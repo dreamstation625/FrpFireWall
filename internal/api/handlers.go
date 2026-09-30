@@ -27,10 +27,22 @@ func (s *Server) handleSystemInfo(c *gin.Context) {
 		cap = drv.Capability()
 	}
 
+	// 更新检查只回放已有缓存，不在这里发起网络请求，
+	// 避免每次刷新面板都去打 GitHub。
+	upd := gin.H{"enabled": s.cfg.Update.Enabled, "checked": false}
+	if s.cfg.Update.Enabled {
+		if res, checked := s.updater.Peek(); checked {
+			upd["checked"] = true
+			upd["result"] = res
+		}
+	}
+
 	ok(c, gin.H{
 		"version":        version.Version,
 		"commit":         version.Commit,
 		"build_time":     version.BuildTime,
+		"version_full":   version.String(),
+		"is_prerelease":  isPrerelease(),
 		"hostname":       host,
 		"os":             runtime.GOOS,
 		"arch":           runtime.GOARCH,
@@ -49,7 +61,14 @@ func (s *Server) handleSystemInfo(c *gin.Context) {
 		"detect":         s.reportSnapshot(),
 		"geoip":          s.geo.Status(),
 		"config_snippet": frpsplugin.Snippet(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
+		"update":         upd,
 	})
+}
+
+// isPrerelease 判断当前运行的是否为预发布版。
+func isPrerelease() bool {
+	n, err := version.Current()
+	return err == nil && n.IsPre()
 }
 
 func (s *Server) handleSystemDetect(c *gin.Context) {

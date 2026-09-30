@@ -134,6 +134,8 @@ frpfirewall -data /var/lib/frpfirewall
 | 总开关 | 开 | 关闭后只判定不写规则 |
 | 观察模式 | 关 | 只记录不封禁，上线前验证误伤 |
 | 日志级别 | `info` | `debug` / `info` / `warn` / `error` |
+| 在线检查更新 | 开 | 关闭后面板不访问 GitHub，纯内网部署建议关掉 |
+| 检查来源 | `dreamstation625/FrpFireWall` | 查询 Release 的 GitHub 仓库（`owner/name`） |
 
 运行期策略（频次阈值、阶梯时长、地域封禁、速率限制）在 **频控策略** 页，改完即时生效，不用重启。
 
@@ -190,13 +192,75 @@ systemctl restart frpfirewall
 
 ---
 
+## 版本与发布
+
+### 版本号格式
+
+只有两种形态：
+
+| 形态 | 含义 |
+| --- | --- |
+| `0.0.1` | 正式版 |
+| `0.0.1-pre.01` | 预发布版，序号从 `01` 起，固定两位 |
+
+同一号段内**正式版大于预发布版**：`0.0.1 > 0.0.1-pre.99`。
+
+### 检查更新
+
+面板侧边栏底部的版本号可以点击，打开版本信息对话框。发现新版本时顶栏会出现红标。
+
+两条轨道互不跨越：
+
+- **正式版只提示正式版更新**，永远不会把正式版用户引到 `-pre` 版本上；
+- 预发布版用户能同时看到更高序号的预发布版和正式版，
+  且当同号正式版发布时会优先被推过去（`0.0.1-pre.03` → `0.0.1`）。
+
+检查走 GitHub Releases API，只读不下载——**本程序不会自动替换自身**，
+新版本需要你自己下载并重装（自更新涉及替换运行中的可执行文件与回滚，风险不划算）。
+
+服务端对结果有一小时缓存，失败结果缓存十分钟，所以离线环境不会因为频繁重试拖慢面板。
+服务器访问不了 `github.com` 时会在对话框里如实报错，也可以在 **系统设置** 里直接关掉。
+
+### 发版流程
+
+版本号的唯一来源是仓库根目录的 `VERSION` 文件，发布 tag 必须与它一致，
+不一致 CI 会直接失败——避免出现「tag 说 0.0.2、二进制里却编译进 0.0.1」这种查不出来的事故。
+
+```bash
+# 1. 改 VERSION 为要发布的版本号
+echo "0.0.2" > VERSION
+# 2. 提交
+git add VERSION && git commit -m "chore: 发布 0.0.2"
+# 3. 打同名 tag 推上去（v 前缀必需）
+git tag v0.0.2 && git push origin main --tags
+```
+
+CI（`.github/workflows/release.yml`）会自动：校验 tag 与 `VERSION` 一致 →
+跑 `go vet` 与单元测试 → 构建前端 → 交叉编译 `linux/amd64` 与 `linux/arm64` →
+实地跑一遍二进制确认版本号注入成功 → 生成 `sha256sums.txt` → 创建 Release。
+
+tag 里带 `-pre.` 的会被自动标记为 **Pre-release**，不会成为 latest；
+正式版则标记为 latest。发布物包含两个架构的二进制、校验和、`install.sh` 与 systemd 单元。
+
+`VERSION` 的格式也由 CI 看门：写 `0.1.0-dev` 这类会被直接拒绝。
+
+---
+
 ## 开发
 
 ```bash
+make version  # 显示将要编译进二进制的版本号（读 VERSION 文件）
 make web      # 构建前端到 internal/web/dist
 make build    # 构建当前平台二进制
-make test     # go vet + go build
+make test     # 单元测试 + go vet + go build
 make smoke    # 对已启动的实例跑接口冒烟测试
+```
+
+单元测试覆盖版本号解析/比较/更新筛选（`internal/version`）与更新检查的缓存、
+轨道规则、失败降级（`internal/update`）：
+
+```bash
+go test ./...
 ```
 
 本地起服务：
@@ -215,7 +279,10 @@ cd web && npm run dev
 ### 代码结构
 
 ```
+VERSION               版本号唯一来源，CI 会校验 tag 与它一致
 cmd/frpfirewall/      入口，命令行参数与装配
+internal/version/     版本号注入、解析、比较与更新筛选规则
+internal/update/      GitHub Releases 更新检查（带缓存，只读）
 internal/config/      配置模型与 SQLite 持久化
 internal/model/       数据模型（ACL / 封禁 / 策略 / 事件）
 internal/store/       GORM + 纯 Go SQLite 数据层
@@ -226,8 +293,10 @@ internal/frpsplugin/  frps httpPlugins 协议实现
 internal/api/         REST API 与 JWT 鉴权
 internal/web/         go:embed 前端产物
 web/                  Vue 3 + Vite + Element Plus 前端
+.github/workflows/    CI 与 tag 触发的自动发布
 deploy/               systemd 单元
 scripts/              安装与救援脚本
+testdata/smoke.sh     接口冒烟测试（对着已启动的实例跑）
 docs/DESIGN.md        设计方案
 ```
 

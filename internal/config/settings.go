@@ -33,6 +33,8 @@ const (
 	KeyGuardDryRun    = "cfg.guard.dry_run"
 	KeyLogLevel       = "cfg.log.level"
 	KeyLogFile        = "cfg.log.file"
+	KeyUpdateEnabled  = "cfg.update.enabled"
+	KeyUpdateRepo     = "cfg.update.repo"
 
 	// KeyJWTSecret 是面板 token 的签名密钥，自动生成，不对外暴露。
 	KeyJWTSecret = "jwt_secret"
@@ -59,6 +61,8 @@ func (c *Config) ToSettings() map[string]string {
 		KeyGuardDryRun:    strconv.FormatBool(c.Guard.DryRun),
 		KeyLogLevel:       c.Log.Level,
 		KeyLogFile:        c.Log.File,
+		KeyUpdateEnabled:  strconv.FormatBool(c.Update.Enabled),
+		KeyUpdateRepo:     c.Update.Repo,
 	}
 }
 
@@ -103,6 +107,10 @@ func FromSettings(m map[string]string) (*Config, error) {
 		c.Log.Level = v
 	}
 	c.Log.File = m[KeyLogFile]
+	c.Update.Enabled = parseBool(m[KeyUpdateEnabled], c.Update.Enabled)
+	if v := strings.TrimSpace(m[KeyUpdateRepo]); v != "" {
+		c.Update.Repo = v
+	}
 
 	if err := c.normalize(); err != nil {
 		return nil, err

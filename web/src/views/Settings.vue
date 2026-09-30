@@ -98,6 +98,23 @@
       </el-form>
     </div>
 
+    <div class="page-card panel">
+      <div class="section-title">版本更新</div>
+      <el-form label-width="150px" style="max-width: 720px">
+        <el-form-item label="在线检查更新">
+          <el-switch v-model="form.update.enabled" />
+          <span class="unit">关闭后面板不访问 GitHub，仍会显示当前版本与发布页链接</span>
+        </el-form-item>
+        <el-form-item label="检查来源">
+          <el-input v-model="form.update.repo" placeholder="owner/name" />
+          <div class="tip">
+            用于查询 Release 的 GitHub 仓库。服务器访问不了 github.com 时会提示检查失败，
+            此时可关闭上面的开关
+          </div>
+        </el-form-item>
+      </el-form>
+    </div>
+
     <div class="actions">
       <el-button type="primary" :loading="saving" @click="save">保存</el-button>
       <el-button @click="load">重新载入</el-button>
@@ -130,6 +147,7 @@ const form = reactive<any>({
   },
   guard: { enabled: true, dry_run: false },
   log: { level: 'info', file: '' },
+  update: { enabled: true, repo: '' },
 })
 
 const proxyPortsText = ref('')
@@ -151,6 +169,7 @@ async function load() {
     form.frps = c.frps || form.frps
     form.guard = c.guard || form.guard
     form.log = c.log || form.log
+    form.update = c.update || form.update
     dataDir.value = r.data_dir || ''
     restartRequired.value = !!r.restart_required
 
@@ -173,6 +192,7 @@ async function save() {
       },
       guard: form.guard,
       log: form.log,
+      update: form.update,
     }
     const r: any = await api.updateConfig(body)
     if (r?.restart_required) {

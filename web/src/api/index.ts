@@ -65,6 +65,11 @@ export const api = {
   // ---- 系统 ----
   systemInfo: () => http.get('/system/info'),
   systemDetect: () => http.get('/system/detect'),
+
+  // 版本更新：status 只读服务端缓存，check 才会真正联网查 GitHub
+  updateStatus: () => http.get('/system/update'),
+  checkUpdate: (force = false) =>
+    http.post('/system/update/check', { force }, { timeout: 40000 }),
   switchBackend: (backend: string) =>
     http.post('/system/firewall/mode', { backend }),
 

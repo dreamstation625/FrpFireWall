@@ -1,0 +1,102 @@
+name: CI
+
+# 日常提交的守门人：编译、静态检查、单元测试、前端构建。
+# 发布流程在 release.yml，由 tag 触发。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: 后端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 VERSION 文件格式
+        run: |
+          set -euo pipefail
+          v="$(tr -d ' \t\r\n' < VERSION)"
+          echo "VERSION = $v"
+
+          # 开发机上出现过的旧格式，先单独拦一道给清晰提示。
+          # 注意必须在下面的通用正则之前判断——否则会被正则先拒掉，
+          # 这段永远执行不到。
+          case "$v" in
+            *-dev|*-rc*|*-alpha*|*-beta*)
+              echo "::error title=版本号后缀不被支持::不支持 -dev / -rc / -alpha / -beta 后缀，预发布一律写成 -pre.NN（如 0.0.1-pre.01）。当前为「$v」"
+              exit 1
+              ;;
+          esac
+
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]{2,})?$'; then
+            echo "::error title=版本号格式非法::VERSION 必须是 0.0.1 或 0.0.1-pre.01 形态，当前为「$v」"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 检查 go.mod 是否整洁
+        run: |
+          set -euo pipefail
+          cp go.mod /tmp/go.mod.before
+          cp go.sum /tmp/go.sum.before
+          go mod tidy
+          if ! diff -q /tmp/go.mod.before go.mod >/dev/null \
+             || ! diff -q /tmp/go.sum.before go.sum >/dev/null; then
+            echo "::error title=go.mod 需要整理::运行 go mod tidy 后有改动，请本地执行并提交。"
+            diff -u /tmp/go.mod.before go.mod || true
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 单元测试
+        run: go test ./... -count=1
+
+      - name: 编译
+        run: CGO_ENABLED=0 go build -trimpath ./...
+
+  frontend:
+    name: 前端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 用 ci 而不是 install：lockfile 与 package.json 不一致时直接失败，
+      # 避免依赖在 CI 上被静默升级。
+      - name: 安装依赖
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+
+      - name: 构建
+        working-directory: web
+        run: npm run build
+
+      - name: 确认产物已生成
+        run: |
+          set -euo pipefail
+          test -f internal/web/dist/index.html
+          echo "产物大小: $(du -sh internal/web/dist | cut -f1)"
+          echo "chunk 清单:"
+          ls -1 internal/web/dist/assets/ | head -30

@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"path/filepath"
 	"strings"
+
+	"github.com/dreamstation625/FrpFireWall/internal/version"
 )
 
 // Config 是运行期配置。
@@ -26,6 +28,7 @@ type Config struct {
 	Frps   FrpsConfig   `json:"frps"`
 	Guard  GuardConfig  `json:"guard"`
 	Log    LogConfig    `json:"log"`
+	Update UpdateConfig `json:"update"`
 }
 
 type ServerConfig struct {
@@ -76,6 +79,15 @@ type LogConfig struct {
 	File  string `json:"file"`
 }
 
+// UpdateConfig 控制面板的版本更新检查。
+type UpdateConfig struct {
+	// Enabled 为 false 时完全不做在线检查。纯内网或不允许出网的服务器可关掉，
+	// 面板仍会显示当前版本号并提供发布页链接。
+	Enabled bool `json:"enabled"`
+	// Repo 是用于检查发布的 GitHub 仓库，格式 owner/name。
+	Repo string `json:"repo"`
+}
+
 // Default 返回一份可用的默认配置。
 func Default() *Config {
 	return &Config{
@@ -101,6 +113,10 @@ func Default() *Config {
 		},
 		Log: LogConfig{
 			Level: "info",
+		},
+		Update: UpdateConfig{
+			Enabled: true,
+			Repo:    version.DefaultRepo,
 		},
 	}
 }
@@ -158,6 +174,40 @@ func (c *Config) normalize() error {
 	if c.Server.TLS.Enabled {
 		if c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "" {
 			return fmt.Errorf("启用 HTTPS 时必须同时填写证书与私钥路径")
+		}
+	}
+
+	if c.Update.Repo == "" {
+		c.Update.Repo = version.DefaultRepo
+	}
+	if err := validateRepoSlug(c.Update.Repo); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRepoSlug 校验 owner/name 形态的仓库标识。
+//
+// 这个值会被拼进 https://api.github.com/repos/{repo}/releases，
+// 必须严格限制字符集，避免用户输入把请求引到别的路径上去。
+func validateRepoSlug(s string) error {
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		return fmt.Errorf("更新检查仓库 %q 应形如 owner/name", s)
+	}
+	for _, p := range parts {
+		if p == "" || p == "." || p == ".." {
+			return fmt.Errorf("更新检查仓库 %q 的 owner 与 name 都不能为空", s)
+		}
+		for _, r := range p {
+			switch {
+			case r >= 'a' && r <= 'z',
+				r >= 'A' && r <= 'Z',
+				r >= '0' && r <= '9',
+				r == '-', r == '_', r == '.':
+			default:
+				return fmt.Errorf("更新检查仓库 %q 含非法字符 %q", s, string(r))
+			}
 		}
 	}
 	return nil

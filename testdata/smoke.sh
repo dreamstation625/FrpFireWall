@@ -18,6 +18,11 @@ DATA_DIR="testdata/data"
 SMOKE_PW="smoke-test-pass"
 cd "$ROOT" || exit 1
 
+# 期望版本号直接取自 VERSION 文件（构建时经 -ldflags 注入二进制）。
+# 不要在这里写死字面量，否则每次升版本都要回来改一遍。
+# 注：如果二进制是旧的没重新编译，这里会失败——那是有效信号，不是脚本误报。
+EXPECT_VERSION="$(tr -d ' \t\r\n' < VERSION 2>/dev/null)"
+
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export PATH="/c/Users/dream/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:/c/Users/dream/.workbuddy/binaries/node/versions/22.22.2-3:$PATH"
 
@@ -100,6 +105,24 @@ check_err() {
     *) printf '  %s %-44s got=%s 应包含=%s\n' "$(red FAIL)" "$label" "$got" "$want"; FAIL=$((FAIL + 1)) ;;
   esac
 }
+
+# ---------- 前置连通性预检 ----------
+# 没有这一步时，服务没起来 / 二进制是旧的 表现为满屏 PARSE_ERR，
+# 最后在 $((BEFORE + 1)) 这类算术展开处直接崩掉（set -u 下 "PARSE_ERR" 被当成变量名），
+# 看不到任何失败汇总，很难判断根因。这里先拦一道，直接给明白话。
+preflight() {
+  local url="$1" name="$2"
+  if ! "${CURL[@]}" -o /dev/null "$url" 2>/dev/null; then
+    printf '\n%s\n' "$(red "无法连接 ${name}：${url}")"
+    echo "请先启动被测实例（二进制需与本轮代码一致）："
+    echo "    ./testdata/frpfirewall.exe -data testdata/data"
+    echo "若刚跑过一次失败，先确认旧进程没占着端口："
+    echo "    netstat -ano | grep LISTENING | grep -E ':7930|:9100'"
+    exit 2
+  fi
+}
+preflight "$BASE/" "面板"
+preflight "$PLUGIN/frps/handler" "frps 插件服务"
 
 echo "########## 1. 前端产物（go:embed + SPA 回退） ##########"
 code=$(get -o /tmp/spa.html -w '%{http_code}' "$BASE/")
@@ -280,7 +303,7 @@ check_list "统计 top_countries 为空数组" "$(printf '%s' "$ES" | jqf data.t
 echo
 echo "########## 8. 系统与防火墙 ##########"
 SI=$(get -H "$AUTH" "$BASE/api/v1/system/info")
-check "版本号" "$(printf '%s' "$SI" | jqf data.version)" "0.1.0-dev"
+check "版本号与 VERSION 一致" "$(printf '%s' "$SI" | jqf data.version)" "$EXPECT_VERSION"
 check "面板监听" "$(printf '%s' "$SI" | jqf data.panel_listen)" "127.0.0.1:7930"
 check "插件监听" "$(printf '%s' "$SI" | jqf data.plugin_listen)" "127.0.0.1:9100"
 check "受保护 bind_port" "$(printf '%s' "$SI" | jqf data.bind_port)" "7000"
@@ -296,7 +319,11 @@ check "系统探测接口" "$(get -H "$AUTH" "$BASE/api/v1/system/detect" | jqf 
 echo
 echo "########## 8b. 系统配置（存于 SQLite） ##########"
 CFG=$(get -H "$AUTH" "$BASE/api/v1/config")
-CFGBODY=$(printf '%s' "$CFG" | jqd)
+# 注意取的是 data.config，不是 data 本身。
+# PUT 的 body 直接绑定到 config.Config，顶层键必须与它的 json tag 对齐；
+# 若误取外层 data（含 config/restart_required/data_dir），
+# 回填时 guard / update / log 都会变成零值，等于把配置悄悄清空。
+CFGBODY=$(printf '%s' "$CFG" | jqf data.config)
 check "面板监听读自数据库" "$(printf '%s' "$CFG" | jqf data.config.server.listen)" "127.0.0.1:7930"
 check "插件监听读自数据库" "$(printf '%s' "$CFG" | jqf data.config.frps.plugin_listen)" "127.0.0.1:9100"
 check "数据目录回显" "$(printf '%s' "$CFG" | jqf data.data_dir)" "testdata/data"
@@ -321,10 +348,95 @@ get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' 
 check "配置已还原" \
   "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.log.level)" \
   "$(printf '%s' "$CFG" | jqf data.config.log.level)"
+# 回归守卫：PUT 的 body 必须是完整配置。曾经因为误取外层 data，
+# 回填时把 guard/update 等没出现在 body 里的段全写成了零值。
+check "回填未清空防护总开关" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.guard.enabled)" \
+  "$(printf '%s' "$CFGBODY" | jqf guard.enabled)"
+check "回填未清空更新检查开关" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.update.enabled)" \
+  "$(printf '%s' "$CFGBODY" | jqf update.enabled)"
+
+echo
+echo "########## 8c. 版本与更新检查 ##########"
+INFO=$(get -H "$AUTH" "$BASE/api/v1/system/info")
+BINVER=$(printf '%s' "$INFO" | jqf data.version)
+check_ok "运行版本号非空" "$BINVER"
+# 只接受 0.0.1 或 0.0.1-pre.01 两种形态，别让 -dev 这类混进来
+check "版本号格式合法" \
+  "$(printf '%s' "$BINVER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]{2,})?$' && echo ok || echo bad)" "ok"
+check_ok "version_full 带提交号" "$(printf '%s' "$INFO" | jqf data.version_full)"
+check "is_prerelease 是布尔" \
+  "$(case "$(printf '%s' "$INFO" | jqf data.is_prerelease)" in true|false) echo ok ;; *) echo bad ;; esac)" "ok"
+check "系统信息含 update.enabled" "$(printf '%s' "$INFO" | jqf data.update.enabled)" "true"
+
+# 只读缓存的接口：没检查过时不应该凭空造一个 result 出来给前端渲染
+UP=$(get -H "$AUTH" "$BASE/api/v1/system/update")
+check "更新检查默认开启" "$(printf '%s' "$UP" | jqf data.enabled)" "true"
+check "检查源为默认仓库" "$(printf '%s' "$UP" | jqf data.repo)" "dreamstation625/FrpFireWall"
+
+# 主动检查：会真实联网。服务器访问不了 GitHub 时接口必须如实返回 error
+# 而不是崩掉或假装成功，所以下面只对「结构」做强断言，连通性相关的断言按需放宽。
+CHK=$(curl -s -S --noproxy '*' -m 40 -X POST "$BASE/api/v1/system/update/check" \
+  -H "$AUTH" -H 'Content-Type: application/json' -d '{"force":true}')
+check "检查已执行" "$(printf '%s' "$CHK" | jqf data.checked)" "true"
+check "结果回显当前版本" "$(printf '%s' "$CHK" | jqf data.result.current)" "$BINVER"
+check "结果回显检查源" "$(printf '%s' "$CHK" | jqf data.result.repo)" "dreamstation625/FrpFireWall"
+check_err "给出 GitHub 发布页链接" \
+  "$(printf '%s' "$CHK" | jqf data.result.releases_url)" "github.com/dreamstation625/FrpFireWall/releases"
+check "has_update 是布尔" \
+  "$(case "$(printf '%s' "$CHK" | jqf data.result.has_update)" in true|false) echo ok ;; *) echo bad ;; esac)" "ok"
+# 列表字段必须是数组，不能是 null，否则前端要处处 || []
+check_list "下载资源是数组而非 null" "$(printf '%s' "$CHK" | jqf data.result.assets)"
+
+# 空 body 也要能走通：前端自动检查时不带任何参数
+CHK2=$(curl -s -S --noproxy '*' -m 40 -X POST "$BASE/api/v1/system/update/check" \
+  -H "$AUTH" -H 'Content-Type: application/json' -d '')
+check "空 body 不报错" "$(printf '%s' "$CHK2" | jqf data.checked)" "true"
+# 手动连点由服务端最小间隔兜住，必须命中缓存而不是又打一次 GitHub
+check "紧接的第二次调用走缓存" "$(printf '%s' "$CHK2" | jqf data.result.from_cache)" "true"
+
+CHK_ERR=$(printf '%s' "$CHK" | jqf data.result.error)
+if [ -z "$CHK_ERR" ] || [ "$CHK_ERR" = "undefined" ] || [ "$CHK_ERR" = "null" ]; then
+  if [ "$(printf '%s' "$CHK" | jqf data.result.has_update)" = "true" ]; then
+    check_ok "判定有更新时给出最新版本号" "$(printf '%s' "$CHK" | jqf data.result.latest)"
+  else
+    check "无更新时 latest 回落为当前版本" \
+      "$(printf '%s' "$CHK" | jqf data.result.latest)" "$BINVER"
+  fi
+  printf '  %s %-44s 联网正常\n' "$(green PASS)" "在线检查链路"; PASS=$((PASS + 1))
+else
+  # 离线环境（内网 / 被墙）属预期，不算失败，但要说清楚
+  printf '  %s %-44s %s\n' "$(green PASS)" "离线时如实返回错误" "$CHK_ERR"
+  PASS=$((PASS + 1))
+fi
+
+# 仓库名会被拼进 GitHub API 的 URL 路径，必须挡住越界字符
+printf '%s' "$CFGBODY" | mut update.repo=../../etc/passwd > /tmp/cfg_up1.json
+check_err "非法更新检查仓库被拒" \
+  "$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_up1.json | jqf error)" "owner/name"
+printf '%s' "$CFGBODY" | mut 'update.repo=no-slash' > /tmp/cfg_up2.json
+check_err "缺少 owner 的仓库名被拒" \
+  "$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_up2.json | jqf error)" "owner/name"
+
+# 关掉开关后接口应如实回答未启用，而不是继续联网
+printf '%s' "$CFGBODY" | mut update.enabled=false > /tmp/cfg_up3.json
+R=$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_up3.json)
+check "关闭在线检查已落库" "$(printf '%s' "$R" | jqf data.restart_required)" "true"
+
+printf '%s' "$CFGBODY" > /tmp/cfg_up0.json
+get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_up0.json > /dev/null
+check "更新检查配置已还原" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.update.repo)" "dreamstation625/FrpFireWall"
 
 echo
 echo "########## 9. 黑白名单 ##########"
 BEFORE=$(get -H "$AUTH" "$BASE/api/v1/acl/white?page=1&size=5" | jqf data.total)
+# 去掉非数字字符再兜底成 0：接口异常时 jqf 会吐 PARSE_ERR，
+# 直接丢进 $((BEFORE + 1)) 会被当成变量名，在 set -u 下把整个脚本带崩，
+# 连失败汇总都打不出来。这里降级成 0，让断言自己 FAIL，能正常收敛。
+BEFORE=${BEFORE//[!0-9]/}
+: "${BEFORE:=0}"
 NEW=$(get -X POST "$BASE/api/v1/acl/white" -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"target":"203.0.113.7","remark":"冒烟测试"}')
 check "新增白名单条目" "$(printf '%s' "$NEW" | jqf data.target)" "203.0.113.7"

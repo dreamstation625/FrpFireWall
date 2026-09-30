@@ -16,6 +16,7 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/guard"
 	"github.com/dreamstation625/FrpFireWall/internal/store"
+	"github.com/dreamstation625/FrpFireWall/internal/update"
 )
 
 // Server 承载 HTTP 层。
@@ -41,6 +42,9 @@ type Server struct {
 	fwMu   sync.RWMutex
 	report *firewall.Report
 	drv    firewall.Driver
+
+	// 版本更新检查（带缓存，不下载任何东西）
+	updater *update.Checker
 
 	startedAt time.Time
 	webFS     fs.FS
@@ -73,6 +77,7 @@ func New(
 		passHash:  passHash,
 		drv:       drv,
 		report:    report,
+		updater:   update.New(update.WithRepo(cfg.Update.Repo)),
 		startedAt: time.Now(),
 		webFS:     webFS,
 		loginLim:  newLoginLimiter(),
@@ -125,6 +130,8 @@ func (s *Server) Routes() http.Handler {
 		auth.GET("/system/info", s.handleSystemInfo)
 		auth.GET("/system/detect", s.handleSystemDetect)
 		auth.POST("/system/firewall/mode", s.handleSwitchMode)
+		auth.GET("/system/update", s.handleUpdateStatus)
+		auth.POST("/system/update/check", s.handleUpdateCheck)
 
 		// ---- 配置 ----
 		auth.GET("/config", s.handleGetConfig)

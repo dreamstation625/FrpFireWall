@@ -14,7 +14,12 @@
       </el-menu>
 
       <div class="aside-footer">
-        <div class="hint">{{ versionText }}</div>
+        <div class="ver-entry" title="查看版本与检查更新" @click="updateVisible = true">
+          <span class="hint">{{ versionText || '版本未知' }}</span>
+          <el-tag v-if="updateAvailable" type="danger" size="small" effect="light">
+            有新版本
+          </el-tag>
+        </div>
       </div>
     </el-aside>
 
@@ -35,6 +40,16 @@
           </el-tag>
           <el-tag v-if="sys.info?.guard?.last_sync_err" type="danger" size="small" effect="light">
             规则同步异常
+          </el-tag>
+          <el-tag
+            v-if="updateAvailable"
+            class="up-badge"
+            type="danger"
+            size="small"
+            effect="light"
+            @click="updateVisible = true"
+          >
+            新版本 {{ updateInfo?.latest }}
           </el-tag>
         </div>
 
@@ -78,6 +93,15 @@
         <el-button type="primary" :loading="pwdLoading" @click="submitPassword">确定</el-button>
       </template>
     </el-dialog>
+
+    <UpdateDialog
+      v-model="updateVisible"
+      :version="sys.info?.version"
+      :commit="sys.info?.commit"
+      :build-time="sys.info?.build_time"
+      :is-prerelease="sys.info?.is_prerelease"
+      @checked="onUpdateChecked"
+    />
   </el-container>
 </template>
 
@@ -92,6 +116,7 @@ import {
   UserFilled,
 } from '@element-plus/icons-vue'
 import api from '@/api'
+import UpdateDialog from '@/components/UpdateDialog.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useSystemStore } from '@/stores/system'
 
@@ -134,6 +159,49 @@ const versionText = computed(() => {
   const v = sys.info?.version
   return v ? `版本 ${v}` : ''
 })
+
+// ---- 版本更新 ----
+// 每个浏览器会话只自动检查一次；服务端另有 1 小时缓存，
+// 所以打开多少次面板都不会真的打很多次 GitHub。
+const UPDATE_CHECKED_KEY = 'frpfirewall_update_checked'
+
+const updateVisible = ref(false)
+const updateInfo = ref<any>(null)
+
+const updateAvailable = computed(() => !!updateInfo.value?.has_update)
+
+function applyUpdate(res: any) {
+  if (!res) return
+  updateInfo.value = res
+}
+
+function onUpdateChecked(hasUpdate: boolean) {
+  // 对话框里手动查完，把结论同步到顶栏徽标
+  if (hasUpdate && !updateInfo.value?.has_update) {
+    updateInfo.value = { ...(updateInfo.value || {}), has_update: true }
+  } else if (!hasUpdate) {
+    updateInfo.value = null
+  }
+}
+
+async function autoCheckUpdate() {
+  // 先吃服务端已有的缓存结论，能立刻出徽标
+  const cached = sys.info?.update
+  if (cached?.checked && cached?.result) {
+    applyUpdate(cached.result)
+    return
+  }
+  if (sys.info?.update?.enabled === false) return
+  if (sessionStorage.getItem(UPDATE_CHECKED_KEY) === '1') return
+
+  sessionStorage.setItem(UPDATE_CHECKED_KEY, '1')
+  try {
+    const r: any = await api.checkUpdate(false)
+    if (r?.enabled !== false) applyUpdate(r?.result)
+  } catch {
+    // 离线 / 被墙时静默失败，不能因为检查更新失败就打扰用户
+  }
+}
 
 async function reload() {
   await sys.load()
@@ -179,8 +247,9 @@ async function submitPassword() {
   }
 }
 
-onMounted(() => {
-  sys.load()
+onMounted(async () => {
+  await sys.load()
+  autoCheckUpdate()
 })
 </script>
 
@@ -221,6 +290,22 @@ onMounted(() => {
 .aside-footer {
   padding: 12px 20px;
   border-top: 1px solid #f0f2f5;
+}
+
+.ver-entry {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ver-entry:hover .hint {
+  color: #1f6feb;
+}
+
+.up-badge {
+  cursor: pointer;
 }
 
 .header {
