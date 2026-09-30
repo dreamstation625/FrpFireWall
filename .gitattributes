@@ -1,0 +1,41 @@
+# 统一换行符：源码入库一律 LF。
+#
+# 本机 core.autocrlf=true，若不加约束，Windows 上会把这些文件检出成 CRLF：
+#   - *.sh     → shebang 变成 "#!/bin/bash\r"，Linux 上直接报错
+#   - Makefile → make 读到行尾的 \r 会当成命令的一部分
+# 因此在这里显式锁死 LF，不依赖任何人的本地 git 配置。
+* text=auto eol=lf
+
+# Windows 批处理必须保留 CRLF，否则 cmd.exe 解析异常
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件：禁止任何换行符转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.eot  binary
+*.exe  binary
+*.so   binary
+*.a    binary
+*.db   binary
+*.mmdb binary
+*.xdb  binary
+*.gz   binary
+*.zip  binary
+
+# 构建与发布产物的 diff 展示
+dist/sha256sums.txt text eol=lf
+
+# 文本文件在 GitHub 上的语言统计
+*.md   text
+*.go   text
+*.ts   text
+*.vue  text
+*.json text

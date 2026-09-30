@@ -1,0 +1,58 @@
+[Unit]
+Description=frpfirewall - frps 服务端插件防火墙
+Documentation=https://github.com/dreamstation625/FrpFireWall
+After=network-online.target
+Wants=network-online.target
+
+# 必须早于 frps 起来：frps 启动后立刻会开始回调插件，
+# 插件没就绪时只能走 fail-open，那段窗口内等于没有防护。
+Before=frps.service
+
+[Service]
+Type=simple
+# 配置全部存在数据目录的 SQLite 里，启动只需要指定数据目录
+ExecStart=/usr/local/bin/frpfirewall -data /var/lib/frpfirewall
+
+Restart=always
+RestartSec=3
+# 反复崩溃时不要无限重启轰炸日志
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ---- 权限 ----
+# 改防火墙只需要 NET_ADMIN；不要给 CAP_SYS_ADMIN 这类过度权限。
+# NoNewPrivileges 与 AmbientCapabilities 搭配时，子进程（iptables/nft）也能拿到这两个能力。
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+# ---- 沙箱 ----
+# 用 full 而不是 strict：strict 会把 /run 也挂成只读，
+# 而 iptables -w 需要写 /run/xtables.lock，开了会直接报错。
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# 数据目录（数据库、GeoIP 库、JWT 密钥、初始化令牌）
+StateDirectory=frpfirewall
+
+# ---- 资源限制 ----
+# 内存上限是必要的安全阀：本程序常驻且要解析 GeoIP，
+# 一旦出现泄漏会拖垮整机（同机的 frps 也救不回来）。
+MemoryMax=512M
+MemoryHigh=384M
+LimitNOFILE=65535
+TasksMax=256
+
+# 日志走 journald，方便 journalctl -u frpfirewall 直接排障
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=frpfirewall
+
+[Install]
+WantedBy=multi-user.target

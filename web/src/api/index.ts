@@ -1,0 +1,133 @@
+import axios, { type AxiosInstance } from 'axios'
+import { ElMessage } from 'element-plus'
+
+export const TOKEN_KEY = 'frpfirewall_token'
+
+export const http: AxiosInstance = axios.create({
+  baseURL: '/api/v1',
+  timeout: 30000,
+})
+
+http.interceptors.request.use((cfg) => {
+  const token = localStorage.getItem(TOKEN_KEY)
+  if (token) {
+    cfg.headers.Authorization = `Bearer ${token}`
+  }
+  return cfg
+})
+
+http.interceptors.response.use(
+  (res) => {
+    const body = res.data
+    // 后端统一返回 {ok, data} / {ok:false, error}
+    if (body && typeof body === 'object' && 'ok' in body) {
+      return body.data
+    }
+    return body
+  },
+  (err) => {
+    const status = err.response?.status
+    const msg =
+      err.response?.data?.error ||
+      err.response?.data?.message ||
+      err.message ||
+      '请求失败'
+
+    if (status === 401) {
+      localStorage.removeItem(TOKEN_KEY)
+      // 初始化令牌错误也会返回 401，那种情况不该把人踢到登录页
+      const url = String(err.config?.url || '')
+      if (!url.includes('/auth/setup') && !location.hash.includes('/login')) {
+        location.hash = '#/login'
+      }
+    }
+    ElMessage.error(msg)
+    return Promise.reject(err)
+  }
+)
+
+export const api = {
+  // ---- 认证 ----
+  authStatus: () => http.get('/auth/status'),
+  setup: (body: { token: string; username: string; password: string }) =>
+    http.post('/auth/setup', body),
+  login: (username: string, password: string) =>
+    http.post('/auth/login', { username, password }),
+  me: () => http.get('/auth/me'),
+  logout: () => http.post('/auth/logout'),
+  changePassword: (old_password: string, new_password: string) =>
+    http.post('/auth/password', { old_password, new_password }),
+
+  // ---- 配置 ----
+  getConfig: () => http.get('/config'),
+  updateConfig: (body: Record<string, unknown>) => http.put('/config', body),
+
+  // ---- 系统 ----
+  systemInfo: () => http.get('/system/info'),
+  systemDetect: () => http.get('/system/detect'),
+  switchBackend: (backend: string) =>
+    http.post('/system/firewall/mode', { backend }),
+
+  // ---- 防火墙 ----
+  managedRules: () => http.get('/firewall/managed'),
+  systemRules: () => http.get('/firewall/system'),
+  preview: () => http.post('/firewall/preview'),
+  reconcile: () => http.post('/firewall/reconcile'),
+
+  // ---- 黑白名单 ----
+  listACL: (kind: string, params: Record<string, unknown>) =>
+    http.get(`/acl/${kind}`, { params }),
+  createACL: (kind: string, body: Record<string, unknown>) =>
+    http.post(`/acl/${kind}`, body),
+  updateACL: (kind: string, id: number, body: Record<string, unknown>) =>
+    http.put(`/acl/${kind}/${id}`, body),
+  deleteACL: (kind: string, id: number) => http.delete(`/acl/${kind}/${id}`),
+  batchACL: (kind: string, body: Record<string, unknown>) =>
+    http.post(`/acl/${kind}/batch`, body),
+  importACL: (kind: string, body: Record<string, unknown>) =>
+    http.post(`/acl/${kind}/import`, body),
+  exportACLURL: (kind: string) =>
+    `/api/v1/acl/${kind}/export?token=${localStorage.getItem(TOKEN_KEY) || ''}`,
+
+  // ---- 封禁 ----
+  listBans: (params: Record<string, unknown>) => http.get('/bans', { params }),
+  activeBans: () => http.get('/bans/active'),
+  createBan: (body: Record<string, unknown>) => http.post('/bans', body),
+  deleteBan: (id: number) => http.delete(`/bans/${id}`),
+  batchDeleteBan: (ids: number[]) =>
+    http.post('/bans/batch-delete', { ids }),
+  lookup: (target: string) => http.post('/bans/lookup', { target }),
+
+  // ---- 策略 ----
+  getPolicy: () => http.get('/policy'),
+  updatePolicy: (body: Record<string, unknown>) => http.put('/policy', body),
+
+  // ---- GeoIP ----
+  geoLookup: (ip: string) => http.post('/geoip/lookup', { ip }),
+  geoStatus: () => http.get('/geoip/status'),
+  geoCountries: () => http.get('/geoip/countries'),
+  geoUpload: (name: string, file: File) => {
+    const fd = new FormData()
+    fd.append('name', name)
+    fd.append('file', file)
+    return http.post('/geoip/upload', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+
+  // ---- 事件 ----
+  listEvents: (params: Record<string, unknown>) =>
+    http.get('/events', { params }),
+  eventStats: (hours: number) =>
+    http.get('/events/stats', { params: { hours } }),
+  listRuleChanges: (params: Record<string, unknown>) =>
+    http.get('/events/changes', { params }),
+
+  // ---- frps 集成 ----
+  frpsSnippet: () => http.get('/frps/snippet'),
+  frpsHealth: () => http.get('/frps/health'),
+  frpsConfig: () => http.get('/frps/config'),
+}
+
+export default api

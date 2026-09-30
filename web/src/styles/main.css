@@ -1,0 +1,104 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  color: #1f2329;
+  background: #f5f7fa;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+    monospace;
+}
+
+/* 规则/配置原文展示区 */
+.code-block {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  background: #f7f8fa;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow: auto;
+  white-space: pre;
+  color: #1f2329;
+  margin: 0;
+}
+
+.code-block.dark {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border-color: #333;
+}
+
+.page-card {
+  background: #fff;
+  border: 1px solid #e9ecf2;
+  border-radius: 10px;
+}
+
+.section-title {
+  font-size: 14px;
+  font-weight: 500;
+  margin: 0 0 12px;
+  color: #1f2329;
+}
+
+.hint {
+  font-size: 12.5px;
+  color: #8a919f;
+  line-height: 1.7;
+}
+
+.alert-note {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: #8a6d3b;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.alert-danger {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: #a33;
+  background: #fef0f0;
+  border: 1px solid #fbc4c4;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.stat-value {
+  font-size: 26px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.stat-label {
+  font-size: 12.5px;
+  color: #8a919f;
+  margin-top: 6px;
+}
+
+.el-table .cell {
+  word-break: break-all;
+}
+
+.el-descriptions__label {
+  width: 150px;
+}
