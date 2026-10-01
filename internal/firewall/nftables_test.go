@@ -4,6 +4,8 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
 // 这一组用例锁死的是"表达式必须与链的家族匹配"。
@@ -149,7 +151,7 @@ func TestRenderScriptDeletesHandlesPerChain(t *testing.T) {
 // 落到 IPv6 链上会被 nft 拒绝，所以只有 v4 链才生成。
 func TestRenderScriptRateLimitOnlyOnIPv4Stack(t *testing.T) {
 	des := Desired{
-		ProtectPorts: []int{7000},
+		ProtectPorts: portrange.Ports(7000),
 		RateLimit:    &RateLimitSpec{Enabled: true, PerSec: 20},
 	}
 
@@ -250,7 +252,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 	des := Desired{
 		Blacklist:    []string{"203.0.113.7"},
 		BlacklistFrp: []string{"198.51.100.9", "2001:db8::5"},
-		ProtectPorts: []int{7100, 7000, 7000}, // 故意乱序并重复
+		ProtectPorts: portrange.Ports(7100, 7000, 7000), // 故意乱序并重复
 	}
 
 	t.Run("inet 双栈：每个协议栈各有 tcp 与 udp", func(t *testing.T) {
@@ -270,6 +272,29 @@ func TestRenderScriptFrpScope(t *testing.T) {
 			if !strings.Contains(got, want) {
 				t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
 			}
+		}
+	})
+
+	// 区间写法是这一版的核心：一万个端口必须仍然是一个集合元素，
+	// 而不是一万个元素。哪天有人把它"顺手展开"，这条断言会立刻炸。
+	t.Run("区间写进集合字面量，不展开成逐个端口", func(t *testing.T) {
+		stacks := []nftStack{{target: inet, bits: 32}}
+		got := renderScript(stacks, Desired{
+			BlacklistFrp: []string{"198.51.100.9"},
+			ProtectPorts: portrange.Span(20000, 30000).Merge(portrange.Ports(880, 8443)),
+		}, nil, false)
+
+		want := "tcp dport { 880, 8443, 20000-30000 } ip saddr @frpfirewall_black_frp drop"
+		if !strings.Contains(got, want) {
+			t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
+		}
+		// nft 在集合字面量里认 lo-hi，不认 iptables 那套 lo:hi。
+		if strings.Contains(got, "20000:30000") {
+			t.Errorf("nft 集合里出现了 iptables 风格的区间写法，会被预检拒掉\n%s", got)
+		}
+		// 一万个端口，脚本文本里不该出现四个以上数字的端口元素。
+		if strings.Contains(got, "20001") || strings.Contains(got, "29999") {
+			t.Errorf("区间被展开成了逐个端口\n%s", got)
 		}
 	})
 
@@ -295,7 +320,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 
 	t.Run("某协议栈没有该类地址就不为它插规则", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
-		onlyV4 := Desired{BlacklistFrp: []string{"198.51.100.9"}, ProtectPorts: []int{7000}}
+		onlyV4 := Desired{BlacklistFrp: []string{"198.51.100.9"}, ProtectPorts: portrange.Ports(7000)}
 		got := renderScript(stacks, onlyV4, nil, false)
 
 		if !strings.Contains(got, "ip saddr @"+setBlackFrp+" drop") {
@@ -327,7 +352,7 @@ func TestRenderScriptFrpRulesComeAfterAllPortRules(t *testing.T) {
 	got := renderScript(stacks, Desired{
 		Blacklist:    []string{"203.0.113.7"},
 		BlacklistFrp: []string{"198.51.100.9"},
-		ProtectPorts: []int{7000},
+		ProtectPorts: portrange.Ports(7000),
 	}, nil, false)
 
 	all, frp := -1, -1

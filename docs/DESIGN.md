@@ -455,7 +455,8 @@ IPv6 那条规则把 IPv4 的一起陪葬了。
 
 **frp 端口集合 = `bindPort` + `proxyPorts`**，且 **TCP 与 UDP 都要封**：`bindPort` 是 TCP，
 但代理端口里可能有 UDP 服务，只封 TCP 会留下一条 UDP 绕过路径。iptables 的 `multiport`
-单条规则最多 15 个端口，超了要分片。
+单条规则最多 15 个**端口或区间**，超了要分片（区间写法见 D15 —— 数的是区间个数，
+不是区间里含多少个端口）。
 
 **更新语义：不带 scope 不能改范围。** 更新接口的 `scope` 用指针类型区分"没传"和
 "传了空串" —— 只改备注的请求不带该字段，若按普通字符串绑定就会得到 `""`、归一化成
@@ -475,6 +476,59 @@ CDN 节点 IP 会照封不误** —— 封掉一个边缘节点就是掐死一�
 **测试**：`iptables_test.go`（规则生成、顺序、端口归一化、预览与下发一致）、
 `nftables_test.go`（双栈、集合 flush、链上顺序还原）、`handlers_acl_test.go`
 （范围归一化、导入格式与导出回读闭环）。
+
+
+### D15. 端口用区间表达，不展开成单个端口
+
+**问题**：`proxy_ports` 原本是 `[]int`。但 frps 的 `allowPorts` 最常见的写法就是一整个
+大区间，实测用户机器上就是 `20000-30000`。逐个列举的代价：
+
+| | 展开成单端口 | 区间表达 |
+|---|---|---|
+| 用户要填的 | 10001 个数字 | `20000-30000` |
+| iptables 规则条数 | 10001 ÷ 15 ≈ **667 条** × 2 协议 | **1 条** × 2 协议 |
+| nft 集合元素 | **10001 个** | **1 个** |
+
+**决策：新增 `internal/portrange` 包，端口统一用「区间集合」表达（`Set []Range`）。**
+
+- **为什么单独一个包而不是塞进 `config` 或 `firewall`。** 两边都要用它，谁当宿主都会让
+  另一边的依赖方向变别扭。解析、归一化、渲染是纯函数，独立出来也最好测。
+- **归一化由类型自己兜住。** `Parse` / `Ports` / `Merge` 出来的 `Set` 一定已合并、去重、
+  排序。上一版的教训是把"归一的义务"留在函数签名之外，调用方带着重复端口进来，生成出
+  读起来像写错的规则。驱动入口再调一次 `Normalize()` 兜底（有人直接手写 `Set` 字面量）。
+- **相邻区间也算重叠，要合并。** `80,81` 并成 `80-81` 后匹配集合完全一致，但
+  multiport 少占一个名额、nft 集合少一个元素。有间隔的不合并 —— 那等于顺手多封了
+  中间的端口。
+- **非法写法必须报错，不能静默丢弃。** 早先的 `csvToInts` 会悄悄跳过越界值；
+  用户以为配了、实际下发不出来，这种"以为保护了其实没保护"最难发现。
+  前端也做一份同样的校验，是为了给出能看懂的错误，而不是让用户对着一句
+  "请求格式不正确"猜自己哪里写错了。
+- **两种后端的区间写法不同，必须分开渲染。** iptables 认 `--dports 20000:30000`，
+  nft 认 `dport { 20000-30000 }`。实测交叉使用会直接报错（`invalid port/service
+  '20000-30000'`），所以 `iptPorts` / `nftPorts` 各包一层，调用点不碰分隔符。
+- **multiport 的 15 个名额数的是「区间个数」**，不是一个区间里含多少端口。
+  所以切块按区间个数切，10001 个端口依然是 1 个名额。
+- **限速规则拆块后共用同一个 `--hashlimit-name`。** 各块各算一份配额会让实际放行量
+  随块数翻倍。
+
+**持久化与接口形态**：`Set` 在 JSON 里就是文本（`"80,443,20000-30000"`），
+和设置页那个输入框一一对应，中间不做结构转换。同时也接受 `[80,443]` 和裸数字，
+让老客户端与手写请求体不至于直接报错。
+
+**真机验证**（Debian 12 / nftables 1.0.6 / iptables 1.8.9）：
+
+```
+tcp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp drop comment "frpfirewall:black-frp"
+udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp drop comment "frpfirewall:black-frp"
+```
+
+两条规则覆盖 10001 个端口，且 `bind_port`（7020）与区间正确合并成一个表达式。
+`tools/remote-range-test.js` 是可重放的验证脚本，`tools/assert-selftest.js`
+用真实抓到的内核输出离线自检断言本身。
+
+**测试**：`portrange_test.go`（解析容错、合并、切块、JSON 往返、越界夹取）、
+`config/settings_test.go`（落库格式往返、老值兼容、坏值回落方向）、
+`firewall` 侧的区间渲染与"宽区间不膨胀"断言。
 
 
 ## 3. 总体架构
@@ -551,6 +605,7 @@ FrpFireWall/
 │   ├── config/            # 配置模型 + SQLite 持久化（config.go / settings.go / password.go）
 │   ├── model/             # 领域模型（ACL / 封禁 / 策略 / 事件 / 键值）
 │   ├── store/             # GORM + 纯 Go SQLite 数据层
+│   ├── portrange/         # 端口区间集合：解析 / 合并 / 切块 / 按后端渲染（含单元测试）
 │   ├── firewall/
 │   │   ├── driver.go      # Driver 接口 + 受管对象名常量
 │   │   ├── detect.go      # 系统与后端探测
@@ -632,9 +687,9 @@ iptables -w -A FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 iptables -w -D FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 
 # 只封 frp 端口：TCP 与 UDP 各一条（proxyPorts 里可能有 UDP 服务，
-# 只封 TCP 会留下一条绕过路径）；端口超过 15 个时按 multiport 上限分片
-iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p tcp -m multiport --dports 7000,80,443 -j DROP
-iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p udp -m multiport --dports 7000,80,443 -j DROP
+# 只封 TCP 会留下一条绕过路径）；区间写成 lo:hi，超过 15 个区间时按 multiport 上限分片
+iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p tcp -m multiport --dports 7000,80,443,20000:30000 -j DROP
+iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p udp -m multiport --dports 7000,80,443,20000:30000 -j DROP
 ```
 
 要点：
@@ -662,7 +717,7 @@ add set inet filter frpfirewall_rate      { type ipv4_addr; flags interval; }
 # 注意：这几行的书写顺序与链上顺序是**相反**的 —— insert 一律插到链首，
 # 所以想让链上是「全端口 → 仅 frp 端口」，脚本就得倒着输出（见 D14）。
 # 下面按"脚本实际生成的顺序"列出，v6 与 udp 的对应行省略。
-insert rule inet filter input tcp dport { 7000, 80, 443 } ip saddr @frpfirewall_black_frp  drop comment "frpfirewall:black-frp"
+insert rule inet filter input tcp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp  drop comment "frpfirewall:black-frp"
 insert rule inet filter input ip  saddr @frpfirewall_black      drop comment "frpfirewall:black"
 insert rule inet filter input ip6 saddr @frpfirewall_black6     drop comment "frpfirewall:black6"
 EOF

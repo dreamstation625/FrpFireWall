@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/dreamstation625/FrpFireWall/internal/model"
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
 // KV 是配置持久化所需的最小接口，由 store.Store 实现。
@@ -55,7 +56,7 @@ func (c *Config) ToSettings() map[string]string {
 		KeyPluginListen:   c.Frps.PluginListen,
 		KeyPluginPath:     c.Frps.PluginPath,
 		KeyBindPort:       strconv.Itoa(c.Frps.BindPort),
-		KeyProxyPorts:     intsToCSV(c.Frps.ProxyPorts),
+		KeyProxyPorts:     c.Frps.ProxyPorts.String(),
 		KeyTrustedProxies: strings.Join(c.Frps.TrustedProxies, ","),
 		KeyGuardEnabled:   strconv.FormatBool(c.Guard.Enabled),
 		KeyGuardDryRun:    strconv.FormatBool(c.Guard.DryRun),
@@ -96,7 +97,13 @@ func FromSettings(m map[string]string) (*Config, error) {
 		c.Frps.BindPort = v
 	}
 	if v := m[KeyProxyPorts]; strings.TrimSpace(v) != "" {
-		c.Frps.ProxyPorts = csvToInts(v)
+		// 解析不了就保持默认值。走到这一步基本只可能是库里的值被手工改坏了：
+		// 经由接口保存的配置在 Validate 里已经拦过一道，会带着原因返回给界面。
+		// 兜底方向取"默认端口"而不是"空集合"，空集合会让「仅 frp 端口」封禁
+		// 一条规则都下发不出来。
+		if ports, err := portrange.Parse(v); err == nil {
+			c.Frps.ProxyPorts = ports
+		}
 	}
 	if v := m[KeyTrustedProxies]; strings.TrimSpace(v) != "" {
 		c.Frps.TrustedProxies = strings.Split(v, ",")
@@ -191,22 +198,4 @@ func parseInt(v string, def int) int {
 		return def
 	}
 	return n
-}
-
-func intsToCSV(in []int) string {
-	parts := make([]string, 0, len(in))
-	for _, n := range in {
-		parts = append(parts, strconv.Itoa(n))
-	}
-	return strings.Join(parts, ",")
-}
-
-func csvToInts(s string) []int {
-	out := make([]int, 0, 8)
-	for _, p := range strings.Split(s, ",") {
-		if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil && n > 0 && n < 65536 {
-			out = append(out, n)
-		}
-	}
-	return out
 }

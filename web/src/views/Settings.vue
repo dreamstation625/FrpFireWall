@@ -51,8 +51,11 @@
           <span class="unit">frps 的 bindPort，用于下发连接速率限制</span>
         </el-form-item>
         <el-form-item label="代理端口">
-          <el-input v-model="proxyPortsText" placeholder="80,443" />
-          <div class="tip">逗号分隔。NewUserConn 回调只在这些端口上参与判定</div>
+          <el-input v-model="proxyPortsText" placeholder="80,443,20000-30000" />
+          <div class="tip">
+            逗号分隔，支持区间 <span class="mono">20000-30000</span>。
+            速率限制作用于此，「仅 frp 端口」的黑名单也按它封禁
+          </div>
         </el-form-item>
         <el-form-item label="可信回源网段">
           <el-input
@@ -142,7 +145,7 @@ const form = reactive<any>({
     plugin_listen: '',
     plugin_path: '',
     bind_port: 7000,
-    proxy_ports: [],
+    proxy_ports: '',
     trusted_proxies: [],
   },
   guard: { enabled: true, dry_run: false },
@@ -160,6 +163,23 @@ function splitList(s: string) {
     .filter(Boolean)
 }
 
+// checkPorts 与后端 portrange.Parse 保持同一套规则：单个端口或 lo-hi 区间，
+// 逗号/分号/空白分隔，取值 1-65535。返回 null 表示合法，否则返回给人看的说明。
+function checkPorts(s: string): string | null {
+  const bad = s
+    .split(/[,，;；\s]+/)
+    .filter(Boolean)
+    .find((tok) => {
+      const m = /^(\d+)(?:[-:](\d+))?$/.exec(tok)
+      if (!m) return true
+      const lo = Number(m[1])
+      const hi = m[2] ? Number(m[2]) : lo
+      return lo < 1 || lo > 65535 || hi < 1 || hi > 65535
+    })
+  if (bad === undefined) return null
+  return `端口「${bad}」无法识别：写单个端口（80）或区间（20000-30000），取值 1-65535`
+}
+
 async function load() {
   loading.value = true
   try {
@@ -173,7 +193,7 @@ async function load() {
     dataDir.value = r.data_dir || ''
     restartRequired.value = !!r.restart_required
 
-    proxyPortsText.value = (c.frps?.proxy_ports || []).join(',')
+    proxyPortsText.value = c.frps?.proxy_ports || ''
     trustedText.value = (c.frps?.trusted_proxies || []).join('\n')
   } finally {
     loading.value = false
@@ -181,13 +201,23 @@ async function load() {
 }
 
 async function save() {
+  // 先在本地拦一道非法端口。后端也会拒，但那边只能回一句
+  // "请求格式不正确"，用户对着它猜不出自己哪里写错了。
+  const portErr = checkPorts(proxyPortsText.value)
+  if (portErr) {
+    ElMessage.error(portErr)
+    return
+  }
+
   saving.value = true
   try {
     const body = {
       server: form.server,
       frps: {
         ...form.frps,
-        proxy_ports: splitList(proxyPortsText.value).map(Number).filter((n) => n > 0),
+        // 文本原样提交：后端认的就是用户在框里敲的这种写法，
+        // 中间不做结构转换，也就不会出现"转换时丢掉一半"。
+        proxy_ports: proxyPortsText.value.trim(),
         trusted_proxies: splitList(trustedText.value),
       },
       guard: form.guard,

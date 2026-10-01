@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
 // nftables 驱动的设计要点
@@ -328,7 +330,7 @@ func (d *nftablesDriver) Sync(des Desired) error {
 
 	// 「仅 frp 端口」的条目在没配端口时生成不出规则，会变成"看起来封了其实没封"。
 	// 这种情况必须报出来，不能静默。
-	if len(des.BlacklistFrp) > 0 && len(normalizePorts(des.ProtectPorts)) == 0 {
+	if len(des.BlacklistFrp) > 0 && len(des.ProtectPorts.Normalize()) == 0 {
 		d.warn(fmt.Sprintf(
 			"有 %d 个地址设为「仅 frp 端口」，但当前没有配置任何 frp 端口（bind_port / proxy_ports 均为空），这些条目暂未下发",
 			len(des.BlacklistFrp)))
@@ -355,6 +357,11 @@ func (d *nftablesDriver) Sync(des Desired) error {
 // handles 按链给出要删的规则 handle；rateOn 表示限速规则是否可以下发。
 func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, rateOn bool) string {
 	var b strings.Builder
+
+	// 驱动入口再归一化一次，作为 Set 类型约定的兜底：直接手写 Set 字面量的
+	// 调用方不会经过归一化，而落在 nft 里的越界端口会让整份脚本预检失败 ——
+	// 预检失败是整份放弃，v4 规则会跟着 v6 一起陪葬。
+	ports := des.ProtectPorts.Normalize()
 
 	// 1. 删掉旧的受管规则（同一个事务里会重新插入，所以没有空窗）。
 	//    按链去重：同一目标可能被两个协议栈共用（inet）。
@@ -393,7 +400,7 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 
 	// 3. 限速规则。表达式里的 saddr 是 IPv4 的，所以只落在 v4 链上。
 	if rateOn {
-		if expr, ok := nftRateLimitExpr(des.RateLimit, des.ProtectPorts); ok {
+		if expr, ok := nftRateLimitExpr(des.RateLimit, ports); ok {
 			if s, ok := stackOf(stacks, 32); ok {
 				fmt.Fprintf(&b, "insert rule %s %s %s %s comment \"%s\"\n",
 					s.target.Family, s.target.Table, s.target.Chain, expr, commentRate)
@@ -424,7 +431,7 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 
 	// 「仅 frp 端口」的规则只在真的用得着时才生成：没有端口就写不出 dport，
 	// 某个协议栈下没有这类地址则不必为它插一条空规则。
-	if exprs := nftFrpPortExprs(des.ProtectPorts); len(exprs) > 0 {
+	if exprs := nftFrpPortExprs(ports); len(exprs) > 0 {
 		for _, pe := range exprs {
 			for _, s := range stacks {
 				if len(filterByFamily(des.BlacklistFrp, s.bits)) == 0 {
@@ -448,21 +455,23 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 	return b.String()
 }
 
+// nftPorts 渲染成 nft 集合字面量里的元素列表，例如 "80, 20000-30000"。
+// 逗号后的空格只是给预览文本看的，nft 两种写法都认。
+func nftPorts(s portrange.Set) string { return renderPorts(s, "-", ", ") }
+
 // nftFrpPortExprs 返回「仅 frp 端口」规则的端口匹配前缀，TCP 与 UDP 各一条。
 //
 // 两种协议都要：frps 的 bindPort 是 TCP，而 proxyPorts 里可能配了 UDP 代理端口，
 // 只封 TCP 会留下一条用 UDP 绕过的路径。端口为空时返回 nil —— 调用方据此跳过，
 // 而不是生成一条匹配不存在的端口的规则。
-func nftFrpPortExprs(ports []int) []string {
-	ps := normalizePorts(ports)
-	if len(ps) == 0 {
+//
+// 区间直接写进集合字面量（`{ 80, 20000-30000 }`），nft 原生支持，
+// 所以 20000-30000 是一个元素，不是一万个。
+func nftFrpPortExprs(ports portrange.Set) []string {
+	if len(ports) == 0 {
 		return nil
 	}
-	ss := make([]string, 0, len(ps))
-	for _, p := range ps {
-		ss = append(ss, strconv.Itoa(p))
-	}
-	list := strings.Join(ss, ", ")
+	list := nftPorts(ports)
 	return []string{
 		"tcp dport { " + list + " }",
 		"udp dport { " + list + " }",
@@ -763,7 +772,7 @@ func halfStackWarning(missing string) string {
 //	tcp dport { 7000 } ct state new add @frpfirewall_rate { ip saddr limit rate over 20/second burst 40 packets } drop
 //
 // 表达式只对 IPv4 有效（集合元素类型是 ipv4_addr），所以只用在 IPv4 落点上。
-func nftRateLimitExpr(spec *RateLimitSpec, ports []int) (string, bool) {
+func nftRateLimitExpr(spec *RateLimitSpec, ports portrange.Set) (string, bool) {
 	if spec == nil || !spec.Enabled || spec.PerSec <= 0 {
 		return "", false
 	}
@@ -774,11 +783,9 @@ func nftRateLimitExpr(spec *RateLimitSpec, ports []int) (string, bool) {
 
 	var b strings.Builder
 	if len(ports) > 0 {
-		ps := make([]string, 0, len(ports))
-		for _, p := range ports {
-			ps = append(ps, strconv.Itoa(p))
-		}
-		fmt.Fprintf(&b, "tcp dport { %s } ", strings.Join(ps, ", "))
+		// 限速规则是单条规则，没法像 iptables 那样按块拆，所以这里直接
+		// 把整个区间集合写进集合字面量 —— 区间写法让它天然只有几个元素。
+		fmt.Fprintf(&b, "tcp dport { %s } ", nftPorts(ports))
 	} else {
 		b.WriteString("tcp ")
 	}

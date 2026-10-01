@@ -307,7 +307,7 @@ check "版本号与 VERSION 一致" "$(printf '%s' "$SI" | jqf data.version)" "$
 check "面板监听" "$(printf '%s' "$SI" | jqf data.panel_listen)" "0.0.0.0:7930"
 check "插件监听" "$(printf '%s' "$SI" | jqf data.plugin_listen)" "127.0.0.1:9100"
 check "受保护 bind_port" "$(printf '%s' "$SI" | jqf data.bind_port)" "7000"
-check "受保护 proxy_ports 2 个" "$(printf '%s' "$SI" | jqf data.proxy_ports)" "[2]"
+check "受保护 proxy_ports 支持区间写法" "$(printf '%s' "$SI" | jqf data.proxy_ports)" "80,443"
 check "引擎已启用" "$(printf '%s' "$SI" | jqf data.guard.enabled)" "true"
 check "探测报告 arch" "$(printf '%s' "$SI" | jqf data.detect.arch)" "amd64"
 check_ok "探测报告 os_pretty" "$(printf '%s' "$SI" | jqf data.detect.os_pretty)"
@@ -343,11 +343,33 @@ printf '%s' "$CFGBODY" | mut 'frps.trusted_proxies=["not-a-cidr"]' > /tmp/cfg3.j
 check_err "非法 CIDR 被拒" \
   "$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg3.json | jqf error)" "CIDR"
 
+# 代理端口支持区间写法：frps 的 allowPorts 常见就是一整个大区间，
+# 逐个列举既没法填、下发出来的规则也会膨胀成千百条。
+printf '%s' "$CFGBODY" | mut 'frps.proxy_ports=20000-25000,24000-30000,7020,7020' > /tmp/cfg_ports.json
+get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_ports.json > /dev/null
+# 落库的是归一化后的文本：重叠区间已合并、重复已去掉、升序
+check "端口区间落库并归一化" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.frps.proxy_ports)" \
+  "7020,20000-30000"
+# 端口属于启动期参数：改完只落库，运行中的进程仍在用旧值，
+# 所以这里必须如实提示"需要重启"，不能假装已经生效。
+check "端口改动提示需重启" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.restart_required)" \
+  "true"
+
+# 写错的端口必须带上原因退回。只说"请求格式不正确"用户不知道该改哪儿。
+printf '%s' "$CFGBODY" | mut 'frps.proxy_ports=20000~30000' > /tmp/cfg_badports.json
+check_err "端口写法非法被拒且说明原因" \
+  "$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_badports.json | jqf error)" "无法识别"
+
 printf '%s' "$CFGBODY" > /tmp/cfg0.json
 get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg0.json > /dev/null
 check "配置已还原" \
   "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.log.level)" \
   "$(printf '%s' "$CFG" | jqf data.config.log.level)"
+check "端口配置已还原" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.frps.proxy_ports)" \
+  "$(printf '%s' "$CFG" | jqf data.config.frps.proxy_ports)"
 # 回归守卫：PUT 的 body 必须是完整配置。曾经因为误取外层 data，
 # 回填时把 guard/update 等没出现在 body 里的段全写成了零值。
 check "回填未清空防护总开关" \

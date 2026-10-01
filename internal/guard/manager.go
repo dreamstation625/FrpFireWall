@@ -14,6 +14,7 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/firewall"
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/model"
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 	"github.com/dreamstation625/FrpFireWall/internal/store"
 )
 
@@ -424,22 +425,16 @@ func (m *Manager) desired() firewall.Desired {
 
 // protectPortsLocked 返回速率限制与保护规则作用的端口集合。
 // 只保护 frp 相关端口，不做全线保护，避免误伤其它服务。
-func (m *Manager) protectPortsLocked() []int {
-	set := make(map[int]struct{}, len(m.cfg.Frps.ProxyPorts)+1)
+//
+// 用 Merge 而不是逐个 append：bindPort 常常就落在代理端口区间里面
+// （例如 bindPort 7000、allowPorts 20000-30000 之外的 7000-7100），
+// 合并后同一段端口只会生成一条规则。
+func (m *Manager) protectPortsLocked() portrange.Set {
+	bind := portrange.Set{}
 	if m.cfg.Frps.BindPort > 0 {
-		set[m.cfg.Frps.BindPort] = struct{}{}
+		bind = portrange.Ports(m.cfg.Frps.BindPort)
 	}
-	for _, p := range m.cfg.Frps.ProxyPorts {
-		if p > 0 {
-			set[p] = struct{}{}
-		}
-	}
-	out := make([]int, 0, len(set))
-	for p := range set {
-		out = append(out, p)
-	}
-	sort.Ints(out)
-	return out
+	return bind.Merge(m.cfg.Frps.ProxyPorts)
 }
 
 // Preview 生成将要下发的规则文本。

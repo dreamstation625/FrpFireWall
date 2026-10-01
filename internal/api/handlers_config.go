@@ -49,7 +49,9 @@ func (s *Server) handleGetConfig(c *gin.Context) {
 func (s *Server) handleUpdateConfig(c *gin.Context) {
 	var in config.Config
 	if err := c.ShouldBindJSON(&in); err != nil {
-		badRequest(c, "请求格式不正确")
+		// 把底层原因带上：这个 body 里唯一有自由文本写法的就是端口这类字段，
+		// 只说一句"请求格式不正确"，用户对着它猜不出自己哪里写错了。
+		badRequest(c, "配置格式不正确："+err.Error())
 		return
 	}
 

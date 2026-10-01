@@ -118,13 +118,13 @@ const health = ref<any>(null)
 const snippetText = computed(() => snippet.value?.snippet || '（加载中…）')
 
 const protectedPorts = computed(() => {
-  const ports: number[] = []
+  // proxy_ports 是一段文本（可能含区间），后端已经归一化过，
+  // 这里原样展示即可，不要自己解析——解析出来的形态会和实际下发的不一致。
+  const raw = String(info.value?.proxy_ports || '').trim()
+  const parts = raw ? raw.split(/[,\s]+/).filter(Boolean) : []
   const bp = snippet.value?.bind_port ?? info.value?.bind_port
-  if (bp) ports.push(bp)
-  for (const p of info.value?.proxy_ports || []) {
-    if (p && !ports.includes(p)) ports.push(p)
-  }
-  return ports.length ? ports.join(', ') : '未配置'
+  if (bp && !parts.includes(String(bp))) parts.unshift(String(bp))
+  return parts.length ? parts.join(', ') : '未配置'
 })
 
 async function load() {

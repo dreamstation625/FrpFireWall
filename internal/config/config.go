@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 	"github.com/dreamstation625/FrpFireWall/internal/version"
 )
 
@@ -70,7 +71,10 @@ type FrpsConfig struct {
 	// BindPort 是 frps 的 bindPort，用于下发连接速率限制规则。
 	BindPort int `json:"bind_port"`
 	// ProxyPorts 是代理对外暴露的端口，用于 NewUserConn 阶段判定的覆盖范围。
-	ProxyPorts []int `json:"proxy_ports"`
+	//
+	// 支持区间写法：frps 的 allowPorts 常见配置就是一整个大区间（20000-30000），
+	// 逐个列举既没法填、下发出来的规则也会膨胀成上千条。
+	ProxyPorts portrange.Set `json:"proxy_ports"`
 	// TrustedProxies 是可信反代/CDN 回源网段（CIDR）。
 	// 来自这些网段的 NewUserConn 不按 remote_addr 封禁，
 	// 而是优先取 X-Forwarded-For 里的真实客户端 IP，避免封到 CDN 节点。
@@ -122,7 +126,7 @@ func Default() *Config {
 			PluginListen: "127.0.0.1:9100",
 			PluginPath:   "/frps/handler",
 			BindPort:     7000,
-			ProxyPorts:   []int{80, 443},
+			ProxyPorts:   portrange.Ports(80, 443),
 		},
 		Guard: GuardConfig{
 			Enabled: true,
@@ -166,6 +170,10 @@ func (c *Config) normalize() error {
 	if c.Frps.BindPort == 0 {
 		c.Frps.BindPort = 7000
 	}
+	// 端口集合归一化：去重、合并（含相邻）、排序。
+	// 合并相邻区间不只是为了好看——iptables 的 multiport 一次只认 15 个端口或区间，
+	// 合并能实打实减少下发的规则条数。
+	c.Frps.ProxyPorts = c.Frps.ProxyPorts.Normalize()
 
 	// 可信回源网段写错会静默失效（拿不到真实客户端 IP 就会封到 CDN 节点），
 	// 所以这里直接拒绝非法 CIDR，而不是放过。

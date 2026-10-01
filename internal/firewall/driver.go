@@ -13,10 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
 type Backend string
@@ -66,51 +67,27 @@ const (
 
 	// multiportMax 是 iptables multiport 一次能列举的端口数上限。
 	// 超过就得拆成多条规则，不然整条命令会被内核拒掉。
+	//
+	// 注意这里数的是「端口或区间」的个数，不是一个区间里包含多少个端口 ——
+	// 单个区间 20000:30000 只占一个名额。
 	multiportMax = 15
 )
 
-// normalizePorts 去重、排序并过滤掉非法端口。
-func normalizePorts(ports []int) []int {
-	seen := make(map[int]struct{}, len(ports))
-	out := make([]int, 0, len(ports))
-	for _, p := range ports {
-		if p <= 0 || p > 65535 {
+// renderPorts 把端口集合渲染成一段文本。
+//
+// 两个后端的区间写法不同，iptables 认 20000:30000、nft 认 20000-30000，
+// 所以 rangeSep 由调用方给。各驱动再各自包一层（iptPorts / nftPorts），
+// 免得在调用点直接传两个长相接近的分隔符，一不留神就传反。
+func renderPorts(s portrange.Set, rangeSep, joiner string) string {
+	parts := make([]string, 0, len(s))
+	for _, r := range s {
+		if r.Lo == r.Hi {
+			parts = append(parts, strconv.Itoa(r.Lo))
 			continue
 		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
+		parts = append(parts, strconv.Itoa(r.Lo)+rangeSep+strconv.Itoa(r.Hi))
 	}
-	sort.Ints(out)
-	return out
-}
-
-// chunkPorts 把端口切成若干块，每块不超过 size 个。
-// 用于绕开 iptables multiport 的端口数上限。
-func chunkPorts(ports []int, size int) [][]int {
-	if size <= 0 {
-		size = multiportMax
-	}
-	var out [][]int
-	for i := 0; i < len(ports); i += size {
-		end := i + size
-		if end > len(ports) {
-			end = len(ports)
-		}
-		out = append(out, ports[i:end])
-	}
-	return out
-}
-
-// portList 把端口渲染成 multiport 需要的 "a,b,c" 形式。
-func portList(ports []int) string {
-	ss := make([]string, 0, len(ports))
-	for _, p := range ports {
-		ss = append(ss, strconv.Itoa(p))
-	}
-	return strings.Join(ss, ",")
+	return strings.Join(parts, joiner)
 }
 
 // RateLimitSpec 连接速率限制配置。
@@ -135,7 +112,10 @@ type Desired struct {
 	// Whitelist 豁免封禁的 IP / CIDR 列表（不是全端口放行，见驱动实现）。
 	Whitelist []string
 	// ProtectPorts 受保护的服务端口：速率限制作用于此，BlacklistFrp 也按它生成 dport。
-	ProtectPorts []int
+	//
+	// 用区间集合而不是 []int：frps 的 allowPorts 常常是一整个大区间，
+	// 展开成一个个端口会让下发的规则条数随区间宽度线性膨胀。
+	ProtectPorts portrange.Set
 	// RateLimit 为 nil 或 Enabled=false 时不下发限速规则。
 	RateLimit *RateLimitSpec
 }
