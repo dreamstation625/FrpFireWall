@@ -59,8 +59,8 @@
 
 | 后端 | 独占命名空间 |
 |---|---|
-| iptables | 两条自定义链：`FRPFIREWALL_GUARD`（主链）+ `FRPFIREWALL_BLACK`（黑名单子链） |
-| nftables | 集合 `frpfirewall_black` / `frpfirewall_black6` / `frpfirewall_rate`；规则靠 `comment "frpfirewall:*"` 标记归属 |
+| iptables | 三条自定义链：`FRPFIREWALL_GUARD`（主链）+ `FRPFIREWALL_BLACK`（全端口黑名单）+ `FRPFIREWALL_BLACK_FRP`（仅 frp 端口黑名单） |
+| nftables | 集合 `frpfirewall_black` / `frpfirewall_black6` / `frpfirewall_black_frp` / `frpfirewall_black6_frp` / `frpfirewall_rate`；规则靠 `comment "frpfirewall:*"` 标记归属 |
 
 只在 `INPUT` 链首插一条 `-j FRPFIREWALL_GUARD` 跳转。nftables 侧**不建自己的 base chain**，
 而是把规则 `insert` 到系统已有的 input 链最前面（原因见 D3）。
@@ -77,15 +77,23 @@ iptables 侧的受管结构：
 
 ```
 INPUT ─(第1条)─▶ FRPFIREWALL_GUARD
-                   ├─ -j FRPFIREWALL_BLACK     ← 固定跳转到黑名单子链
-                   ├─ [限速规则]               ← 可选
+                   ├─ -j FRPFIREWALL_BLACK         ← 全端口黑名单，跳转在前
+                   ├─ -j FRPFIREWALL_BLACK_FRP     ← 仅 frp 端口黑名单（见 D14）
+                   ├─ [限速规则]                   ← 可选
                    └─ -j RETURN
 FRPFIREWALL_BLACK
-                   └─ -s <黑名单> -j DROP      ← 逐条
+                   └─ -s <黑名单> -j DROP          ← 逐条，无 dport 限定
+FRPFIREWALL_BLACK_FRP
+                   └─ -s <黑名单> -p tcp -m multiport --dports <frp 端口> -j DROP   ← 逐条
+                      （UDP 同样一条，避免留下绕过路径）
 ```
 
 黑名单单独放一个子链，是因为增量封禁/解封是高频操作：写在主链里每次都要算"插到第几条"、
 还要处理删除后的序号漂移；放进子链后追加就是 `-A`、删除就是按内容 `-D`，完全不依赖位置。
+
+按范围再拆一层子链（而不是在主链里给每条规则加条件），是为了让"改一条条目的范围"只动
+一个子链的内容：`all` 与 `frp` 两条链各自独立增删，互不干扰，链上顺序也天然稳定 ——
+不需要在改动时重新计算"这条该插在哪些规则前面"。
 
 nftables 侧**不建自己的 hook 链**：同一 hook 上多个 base chain 按 priority 依次执行，
 一条 `policy accept` 的链放在后面，判决会被前面的链吃掉，直接毁掉系统原有规则。
@@ -401,6 +409,73 @@ IPv6 那条规则把 IPv4 的一起陪葬了。
 本身能防住。`Preview` 复用同一个函数，保证"预览到的"就是"会下发的"（原来是两份
 独立实现，迟早漂移）。
 
+### D14. 黑名单的封禁范围按条目选，默认全端口
+
+**需求**：黑名单原来只有一种行为 —— 该地址到本机的**全部端口**一律 DROP。实际使用中
+分成两类需求：一类是确认的纯攻击源，想彻底断开；另一类只想挡掉它对 frp 的访问，
+本机其它服务（尤其是同一来源还需要访问的）不该被牵累。
+
+**决策：范围做成每条条目一个字段（`all` | `frp`），默认 `all`。**
+
+- **为什么是每条而不是全局开关。** 一个全局开关表达不了"A 只扫 frp、B 是纯攻击源"
+  这种必然共存的局面。更要紧的是，切全局开关会**一次性改写所有现有条目的含义** ——
+  用户改一条新条目的意图，变成了动到另外几十条的既有行为。
+- **为什么默认 `all`。** 升级上来的存量条目必须保持原来的行为，否则升级本身就成了
+  一次静默的防护降级。同理，**自动封禁固定 `all`**：它不是人逐条确认过的决定，
+  放宽到只封 frp 端口等于给暴力破解者留一条继续扫其它端口的路；需要放宽的场景
+  走人工改条目范围。
+
+**内核落点**：两种范围落在不同的链 / 集合里，互不干扰。
+
+| 后端 | 全端口 | 仅 frp 端口 |
+|---|---|---|
+| iptables | `FRPFIREWALL_BLACK` | `FRPFIREWALL_BLACK_FRP` |
+| nftables | 集合 `frpfirewall_black` / `black6` | 集合 `frpfirewall_black_frp` / `black6_frp` |
+
+链上的顺序必须是**全端口在前、仅 frp 端口在后**：`frp` 范围是全端口的子集，全端口
+命中就 `DROP` 掉了，后面的规则永远不会被读到，多出来的只是一次比较。反过来放则
+全端口规则要等 frp 规则先走一遍。
+
+这里有个 nft 特有的坑：`insert rule` **一律插到链首**，所以脚本里的书写先后与链上的
+实际顺序**相反**。想让链上是「全端口 → 仅 frp 端口」，脚本文本就得**倒着输出**。
+`internal/firewall/nftables_test.go` 的 `insertOrder` 辅助函数专门还原这个语义，
+否则测试会以相反的期望通过。
+
+**范围对插件层是空操作。** 插件回调（`Login` / `NewUserConn`）本来就只作用于 frp 连接，
+`all` 与 `frp` 对它完全等价。所以插件的判定代码不需要知道范围存在 —— 这也是为什么
+范围只影响内核侧而不影响"能不能登录"。
+
+**兜底方向必须偏严。** `toBlockTargets` / `restoreBans` / `BanView` / 前端渲染，
+凡是读到空值或非法值的地方一律回落 `all`。回落 `frp` 等于把一条"封全端口"的条目
+悄悄放松成"只封 frp 端口"，是安全语义上的降级；宁可显示得严一点。
+
+**同址归并。** 同一个地址可能同时来自手动黑名单与自动封禁，两处范围还可能不同。
+`desired()` 用 map 归并而不是拼接：全端口已经覆盖 frp 端口，同址再写一条 frp 规则
+纯属冗余，还会变成"为什么这里有两行"这种需要解释的问题。**冲突时严格范围胜出。**
+
+**frp 端口集合 = `bindPort` + `proxyPorts`**，且 **TCP 与 UDP 都要封**：`bindPort` 是 TCP，
+但代理端口里可能有 UDP 服务，只封 TCP 会留下一条 UDP 绕过路径。iptables 的 `multiport`
+单条规则最多 15 个端口，超了要分片。
+
+**更新语义：不带 scope 不能改范围。** 更新接口的 `scope` 用指针类型区分"没传"和
+"传了空串" —— 只改备注的请求不带该字段，若按普通字符串绑定就会得到 `""`、归一化成
+`all`，等于顺手把一条 `frp` 条目放宽成封全端口。改个备注不该有这种副作用。
+
+**导入格式向后兼容。** 第二列只有恰好是 `all` / `frp` 时才被当作范围，否则整体按备注
+处理，所以老版本导出的两列文件（`地址,备注`）能直接导入。代价是备注恰好写成这两个词
+时会被误认，属于刻意接受的取舍 —— 导出文件常被留档或拿去别的机器用，
+格式不兼容就是实打实的数据损失。
+
+**已知缺口：手动黑名单不过滤 CDN 可信回源段。** `desired()` 只剔除系统保护地址与
+白名单地址，不看 `TrustedProxies`。自动封禁会因为它是可信回源而放过，但**手工加进去的
+CDN 节点 IP 会照封不误** —— 封掉一个边缘节点就是掐死一大片正常用户。选 `frp` 范围
+并不缓解这个问题（回源打的正是 frp 端口）。这一条当前靠界面提示与人工判断兜住，
+未做程序化拦截。
+
+**测试**：`iptables_test.go`（规则生成、顺序、端口归一化、预览与下发一致）、
+`nftables_test.go`（双栈、集合 flush、链上顺序还原）、`handlers_acl_test.go`
+（范围归一化、导入格式与导出回读闭环）。
+
 
 ## 3. 总体架构
 
@@ -479,8 +554,10 @@ FrpFireWall/
 │   ├── firewall/
 │   │   ├── driver.go      # Driver 接口 + 受管对象名常量
 │   │   ├── detect.go      # 系统与后端探测
-│   │   ├── iptables.go    # 两条自定义链实现
-│   │   └── nftables.go    # 集合 + 插系统 input 链的实现
+│   │   ├── iptables.go    # 三条自定义链实现（全端口 / 仅 frp 端口黑名单分链）
+│   │   ├── iptables_test.go
+│   │   ├── nftables.go    # 集合 + 插系统 input 链的实现
+│   │   └── nftables_test.go   # 直接断言生成的 nft 脚本（桩命令测不出语法问题）
 │   ├── guard/
 │   │   ├── manager.go     # 引擎装配与 reconcile 循环
 │   │   ├── window.go      # 滑动窗口计数
@@ -497,6 +574,7 @@ FrpFireWall/
 │   │   ├── auth.go        # 登录 / 初始化 / 改密码
 │   │   ├── handlers.go    # 系统、防火墙、frps、事件
 │   │   ├── handlers_acl.go
+│   │   ├── handlers_acl_test.go    # 范围归一化 + 导入格式与导出回读闭环
 │   │   ├── handlers_config.go
 │   │   └── handlers_update.go   # 版本更新状态与主动检查
 │   └── web/               # go:embed 前端产物 + SPA 回退
@@ -540,20 +618,29 @@ type Driver interface {
 ```bash
 # 基础结构（幂等，全部带 -w 拿 xtables 锁，避免与其它工具并发写）
 iptables -w -N FRPFIREWALL_GUARD 2>/dev/null || true
-iptables -w -N FRPFIREWALL_BLACK 2>/dev/null || true
+iptables -w -N FRPFIREWALL_BLACK 2>/dev/null || true       # 全端口黑名单
+iptables -w -N FRPFIREWALL_BLACK_FRP 2>/dev/null || true   # 仅 frp 端口黑名单
 iptables -w -C INPUT -j FRPFIREWALL_GUARD 2>/dev/null || iptables -w -I INPUT 1 -j FRPFIREWALL_GUARD
 
-# 主链只负责分流，不承载具体 IP
+# 主链只负责分流，不承载具体 IP；全端口的跳转排在仅 frp 端口之前
 iptables -w -A FRPFIREWALL_GUARD -j FRPFIREWALL_BLACK
+iptables -w -A FRPFIREWALL_GUARD -j FRPFIREWALL_BLACK_FRP
 iptables -w -A FRPFIREWALL_GUARD -j RETURN          # 限速规则存在时插在两者之间
 
 # 封禁 / 解封：纯追加 + 按内容删除，不用关心位置
 iptables -w -A FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 iptables -w -D FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
+
+# 只封 frp 端口：TCP 与 UDP 各一条（proxyPorts 里可能有 UDP 服务，
+# 只封 TCP 会留下一条绕过路径）；端口超过 15 个时按 multiport 上限分片
+iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p tcp -m multiport --dports 7000,80,443 -j DROP
+iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p udp -m multiport --dports 7000,80,443 -j DROP
 ```
 
 要点：
 - **不引入 ipset。** 封禁条数由封禁记录数约束，属于可接受范围；真要上千条时优先引导用户切到 nftables 后端。
+- **按范围分链，而不是在主链里给每条规则加 dport 条件**（见 D14）：两条链各自独立增删，
+  改一条条目的范围不会牵动另一条链的内容，也就不需要计算"这条该插在哪些规则前面"。
 - 白名单不落内核（见 D3），所以链里没有白名单相关规则。
 - IPv6 走 `ip6tables`，链名与结构完全相同。
 - 若系统用的是 `iptables-nft`（nft 后端），照样可用，但注意与 nftables 驱动**不要同时启用**，UI 上互斥。
@@ -566,27 +653,45 @@ iptables -w -D FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 ```bash
 # 形态一：系统有 inet/filter/input —— 一条链同时承载双栈
 nft -f - <<'EOF'
-add set inet filter frpfirewall_black  { type ipv4_addr; flags interval; }
-add set inet filter frpfirewall_black6 { type ipv6_addr; flags interval; }
-add set inet filter frpfirewall_rate   { type ipv4_addr; flags interval; }
+add set inet filter frpfirewall_black     { type ipv4_addr; flags interval; }
+add set inet filter frpfirewall_black_frp { type ipv4_addr; flags interval; }
+add set inet filter frpfirewall_black6     { type ipv6_addr; flags interval; }
+add set inet filter frpfirewall_black6_frp { type ipv6_addr; flags interval; }
+add set inet filter frpfirewall_rate      { type ipv4_addr; flags interval; }
 
-insert rule inet filter input ip  saddr @frpfirewall_black  drop comment "frpfirewall:black"
-insert rule inet filter input ip6 saddr @frpfirewall_black6 drop comment "frpfirewall:black6"
+# 注意：这几行的书写顺序与链上顺序是**相反**的 —— insert 一律插到链首，
+# 所以想让链上是「全端口 → 仅 frp 端口」，脚本就得倒着输出（见 D14）。
+# 下面按"脚本实际生成的顺序"列出，v6 与 udp 的对应行省略。
+insert rule inet filter input tcp dport { 7000, 80, 443 } ip saddr @frpfirewall_black_frp  drop comment "frpfirewall:black-frp"
+insert rule inet filter input ip  saddr @frpfirewall_black      drop comment "frpfirewall:black"
+insert rule inet filter input ip6 saddr @frpfirewall_black6     drop comment "frpfirewall:black6"
 EOF
+```
+
+执行完上面这个事务后，链上的实际顺序（链首 → 链尾）是：
+
+```
+全端口(v4) → 全端口(v6) → 仅 frp 端口 tcp(v4) → tcp(v6) → udp(v4) → udp(v6) → 限速 → 原有规则…
 ```
 
 ```bash
 # 形态二：系统是 table ip filter + table ip6 filter（ufw / docker /
 # iptables-nft 常见）—— 两个家族互不相通，必须各插各的链
 nft -f - <<'EOF'
-add set ip  filter frpfirewall_black  { type ipv4_addr; flags interval; }
-add set ip6 filter frpfirewall_black6 { type ipv6_addr; flags interval; }
-add set ip  filter frpfirewall_rate   { type ipv4_addr; flags interval; }
+add set ip  filter frpfirewall_black     { type ipv4_addr; flags interval; }
+add set ip  filter frpfirewall_black_frp { type ipv4_addr; flags interval; }
+add set ip6 filter frpfirewall_black6     { type ipv6_addr; flags interval; }
+add set ip6 filter frpfirewall_black6_frp { type ipv6_addr; flags interval; }
+add set ip  filter frpfirewall_rate      { type ipv4_addr; flags interval; }
 
-insert rule ip  filter INPUT ip  saddr @frpfirewall_black  drop comment "frpfirewall:black"
-insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6 drop comment "frpfirewall:black6"
+insert rule ip  filter INPUT ip  saddr @frpfirewall_black      drop comment "frpfirewall:black"
+insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6     drop comment "frpfirewall:black6"
+# 仅 frp 端口的规则同样按各自家族插进各自的链，dport 表达式相同
 EOF
 ```
+
+这个形态正是 D13 那个故障的场景：`ip` 家族的表里**不能**出现 `ip6 saddr` 表达式，
+写错一条会让整份脚本预检失败，连 IPv4 的封禁一起失效。
 
 要点：
 - **不建自己的 base chain**，只往系统已有链里插规则（原因见 D3）。
@@ -690,6 +795,8 @@ X-Frp-Reqid: <trace id>
 - 服务只监听 `127.0.0.1:<port>`，不对外暴露；可选要求 `X-Frp-Plugin-Token` 头校验（frps 的 `httpPlugins` 不支持自定义 header，故实际以来源 IP 白名单 + 仅绑回环为准）。
 - 处理函数外层套 `context.WithTimeout(100ms)`，超时/panic 一律 fail-open 放行（见 D6）。
 - `NewUserConn` 走同一套逻辑，但**封禁决策必须区分回源 IP 与真实客户端 IP**（见 D7）。
+- **插件层不看封禁范围**（见 D14）：回调本来就只作用于 frp 连接，条目上的 `all` 与 `frp`
+  对这里的判定结果完全等价。范围只影响内核侧下发什么规则，不影响"能不能登录"。
 - `ops = ["Login", "NewUserConn"]`，明确不含 `Ping`。
 
 ### 4.6 GeoIP 模块
@@ -716,6 +823,7 @@ CREATE TABLE acl_entries (
   kind         TEXT    NOT NULL,        -- 'white' | 'black'
   target       TEXT    NOT NULL,        -- IP 或 CIDR
   target_type  TEXT    NOT NULL,        -- 'ipv4' | 'ipv6' | 'cidr4' | 'cidr6'
+  scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp'，只对黑名单有意义（见 D14）
   remark       TEXT,
   source       TEXT    NOT NULL DEFAULT 'manual',  -- manual | geoip | system
   country      TEXT,                    -- 冗余的属地，便于列表展示
@@ -730,6 +838,7 @@ CREATE TABLE ban_records (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   target       TEXT    NOT NULL,
   target_type  TEXT    NOT NULL,
+  scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp'（见 D14）
   reason       TEXT,
   source       TEXT    NOT NULL,        -- auto | manual | geoip
   trigger_user TEXT,                    -- 触发封禁的 frp user
@@ -873,7 +982,7 @@ frpfirewall -data /var/lib/frpfirewall
 | POST | `/firewall/preview` | 预览将要下发的规则（dry-run，不落盘） |
 | GET | `/acl/:kind` | 名单列表（kind=white/black），支持分页/筛选 |
 | POST | `/acl/:kind` | 新增 |
-| PUT | `/acl/:kind/:id` | 修改（备注/到期） |
+| PUT | `/acl/:kind/:id` | 修改（备注/到期/范围；范围不传即保持原值，见 D14） |
 | DELETE | `/acl/:kind/:id` | 删除 |
 | POST | `/acl/:kind/batch` | 批量新增/删除 |
 | GET | `/acl/:kind/export` | 导出（txt / json） |
@@ -915,8 +1024,8 @@ frpfirewall -data /var/lib/frpfirewall
 | 初始化 Setup | 首次访问引导页：凭启动时打印的一次性令牌设置用户名与密码 |
 | 概览 Dashboard | 当前后端徽标、受管规则数、活跃封禁数、拦截趋势图（ECharts）、Top 攻击 IP、Top 来源国家、系统健康状态 |
 | 防火墙配置 Firewall | 后端模式切换卡（含探测结果与冲突告警）、受管规则表、系统规则原文、「预览变更」抽屉、手动 reconcile |
-| 黑白名单 ACL | 白 / 黑 Tab、搜索分页、新增/编辑对话框、批量导入（先 dry-run 校验去重再提交）、导出 |
-| 封禁记录 Bans | 活跃封禁表（剩余时间实时倒计时）、历史表（状态筛选）、手动封禁、批量解封、排障查询 |
+| 黑白名单 ACL | 白 / 黑 Tab、搜索分页、新增/编辑对话框、批量导入（先 dry-run 校验去重再提交）、导出。黑名单多一列「范围」（全端口 / 仅 frp 端口），白名单不显示该列（见 D14） |
+| 封禁记录 Bans | 活跃封禁表（剩余时间实时倒计时）、历史表（状态筛选）、手动封禁（可选封禁范围）、批量解封、排障查询 |
 | 频控策略 Policy | 窗口秒数、阈值、阶梯时长编辑器（可增删/上移/永久档）、升级窗口、封禁粒度、fail-open/close、自动封禁与观察模式、地域封禁、连接速率限制 |
 | IP 属地 GeoIP | 三个库的状态卡（加载状态/大小/更新时间）、上传替换、IP 查询工具（属地 + 当前拦截状态 + 窗口命中数），未加载库时给出降级提示 |
 | frp 接入 Frps | 生成的 `frps.toml` 片段（一键复制）、插件连通性检测、受保护端口展示、可选加固项、判定链路说明 |

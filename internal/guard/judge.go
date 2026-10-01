@@ -50,7 +50,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	m.mu.RLock()
 	policy := m.policy
 	isWhite := m.matchAnyLocked(m.white, addr)
-	isBlack := m.matchAnyLocked(m.black, addr)
+	isBlack := m.matchAnyBlockLocked(m.black, addr)
 	trusted := m.protect != nil && m.protect.IsTrustedProxy(addr)
 	ban, banned := m.findBanLocked(addr, policy, now)
 	m.mu.RUnlock()

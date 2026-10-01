@@ -56,8 +56,12 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 
 	now := time.Now()
 	rec := &model.BanRecord{
-		Target:      target,
-		TargetType:  model.TargetTypeOf(target),
+		Target:     target,
+		TargetType: model.TargetTypeOf(target),
+		// 自动封禁固定全端口。它不是人在盯着做的决定，误伤代价更大（把正常用户
+		// 的 SSH 一起挡了），但"只封 frp 端口"会让暴力破解者仍能扫其它端口 ——
+		// 权衡后宁可封得死一点，需要放宽的场景由人工改条目范围来兜。
+		Scope:       model.ScopeAll,
 		Reason:      reason,
 		Source:      source,
 		TriggerUser: user,
@@ -80,6 +84,7 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 	st := &banState{
 		Prefix:   prefix,
 		Target:   target,
+		Scope:    model.ScopeAll,
 		Reason:   reason,
 		Source:   source,
 		User:     user,
@@ -119,14 +124,20 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 	m.scheduleApply()
 }
 
-// BanManual 人工封禁。dur <= 0 表示永久。
-func (m *Manager) BanManual(target, reason, by string, dur time.Duration) (*model.BanRecord, error) {
+// BanManual 人工封禁。dur <= 0 表示永久；scope 为空按全端口处理。
+func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope string) (*model.BanRecord, error) {
 	p, err := parsePrefixOrAddr(strings.TrimSpace(target))
 	if err != nil {
 		return nil, fmt.Errorf("地址格式不正确: %w", err)
 	}
 	if IsSystemProtected(p.Addr()) {
 		return nil, fmt.Errorf("该地址属于系统保护范围（回环 / 内网 / 链路本地），不允许封禁")
+	}
+	if scope == "" {
+		scope = model.ScopeAll
+	}
+	if !model.ValidScope(scope) {
+		return nil, fmt.Errorf("封禁范围只能是 %s 或 %s", model.ScopeAll, model.ScopeFrp)
 	}
 	if reason == "" {
 		reason = "人工封禁"
@@ -155,6 +166,7 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration) (*mode
 	rec := &model.BanRecord{
 		Target:     t,
 		TargetType: model.TargetTypeOf(t),
+		Scope:      scope,
 		Reason:     reason,
 		Source:     model.SourceManual,
 		HitCount:   1,
@@ -174,6 +186,7 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration) (*mode
 	st := &banState{
 		Prefix:   p,
 		Target:   t,
+		Scope:    scope,
 		Reason:   reason,
 		Source:   model.SourceManual,
 		RecordID: rec.ID,

@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -40,17 +42,76 @@ const (
 	// 完全不需要关心规则在主链里的位置。
 	managedBlackChain = "FRPFIREWALL_BLACK"
 
+	// managedBlackFrpChain 是"仅 frp 端口"用的子链，规则带 dport 限定。
+	// 与上面那条分开成两条链而不是混在一条里，因为两者的规则形状不同
+	// （带不带端口条件），混在一起后按内容删除就得逐条比对整套参数。
+	managedBlackFrpChain = "FRPFIREWALL_BLACK_FRP"
+
 	// commentPrefix 是识别"这条规则属于本程序"的标记前缀。
 	commentPrefix = "frpfirewall"
 	commentBlack  = "frpfirewall:black"
 	commentBlack6 = "frpfirewall:black6"
-	commentRate   = "frpfirewall:rate"
+	// 注意这两个值以 commentBlack 开头，所以识别处只能用 Contains(commentPrefix)，
+	// 不能写成 HasPrefix(line, commentBlack)，否则 frp 范围的规则会被误判成全端口。
+	commentBlackFrp  = "frpfirewall:black-frp"
+	commentBlack6Frp = "frpfirewall:black6-frp"
+	commentRate      = "frpfirewall:rate"
 
 	// nftables 集合名，统一加 frpfirewall_ 前缀避免与系统集合撞名。
-	setBlack  = "frpfirewall_black"
-	setBlack6 = "frpfirewall_black6"
-	setRate   = "frpfirewall_rate"
+	setBlack     = "frpfirewall_black"
+	setBlack6    = "frpfirewall_black6"
+	setBlackFrp  = "frpfirewall_black_frp"
+	setBlack6Frp = "frpfirewall_black6_frp"
+	setRate      = "frpfirewall_rate"
+
+	// multiportMax 是 iptables multiport 一次能列举的端口数上限。
+	// 超过就得拆成多条规则，不然整条命令会被内核拒掉。
+	multiportMax = 15
 )
+
+// normalizePorts 去重、排序并过滤掉非法端口。
+func normalizePorts(ports []int) []int {
+	seen := make(map[int]struct{}, len(ports))
+	out := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p <= 0 || p > 65535 {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// chunkPorts 把端口切成若干块，每块不超过 size 个。
+// 用于绕开 iptables multiport 的端口数上限。
+func chunkPorts(ports []int, size int) [][]int {
+	if size <= 0 {
+		size = multiportMax
+	}
+	var out [][]int
+	for i := 0; i < len(ports); i += size {
+		end := i + size
+		if end > len(ports) {
+			end = len(ports)
+		}
+		out = append(out, ports[i:end])
+	}
+	return out
+}
+
+// portList 把端口渲染成 multiport 需要的 "a,b,c" 形式。
+func portList(ports []int) string {
+	ss := make([]string, 0, len(ports))
+	for _, p := range ports {
+		ss = append(ss, strconv.Itoa(p))
+	}
+	return strings.Join(ss, ",")
+}
 
 // RateLimitSpec 连接速率限制配置。
 type RateLimitSpec struct {
@@ -63,11 +124,17 @@ type RateLimitSpec struct {
 
 // Desired 是上层期望的防火墙状态。驱动负责把它翻译成具体规则。
 type Desired struct {
-	// Blacklist 需要封禁的 IP / CIDR 列表。
+	// Blacklist 需要封禁的 IP / CIDR 列表，作用于该地址到本机的全部端口。
 	Blacklist []string
+	// BlacklistFrp 只封 frp 服务端口（即 ProtectPorts）的 IP / CIDR 列表。
+	//
+	// 单独一个字段而不是把端口条件塞进 Blacklist，是因为两种规则的写法差得远：
+	// 前者光凭地址就能表达，后者必须带上 dport。合成一个列表就得额外传一份
+	// "哪几条属于 frp 范围"的映射，不如让上层直接分好再送下来。
+	BlacklistFrp []string
 	// Whitelist 豁免封禁的 IP / CIDR 列表（不是全端口放行，见驱动实现）。
 	Whitelist []string
-	// ProtectPorts 速率限制与保护规则作用的端口。
+	// ProtectPorts 受保护的服务端口：速率限制作用于此，BlacklistFrp 也按它生成 dport。
 	ProtectPorts []int
 	// RateLimit 为 nil 或 Enabled=false 时不下发限速规则。
 	RateLimit *RateLimitSpec

@@ -237,3 +237,126 @@ func TestHalfStackWarning(t *testing.T) {
 		t.Errorf("IPv4 缺失的告警没说清楚: %s", got)
 	}
 }
+
+// 这一组锁死「仅 frp 端口」这条范围的产物。
+//
+// 它的失效方式很安静：规则少一条、或者端口漏一个，内核不会报任何错，界面上照样
+// 显示"已封禁"，只有真去连那个端口才发现没挡住。桩命令同样测不出来（桩不解析
+// 语法，只会点头），所以只能断言脚本文本。
+func TestRenderScriptFrpScope(t *testing.T) {
+	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
+	ip4 := nftTarget{Family: "ip", Table: "filter", Chain: "INPUT"}
+
+	des := Desired{
+		Blacklist:    []string{"203.0.113.7"},
+		BlacklistFrp: []string{"198.51.100.9", "2001:db8::5"},
+		ProtectPorts: []int{7100, 7000, 7000}, // 故意乱序并重复
+	}
+
+	t.Run("inet 双栈：每个协议栈各有 tcp 与 udp", func(t *testing.T) {
+		stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
+		got := renderScript(stacks, des, nil, false)
+
+		for _, want := range []string{
+			"add element inet filter frpfirewall_black_frp { 198.51.100.9/32 }",
+			"add element inet filter frpfirewall_black6_frp { 2001:db8::5/128 }",
+			// 端口归一化后升序；TCP 与 UDP 都要有，只封 TCP 会留下 UDP 绕过路径
+			"tcp dport { 7000, 7100 } ip saddr @frpfirewall_black_frp drop",
+			"udp dport { 7000, 7100 } ip saddr @frpfirewall_black_frp drop",
+			"tcp dport { 7000, 7100 } ip6 saddr @frpfirewall_black6_frp drop",
+			// 全端口那部分不受影响
+			"insert rule inet filter input ip saddr @frpfirewall_black drop",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("集合始终 flush，避免改范围后残留", func(t *testing.T) {
+		stacks := []nftStack{{target: inet, bits: 32}}
+		got := renderScript(stacks, Desired{}, nil, false)
+		if !strings.Contains(got, "flush set inet filter frpfirewall_black_frp") {
+			t.Errorf("frp 集合没有被 flush：地址从该范围移走后元素会残留，那个端口会一直被挡着\n%s", got)
+		}
+	})
+
+	t.Run("没配 frp 端口时不生成引用集合的规则", func(t *testing.T) {
+		stacks := []nftStack{{target: inet, bits: 32}}
+		got := renderScript(stacks, Desired{BlacklistFrp: []string{"198.51.100.9"}}, nil, false)
+
+		if strings.Contains(got, "dport") {
+			t.Errorf("没有端口却生成了带 dport 的规则\n%s", got)
+		}
+		if strings.Contains(got, "@"+setBlackFrp+" drop") {
+			t.Errorf("没有端口却生成了引用 frp 集合的规则，等于静默不生效\n%s", got)
+		}
+	})
+
+	t.Run("某协议栈没有该类地址就不为它插规则", func(t *testing.T) {
+		stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
+		onlyV4 := Desired{BlacklistFrp: []string{"198.51.100.9"}, ProtectPorts: []int{7000}}
+		got := renderScript(stacks, onlyV4, nil, false)
+
+		if !strings.Contains(got, "ip saddr @"+setBlackFrp+" drop") {
+			t.Errorf("IPv4 落点上缺少 frp 规则\n%s", got)
+		}
+		if strings.Contains(got, "ip6 saddr @"+setBlack6Frp+" drop") {
+			t.Errorf("IPv6 下没有任何该类地址，不该为它生成规则\n%s", got)
+		}
+	})
+
+	t.Run("ip 家族下不出现 ip6 表达式", func(t *testing.T) {
+		stacks := []nftStack{{target: ip4, bits: 32}}
+		got := renderScript(stacks, des, nil, false)
+		if strings.Contains(got, "ip6 saddr") {
+			t.Errorf("ip 家族的链里出现了 ip6 表达式，nft 会拒掉整份脚本\n%s", got)
+		}
+	})
+}
+
+// 链上的实际顺序：全端口封禁在前，仅 frp 端口的在后。
+//
+// insert 一律插到链首，所以脚本文本里的先后与链上的顺序**相反** —— 脚本末尾那条
+// 插入后位置最靠前。要验证真实顺序就得把 insert 序列倒过来读；直接拿脚本顺序
+// 断言会得出完全相反的结论。
+func TestRenderScriptFrpRulesComeAfterAllPortRules(t *testing.T) {
+	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
+	stacks := []nftStack{{target: inet, bits: 32}}
+
+	got := renderScript(stacks, Desired{
+		Blacklist:    []string{"203.0.113.7"},
+		BlacklistFrp: []string{"198.51.100.9"},
+		ProtectPorts: []int{7000},
+	}, nil, false)
+
+	all, frp := -1, -1
+	for i, line := range insertOrder(got) {
+		if strings.Contains(line, "@"+setBlack+" drop") {
+			all = i
+		}
+		if strings.Contains(line, "@"+setBlackFrp+" drop") {
+			frp = i
+		}
+	}
+	if all < 0 || frp < 0 {
+		t.Fatalf("两条规则都应当存在\n%s", got)
+	}
+	if all > frp {
+		t.Errorf("链上顺序应为「全端口 → 仅 frp 端口」，实际相反\n%s", got)
+	}
+}
+
+// insertOrder 抽出脚本里的 insert 语句，并按"插到链首"的语义还原成链上的顺序。
+func insertOrder(script string) []string {
+	var out []string
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(line, "insert rule ") {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}

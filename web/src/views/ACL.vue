@@ -19,8 +19,14 @@
       :closable="false"
       show-icon
       style="margin-bottom: 12px"
-      title="黑名单中的地址会被立即拒绝登录，并同步写入内核防火墙。"
-    />
+    >
+      <template #title>黑名单地址会被立即拒绝登录，并同步写入内核防火墙。</template>
+      <template #default>
+        封禁范围按条目单独设置：<b>全端口</b>会把该地址访问本机的所有端口一起拒绝（含 SSH、
+        面板），挡得彻底，但误伤时代价也大；<b>仅 frp 端口</b>只拒绝 frp 服务端口上的连接，
+        影响面小，代价是对方仍能扫到本机其它端口。
+      </template>
+    </el-alert>
 
     <div class="toolbar">
       <el-input
@@ -48,6 +54,16 @@
       <el-table-column prop="target_type" label="类型" width="80">
         <template #default="{ row }">
           <el-tag size="small" type="info">{{ row.target_type }}</el-tag>
+        </template>
+      </el-table-column>
+      <!-- 范围只对黑名单有意义，白名单不显示这一列 -->
+      <el-table-column v-if="kind === 'black'" label="范围" width="118">
+        <template #default="{ row }">
+          <el-tooltip :content="scopeTip(row.scope)" placement="top">
+            <el-tag size="small" :type="row.scope === 'frp' ? 'info' : 'warning'">
+              {{ scopeLabel(row.scope) }}
+            </el-tag>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column label="属地" min-width="150">
@@ -108,6 +124,24 @@
         <el-form-item label="备注">
           <el-input v-model="form.remark" placeholder="可选" />
         </el-form-item>
+        <el-form-item v-if="kind === 'black'" label="封禁范围">
+          <el-radio-group v-model="form.scope">
+            <el-radio-button
+              v-for="o in SCOPE_OPTIONS"
+              :key="o.value"
+              :value="o.value"
+            >
+              {{ o.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="hint" style="margin-top: 6px">
+            {{
+              form.scope === 'frp'
+                ? '只拒绝该地址访问 frp 服务端口，本机其它端口不受影响。'
+                : '拒绝该地址访问本机的全部端口，含 SSH 与管理面板。确认不会误伤再选。'
+            }}
+          </div>
+        </el-form-item>
         <el-form-item label="有效期">
           <el-select v-model="form.expires" style="width: 100%">
             <el-option label="永久" :value="0" />
@@ -130,11 +164,32 @@
         <span class="mono">1.2.3.0/24</span>，可以追加备注：<span class="mono">1.2.3.4,机房备用</span>。
         以 # 开头的行会被忽略。
       </div>
+      <div v-if="kind === 'black'" class="hint" style="margin-bottom: 10px">
+        黑名单还可以在第二列写范围 <span class="mono">all</span> /
+        <span class="mono">frp</span>：<span class="mono">1.2.3.4,frp,备注</span>。
+        第二列只有恰好是这两个词时才当作范围，否则整体按备注处理，所以旧文件可以直接导入。
+      </div>
+      <el-form v-if="kind === 'black'" label-width="90px" style="margin-bottom: 10px">
+        <el-form-item label="默认范围">
+          <el-radio-group v-model="importScope">
+            <el-radio-button
+              v-for="o in SCOPE_OPTIONS"
+              :key="o.value"
+              :value="o.value"
+            >
+              {{ o.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="hint" style="margin-top: 6px">未写范围的行按此处理。</div>
+        </el-form-item>
+      </el-form>
+      <!-- 占位符里的换行必须用 \n 转义：写 &#10; 会被解析成真实换行，
+           再当作 JS 字符串编译就报 "Unterminated string constant" -->
       <el-input
         v-model="importText"
         type="textarea"
         :rows="10"
-        placeholder="1.2.3.4&#10;1.2.3.0/24,办公网&#10;# 注释行"
+        :placeholder="importPlaceholder"
       />
       <div v-if="importResult" class="alert-note" style="margin-top: 12px">
         可导入 {{ importResult.added }} 条，跳过 {{ importResult.skipped }} 条
@@ -152,10 +207,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import api from '@/api'
+import { SCOPE_OPTIONS, scopeLabel, scopeTip } from '@/utils/scope'
 
 const kind = ref('white')
 const rows = ref<any[]>([])
@@ -168,12 +224,20 @@ const total = ref(0)
 const editVisible = ref(false)
 const editing = ref(false)
 const saving = ref(false)
-const form = reactive({ id: 0, target: '', remark: '', expires: 0 })
+const form = reactive({ id: 0, target: '', remark: '', expires: 0, scope: 'all' })
 
 const importVisible = ref(false)
 const importing = ref(false)
 const importText = ref('')
+const importScope = ref('all')
 const importResult = ref<any>(null)
+
+// 黑名单多给一行带范围的示例，白名单保持原样
+const importPlaceholder = computed(() =>
+  kind.value === 'black'
+    ? '1.2.3.4,frp,扫描源\n1.2.3.0/24,办公网\n# 注释行'
+    : '1.2.3.4\n1.2.3.0/24,办公网\n# 注释行'
+)
 
 function fmt(t: string) {
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
@@ -202,7 +266,7 @@ function onTabChange() {
 
 function openCreate() {
   editing.value = false
-  Object.assign(form, { id: 0, target: '', remark: '', expires: 0 })
+  Object.assign(form, { id: 0, target: '', remark: '', expires: 0, scope: 'all' })
   editVisible.value = true
 }
 
@@ -213,6 +277,8 @@ function openEdit(row: any) {
     target: row.target,
     remark: row.remark || '',
     expires: 0,
+    // 老条目可能是空串，回显成全端口而不是留空，避免用户以为没设置过
+    scope: row.scope === 'frp' ? 'frp' : 'all',
   })
   editVisible.value = true
 }
@@ -224,16 +290,20 @@ async function save() {
   }
   saving.value = true
   try {
+    // 编辑时总是带上 scope：form.scope 已用行内原值回填，等价于"不改动"。
+    // 白名单的 scope 由后端忽略，这里不用特判。
     if (editing.value) {
       await api.updateACL(kind.value, form.id, {
         remark: form.remark,
         expires_in_sec: form.expires,
+        scope: form.scope,
       })
     } else {
       await api.createACL(kind.value, {
         target: form.target,
         remark: form.remark,
         expires_in_sec: form.expires,
+        scope: form.scope,
       })
     }
     ElMessage.success('已保存')
@@ -259,6 +329,7 @@ async function remove(row: any) {
 
 function openImport() {
   importText.value = ''
+  importScope.value = 'all'
   importResult.value = null
   importVisible.value = true
 }
@@ -273,6 +344,7 @@ async function doImport(dry: boolean) {
     const r: any = await api.importACL(kind.value, {
       content: importText.value,
       dry_run: dry,
+      scope: importScope.value,
     })
     importResult.value = r
     if (!dry) {

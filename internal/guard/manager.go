@@ -20,8 +20,10 @@ import (
 // banState 是一条活跃封禁的内存表示。内存里的这份是唯一权威，
 // 防火墙规则只是它的投影，任何时候都能从内存重新生成。
 type banState struct {
-	Prefix   netip.Prefix
-	Target   string
+	Prefix netip.Prefix
+	Target string
+	// Scope 封禁范围（all | frp）。自动封禁固定 all，手动封禁可指定。
+	Scope    string
 	Reason   string
 	Source   string
 	User     string
@@ -50,18 +52,20 @@ func (b *banState) Remaining(now time.Time) time.Duration {
 
 // BanView 是给前端的封禁视图。
 type BanView struct {
-	Target       string    `json:"target"`
-	Reason       string    `json:"reason"`
-	Source       string    `json:"source"`
-	User         string    `json:"user"`
-	RecordID     uint      `json:"record_id"`
-	HitCount     int       `json:"hit_count"`
-	BannedAt     time.Time `json:"banned_at"`
+	Target string `json:"target"`
+	// Scope 封禁范围（all | frp）。
+	Scope        string     `json:"scope"`
+	Reason       string     `json:"reason"`
+	Source       string     `json:"source"`
+	User         string     `json:"user"`
+	RecordID     uint       `json:"record_id"`
+	HitCount     int        `json:"hit_count"`
+	BannedAt     time.Time  `json:"banned_at"`
 	ExpiresAt    *time.Time `json:"expires_at"`
-	RemainingSec int64     `json:"remaining_sec"` // -1 表示永久
-	Permanent    bool      `json:"permanent"`
-	Country      string    `json:"country"`
-	Province     string    `json:"province"`
+	RemainingSec int64      `json:"remaining_sec"` // -1 表示永久
+	Permanent    bool       `json:"permanent"`
+	Country      string     `json:"country"`
+	Province     string     `json:"province"`
 }
 
 // Stats 是引擎运行状态，供概览页展示。
@@ -92,6 +96,16 @@ type Verdict struct {
 //   - frps 插件回调的判定入口（JudgeLogin / JudgeUserConn）
 //   - 封禁状态机（阶梯时长、到期解封）
 //   - 期望状态与内核规则的对齐（Reconcile）
+//
+// blockTarget 是内存里的黑名单条目：地址 + 封禁范围。
+//
+// 范围只影响内核规则怎么写（全端口丢 / 只丢 frp 端口），不影响"是否命中"的判定 ——
+// 插件层本来就只作用于 frp 连接，两种范围对它没有区别。
+type blockTarget struct {
+	Prefix netip.Prefix
+	Scope  string
+}
+
 type Manager struct {
 	cfg   *config.Config
 	store *store.Store
@@ -103,7 +117,7 @@ type Manager struct {
 	policy  *model.Policy
 	protect *protector
 	white   []netip.Prefix
-	black   []netip.Prefix
+	black   []blockTarget
 	bans    map[string]*banState
 	windows map[string]*hitWindow
 
@@ -189,7 +203,7 @@ func (m *Manager) Refresh() error {
 
 	now := time.Now()
 	white := toPrefixes(whiteRows, now)
-	black := toPrefixes(blackRows, now)
+	black := toBlockTargets(blackRows, now)
 
 	m.mu.Lock()
 	m.policy = policy
@@ -220,6 +234,30 @@ func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 	return out
 }
 
+// toBlockTargets 把黑名单行转成带范围的条目，跳过已过期和解析失败的。
+//
+// 范围缺失或非法一律按 all 处理。空值是真会出现的：AutoMigrate 加列前写入的
+// 老行、以及手工改过数据库的行。兜底方向必须是"更严"的那一侧 —— 把本该全端口
+// 封禁的条目降级成只封 frp 端口，等于不知不觉放松了封禁。
+func toBlockTargets(rows []model.ACLEntry, now time.Time) []blockTarget {
+	out := make([]blockTarget, 0, len(rows))
+	for _, r := range rows {
+		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
+			continue
+		}
+		p, err := parsePrefixOrAddr(r.Target)
+		if err != nil {
+			continue
+		}
+		scope := r.Scope
+		if !model.ValidScope(scope) {
+			scope = model.ScopeAll
+		}
+		out = append(out, blockTarget{Prefix: p, Scope: scope})
+	}
+	return out
+}
+
 // rebuildBans 从数据库恢复活跃封禁。程序重启后靠它自愈。
 func (m *Manager) rebuildBans() error {
 	rows, err := m.store.ActiveBans()
@@ -238,9 +276,14 @@ func (m *Manager) rebuildBans() error {
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
 			continue
 		}
+		scope := r.Scope
+		if !model.ValidScope(scope) {
+			scope = model.ScopeAll
+		}
 		st := &banState{
 			Prefix:   p,
 			Target:   r.Target,
+			Scope:    scope,
 			Reason:   r.Reason,
 			Source:   r.Source,
 			User:     r.TriggerUser,
@@ -314,33 +357,49 @@ func (m *Manager) desired() firewall.Desired {
 	defer m.mu.RUnlock()
 
 	now := time.Now()
-	seen := make(map[string]struct{}, len(m.black)+len(m.bans))
-	black := make([]string, 0, len(m.black)+len(m.bans))
 
-	add := func(p netip.Prefix) {
+	// 同一个地址可能同时来自手动黑名单与自动封禁，两处范围还可能不同。
+	// 这里用 map 归并而不是简单拼接：全端口已经覆盖了 frp 端口，同一地址再写
+	// 一条 frp 规则纯属冗余，还会变成"为什么这里有两行"这种需要解释的问题。
+	// 冲突时严格范围胜出。
+	scopeOf := make(map[netip.Prefix]string, len(m.black)+len(m.bans))
+
+	add := func(p netip.Prefix, scope string) {
 		if IsSystemProtected(p.Addr()) {
 			return
 		}
 		if m.matchAnyLocked(m.white, p.Addr()) {
 			return
 		}
-		s := p.String()
-		if _, ok := seen[s]; ok {
-			return
+		if !model.ValidScope(scope) {
+			scope = model.ScopeAll
 		}
-		seen[s] = struct{}{}
-		black = append(black, s)
+		if prev, ok := scopeOf[p]; ok && prev == model.ScopeAll {
+			return // 已是全端口，别再降级成 frp
+		}
+		scopeOf[p] = scope
 	}
 
-	for _, p := range m.black {
-		add(p)
+	for _, b := range m.black {
+		add(b.Prefix, b.Scope)
 	}
 	for _, b := range m.bans {
 		if b.Expires.IsZero() || b.Expires.After(now) {
-			add(b.Prefix)
+			add(b.Prefix, b.Scope)
 		}
 	}
-	sort.Strings(black)
+
+	blackAll := make([]string, 0, len(scopeOf))
+	blackFrp := make([]string, 0, 8)
+	for p, scope := range scopeOf {
+		if scope == model.ScopeFrp {
+			blackFrp = append(blackFrp, p.String())
+		} else {
+			blackAll = append(blackAll, p.String())
+		}
+	}
+	sort.Strings(blackAll)
+	sort.Strings(blackFrp)
 
 	white := make([]string, 0, len(m.white))
 	for _, p := range m.white {
@@ -348,7 +407,8 @@ func (m *Manager) desired() firewall.Desired {
 	}
 
 	des := firewall.Desired{
-		Blacklist:    black,
+		Blacklist:    blackAll,
+		BlacklistFrp: blackFrp,
 		Whitelist:    white,
 		ProtectPorts: m.protectPortsLocked(),
 	}
@@ -444,8 +504,13 @@ func (m *Manager) Bans() []BanView {
 	now := time.Now()
 	out := make([]BanView, 0, len(m.bans))
 	for _, b := range m.bans {
+		scope := b.Scope
+		if !model.ValidScope(scope) {
+			scope = model.ScopeAll
+		}
 		v := BanView{
 			Target:    b.Target,
+			Scope:     scope,
 			Reason:    b.Reason,
 			Source:    b.Source,
 			User:      b.User,
@@ -484,7 +549,8 @@ func (m *Manager) Lookup(target string) map[string]any {
 	m.mu.RLock()
 	policy := m.policy
 	isWhite := m.matchAnyLocked(m.white, addr)
-	isBlack := m.matchAnyLocked(m.black, addr)
+	isBlack := m.matchAnyBlockLocked(m.black, addr)
+	blockScope := m.blockScopeLocked(m.black, addr)
 	trusted := m.protect != nil && m.protect.IsTrustedProxy(addr)
 	b, banned := m.findBanLocked(addr, policy, time.Now())
 	var windowCount int
@@ -495,12 +561,16 @@ func (m *Manager) Lookup(target string) map[string]any {
 
 	result["whitelisted"] = isWhite
 	result["blacklisted"] = isBlack
+	if blockScope != "" {
+		result["block_scope"] = blockScope
+	}
 	result["trusted_proxy"] = trusted
 	result["window_hits"] = windowCount
 	result["banned"] = banned
 	if banned {
 		result["ban"] = BanView{
 			Target:       b.Target,
+			Scope:        b.Scope,
 			Reason:       b.Reason,
 			Source:       b.Source,
 			HitCount:     b.HitCount,
@@ -704,6 +774,37 @@ func (m *Manager) matchAnyLocked(list []netip.Prefix, addr netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+// matchAnyBlockLocked 判断地址是否命中黑名单。调用方需持有锁。
+//
+// 这里刻意不看范围：插件层只作用于 frp 的登录与建连回调，所以"只封 frp 端口"
+// 与"全端口封禁"在它面前是同一件事。
+func (m *Manager) matchAnyBlockLocked(list []blockTarget, addr netip.Addr) bool {
+	for _, b := range list {
+		if b.Prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// blockScopeLocked 返回地址命中的黑名单范围，未命中返回空串。调用方需持有锁。
+//
+// 命中多条时取最严格的那条（all 优先）。排障时要回答的是"这个地址实际被挡得
+// 有多死"，而不是"它命中了哪几条"；把范围最宽的那条报出来才不误导。
+func (m *Manager) blockScopeLocked(list []blockTarget, addr netip.Addr) string {
+	scope := ""
+	for _, b := range list {
+		if !b.Prefix.Contains(addr) {
+			continue
+		}
+		if b.Scope != model.ScopeFrp {
+			return model.ScopeAll
+		}
+		scope = model.ScopeFrp
+	}
+	return scope
 }
 
 func truncate(s string, n int) string {

@@ -458,6 +458,47 @@ check "导入 dry_run 标记" "$(printf '%s' "$IMP" | jqf data.dry_run)" "true"
 check "非法行被记录" "$(printf '%s' "$IMP" | jqf data.invalid)" "[1]"
 check "导出白名单" "$(get -o /dev/null -w '%{http_code}' -H "$AUTH" "$BASE/api/v1/acl/white/export")" "200"
 
+# 封禁范围：每条条目独立，默认 all（范围只对黑名单有意义）
+SC1=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"198.51.100.9","scope":"frp","remark":"冒烟-scope"}')
+check "黑名单可指定 frp 范围" "$(printf '%s' "$SC1" | jqf data.scope)" "frp"
+SC1ID=$(printf '%s' "$SC1" | jqf data.id)
+
+SC2=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"198.51.100.10"}')
+check "不带 scope 默认 all" "$(printf '%s' "$SC2" | jqf data.scope)" "all"
+SC2ID=$(printf '%s' "$SC2" | jqf data.id)
+
+check_err "非法范围被拒" \
+  "$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"target":"198.51.100.11","scope":"port"}' | jqf error)" "封禁范围"
+
+# 回归守卫：只改备注的请求不带 scope 字段，不能顺手把 frp 放宽成全端口
+check "改备注不动范围" \
+  "$(get -X PUT "$BASE/api/v1/acl/black/$SC1ID" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"remark":"改过备注"}' | jqf data.scope)" "frp"
+check "显式传范围可改回 all" \
+  "$(get -X PUT "$BASE/api/v1/acl/black/$SC1ID" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"remark":"改过备注","scope":"all"}' | jqf data.scope)" "all"
+
+# 白名单没有范围概念，传了也应被忽略成 all
+SCW=$(get -X POST "$BASE/api/v1/acl/white" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"203.0.113.9","scope":"frp"}')
+check "白名单忽略范围" "$(printf '%s' "$SCW" | jqf data.scope)" "all"
+SCWID=$(printf '%s' "$SCW" | jqf data.id)
+
+# 导入：第二列恰好是范围词才当范围，否则整体按备注（老格式因此仍可导入）
+SCIMP=$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"content":"198.51.100.12,frp,带范围\n198.51.100.13,只是备注","dry_run":true}')
+check "导入行可覆盖范围" "$(printf '%s' "$SCIMP" | jqf data.added)" "2"
+check "导入非法范围行落默认值" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"198.51.100.14,port","scope":"frp","dry_run":true}' | jqf data.added)" "1"
+
+get -X DELETE "$BASE/api/v1/acl/black/$SC1ID" -H "$AUTH" > /dev/null
+get -X DELETE "$BASE/api/v1/acl/black/$SC2ID" -H "$AUTH" > /dev/null
+get -X DELETE "$BASE/api/v1/acl/white/$SCWID" -H "$AUTH" > /dev/null
+
 echo
 echo "########## 10. 封禁 ##########"
 check_any "活跃封禁列表" "$(get -H "$AUTH" "$BASE/api/v1/bans/active" | jqf data.total)"

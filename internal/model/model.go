@@ -13,6 +13,24 @@ const (
 	KindBlack = "black"
 )
 
+// 封禁范围：一个地址被封住之后，到底挡掉它多少访问。
+//
+// 这个维度是必要的，因为内核层的黑名单规则默认不带端口限定 —— 封一个 IP
+// 等于让整台机器对它静默，SSH、面板、其它服务一起挡。多数时候这正是想要的；
+// 但当这个 IP 同时还有别的用途（合作方出口、监控节点、运维自己的跳板），
+// 就需要一个"只挡住它连 frp、其它照常"的中间档。
+const (
+	// ScopeAll 全端口：该地址到本机任意端口的入站全部丢弃。
+	ScopeAll = "all"
+	// ScopeFrp 仅 frp 端口：只丢弃 frp 服务端口（bindPort + proxyPorts）上的入站。
+	ScopeFrp = "frp"
+)
+
+// ValidScope 判断范围取值是否合法。
+func ValidScope(s string) bool {
+	return s == ScopeAll || s == ScopeFrp
+}
+
 // 封禁来源
 const (
 	SourceAuto   = "auto"   // 频次超阈值自动封禁
@@ -48,24 +66,30 @@ const (
 
 // ACLEntry 黑白名单条目。黑白名单共用一张表，用 Kind 区分。
 type ACLEntry struct {
-	ID         uint       `gorm:"primaryKey" json:"id"`
-	Kind       string     `gorm:"uniqueIndex:uk_kind_target;size:8;not null" json:"kind"`
-	Target     string     `gorm:"uniqueIndex:uk_kind_target;size:64;not null" json:"target"`
-	TargetType string     `gorm:"size:8;not null" json:"target_type"` // ipv4 | ipv6 | cidr4 | cidr6
-	Remark     string     `gorm:"size:255" json:"remark"`
-	Source     string     `gorm:"size:16;not null;default:manual" json:"source"`
-	Country    string     `gorm:"size:64" json:"country"`
-	Province   string     `gorm:"size:64" json:"province"`
-	ExpiresAt  *time.Time `json:"expires_at"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	ID         uint   `gorm:"primaryKey" json:"id"`
+	Kind       string `gorm:"uniqueIndex:uk_kind_target;size:8;not null" json:"kind"`
+	Target     string `gorm:"uniqueIndex:uk_kind_target;size:64;not null" json:"target"`
+	TargetType string `gorm:"size:8;not null" json:"target_type"` // ipv4 | ipv6 | cidr4 | cidr6
+	// Scope 封禁范围（all | frp）。只对黑名单有意义，白名单恒为 all。
+	// 默认 all 是有意为之：升级上来的存量条目保持原来的"全端口"行为，
+	// 不能因为加了这个字段就悄悄把别人原本封死的东西变松。
+	Scope     string     `gorm:"size:8;not null;default:all" json:"scope"`
+	Remark    string     `gorm:"size:255" json:"remark"`
+	Source    string     `gorm:"size:16;not null;default:manual" json:"source"`
+	Country   string     `gorm:"size:64" json:"country"`
+	Province  string     `gorm:"size:64" json:"province"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 // BanRecord 封禁记录。自动封禁、手动封禁、GeoIP 封禁统一进这张表，用 Source 区分。
 type BanRecord struct {
-	ID          uint       `gorm:"primaryKey" json:"id"`
-	Target      string     `gorm:"index;size:64;not null" json:"target"`
-	TargetType  string     `gorm:"size:8;not null" json:"target_type"`
+	ID         uint   `gorm:"primaryKey" json:"id"`
+	Target     string `gorm:"index;size:64;not null" json:"target"`
+	TargetType string `gorm:"size:8;not null" json:"target_type"`
+	// Scope 封禁范围（all | frp），与 ACLEntry 同义。默认 all。
+	Scope       string     `gorm:"size:8;not null;default:all" json:"scope"`
 	Reason      string     `gorm:"size:255" json:"reason"`
 	Source      string     `gorm:"index;size:16;not null" json:"source"`
 	TriggerUser string     `gorm:"size:64" json:"trigger_user"`
@@ -136,9 +160,9 @@ type Policy struct {
 	// GeoIPMode blacklist = 拒绝列表内国家；whitelist = 只允许列表内国家
 	GeoIPMode string `gorm:"size:16;not null;default:blacklist" json:"geoip_mode"`
 
-	RateLimitEnabled   bool `gorm:"not null;default:false" json:"rate_limit_enabled"`
-	RateLimitPerSec    int  `gorm:"not null;default:20" json:"rate_limit_per_sec"`
-	RateLimitBurst     int  `gorm:"not null;default:40" json:"rate_limit_burst"`
+	RateLimitEnabled bool `gorm:"not null;default:false" json:"rate_limit_enabled"`
+	RateLimitPerSec  int  `gorm:"not null;default:20" json:"rate_limit_per_sec"`
+	RateLimitBurst   int  `gorm:"not null;default:40" json:"rate_limit_burst"`
 
 	UpdatedAt time.Time `json:"updated_at"`
 }

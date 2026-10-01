@@ -11,11 +11,17 @@ import (
 // iptables 驱动的受管结构：
 //
 //	INPUT ─(第1条)─▶ FRPFIREWALL_GUARD
-//	                   ├─ -j FRPFIREWALL_BLACK            ← 固定跳转到黑名单子链
+//	                   ├─ -j FRPFIREWALL_BLACK            ← 全端口黑名单
+//	                   ├─ -j FRPFIREWALL_BLACK_FRP        ← 仅 frp 端口的黑名单
 //	                   ├─ [限速规则]                 ← 可选
 //	                   └─ -j RETURN
 //	FRPFIREWALL_BLACK
-//	                   └─ -s <黑名单> -j DROP        ← 逐条
+//	                   └─ -s <黑名单> -j DROP        ← 逐条，不带端口限定
+//	FRPFIREWALL_BLACK_FRP
+//	                   └─ -s <黑名单> -p tcp -m multiport --dports ... -j DROP
+//
+// 两条黑名单子链的先后不影响结果（全端口是 frp 端口的超集），按"从严到宽"排
+// 只是为了让 `iptables -S` 的输出自解释。
 //
 // 为什么黑名单要单独一个子链：
 //
@@ -69,11 +75,11 @@ func (d *iptablesDriver) Capability() Capability {
 	return c
 }
 
-// EnsureBase 幂等创建两条受管链，并把跳转挂进 INPUT。
+// EnsureBase 幂等创建受管链，并把跳转挂进 INPUT。
 func (d *iptablesDriver) EnsureBase() error {
 	ctx := context.Background()
 	for _, f := range d.fams {
-		for _, chain := range []string{ManagedChain, managedBlackChain} {
+		for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
 			if _, err := run(ctx, f.bin, "-N", chain); err != nil {
 				if !isAlreadyExists(err) {
 					return fmt.Errorf("创建链 %s 失败: %w", chain, err)
@@ -104,49 +110,145 @@ func (d *iptablesDriver) Sync(des Desired) error {
 	return nil
 }
 
-func (d *iptablesDriver) syncFamily(ctx context.Context, f ipFamily, des Desired) error {
-	black := filterByFamily(des.Blacklist, f.bits)
+// iptRule 是一条待下发的规则。Soft 为真表示失败不阻断整次同步 ——
+// 用于限速这类"模块不可用就降级"的增强能力。
+type iptRule struct {
+	Args []string
+	Soft bool
+}
 
-	// 先清空自己的链——只动受管命名空间，绝不碰系统其它规则。
-	if _, err := run(ctx, f.bin, "-w", "-F", ManagedChain); err != nil {
-		return fmt.Errorf("清空 %s 失败: %w", ManagedChain, err)
-	}
-	if _, err := run(ctx, f.bin, "-w", "-F", managedBlackChain); err != nil {
-		return fmt.Errorf("清空 %s 失败: %w", managedBlackChain, err)
+// iptRules 是一个协议栈本次要下发的全部规则。
+//
+// Sync 与 Preview 共用它。iptables 侧原本是两处各自手写规则拼装，加一个维度
+// 就得记得改两处，漏一处就是"预览与实际下发不符"——这种问题在排障时最费时间，
+// 因为你会先相信预览。
+type iptRules struct {
+	// Guard 是主链里的规则，按顺序。
+	Guard []iptRule
+	// Black 是全端口封禁的地址（已按协议栈过滤）。
+	Black []string
+	// BlackFrp 是仅 frp 端口封禁的地址（已按协议栈过滤）。
+	BlackFrp []string
+	// FrpPorts 是 frp 端口，已归一化。
+	FrpPorts []int
+}
+
+func buildIPTablesRules(des Desired, bits int) iptRules {
+	r := iptRules{
+		Black:    filterByFamily(des.Blacklist, bits),
+		BlackFrp: filterByFamily(des.BlacklistFrp, bits),
+		FrpPorts: normalizePorts(des.ProtectPorts),
 	}
 
-	// 1. 固定跳转到黑名单子链。
-	if _, err := run(ctx, f.bin, "-w", "-A", ManagedChain, "-j", managedBlackChain); err != nil {
-		return fmt.Errorf("写入黑名单跳转失败: %w", err)
-	}
+	// 顺序即优先级：全端口在前，仅 frp 端口在后。
+	r.Guard = append(r.Guard,
+		iptRule{Args: []string{"-A", ManagedChain, "-j", managedBlackChain}},
+		iptRule{Args: []string{"-A", ManagedChain, "-j", managedBlackFrpChain}},
+	)
 
-	// 2. 连接速率限制（per-IP），放在封禁判定之后、兜底 RETURN 之前。
+	// 连接速率限制（per-IP），放在封禁判定之后、兜底 RETURN 之前。
 	if des.RateLimit != nil && des.RateLimit.Enabled {
-		if args, ok := hashlimitArgs(des.RateLimit, des.ProtectPorts, f.bits); ok {
-			full := append([]string{"-w", "-A", ManagedChain}, args...)
-			if _, err := run(ctx, f.bin, full...); err != nil {
-				// 限速是增强能力，模块不可用时降级而不是让整次同步失败。
-				d.report.Warnings = append(d.report.Warnings,
-					fmt.Sprintf("%s 下发连接速率限制失败，已跳过：%v", f.name, err))
-			}
+		if args, ok := hashlimitArgs(des.RateLimit, des.ProtectPorts, bits); ok {
+			r.Guard = append(r.Guard, iptRule{
+				Args: append([]string{"-A", ManagedChain}, args...),
+				Soft: true,
+			})
 		}
 	}
 
-	// 3. 兜底 RETURN：不匹配的流量回到 INPUT 继续走系统原有规则。
-	if _, err := run(ctx, f.bin, "-w", "-A", ManagedChain, "-j", "RETURN"); err != nil {
-		return fmt.Errorf("写入兜底 RETURN 失败: %w", err)
+	// 兜底 RETURN：不匹配的流量回到 INPUT 继续走系统原有规则。
+	r.Guard = append(r.Guard, iptRule{Args: []string{"-A", ManagedChain, "-j", "RETURN"}})
+	return r
+}
+
+// frpBlockRules 展开"仅 frp 端口"封禁的全部规则。
+//
+// 两种协议都封：frps 的 bindPort 是 TCP，但 proxyPorts 里可能配了 UDP 代理端口，
+// 只封 TCP 会留下一条用 UDP 绕过的路径。端口多到超过 multiport 上限时按块拆开。
+//
+// 端口在这里自己归一化，不依赖调用方先处理过 —— 带着重复或乱序的端口进来，
+// 生成出来的规则虽然大概率仍能被内核接受，但读起来完全无法判断是不是写错了。
+func frpBlockRules(addrs []string, ports []int) [][]string {
+	ports = normalizePorts(ports)
+	if len(ports) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(addrs))
+	for _, addr := range addrs {
+		for _, chunk := range chunkPorts(ports, multiportMax) {
+			for _, proto := range []string{"tcp", "udp"} {
+				out = append(out, []string{
+					"-A", managedBlackFrpChain, "-s", addr,
+					"-p", proto, "-m", "multiport", "--dports", portList(chunk),
+					"-j", "DROP",
+				})
+			}
+		}
+	}
+	return out
+}
+
+// warn 追加一条告警，重复的不再追加（Sync 每次都会重跑，不去重会堆一长串）。
+func (d *iptablesDriver) warn(msg string) {
+	for _, w := range d.report.Warnings {
+		if w == msg {
+			return
+		}
+	}
+	d.report.Warnings = append(d.report.Warnings, msg)
+}
+
+func (d *iptablesDriver) syncFamily(ctx context.Context, f ipFamily, des Desired) error {
+	rules := buildIPTablesRules(des, f.bits)
+
+	// 先清空自己的链——只动受管命名空间，绝不碰系统其它规则。
+	for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+		if _, err := run(ctx, f.bin, "-w", "-F", chain); err != nil {
+			return fmt.Errorf("清空 %s 失败: %w", chain, err)
+		}
 	}
 
-	// 4. 黑名单逐条写入子链。
-	for _, b := range black {
+	for _, rule := range rules.Guard {
+		full := append([]string{"-w"}, rule.Args...)
+		if _, err := run(ctx, f.bin, full...); err != nil {
+			if rule.Soft {
+				// 限速是增强能力，模块不可用时降级而不是让整次同步失败。
+				d.warn(fmt.Sprintf("%s 下发连接速率限制失败，已跳过：%v", f.name, err))
+				continue
+			}
+			return fmt.Errorf("写入主链规则失败: %w", err)
+		}
+	}
+
+	// 黑名单逐条写入子链。
+	for _, b := range rules.Black {
 		if _, err := run(ctx, f.bin, "-w", "-A", managedBlackChain, "-s", b, "-j", "DROP"); err != nil {
 			return fmt.Errorf("写入黑名单 %s 失败: %w", b, err)
+		}
+	}
+
+	// 仅 frp 端口的黑名单。
+	if len(rules.BlackFrp) > 0 && len(rules.FrpPorts) == 0 {
+		// 没有端口列表就构造不出端口条件。静默跳过会让"设了 frp 范围"看起来
+		// 生效了、实际一条规则都没有 —— 这种"以为封了其实没封"必须报出来。
+		d.warn(fmt.Sprintf(
+			"有 %d 个地址设为「仅 frp 端口」，但当前没有配置任何 frp 端口（bind_port / proxy_ports 均为空），这些条目暂未下发",
+			len(rules.BlackFrp)))
+	}
+	for _, args := range frpBlockRules(rules.BlackFrp, rules.FrpPorts) {
+		full := append([]string{"-w"}, args...)
+		if _, err := run(ctx, f.bin, full...); err != nil {
+			return fmt.Errorf("写入 frp 端口黑名单失败: %w", err)
 		}
 	}
 	return nil
 }
 
 // AddBlock 增量封禁一条，不做全量重建。
+//
+// 只写全端口子链：target 参数里没有"范围"这个维度，要按范围区分只能走 Sync。
+// 当前没有调用方（封禁统一走全量 Sync），保留接口是为将来需要秒级增量时留个
+// 落点 —— 真要用它时得把范围一起加进签名，别只改一半。
 func (d *iptablesDriver) AddBlock(target string) error {
 	ctx := context.Background()
 	p, err := normalizeTarget(target)
@@ -198,6 +300,8 @@ func (d *iptablesDriver) DumpManaged() (*ManagedRules, error) {
 	res := &ManagedRules{Backend: string(BackendIPTables)}
 	var raw strings.Builder
 
+	// 主链的规则逐条列出；两条黑名单子链只报条数 —— 上百个地址会把摘要淹掉。
+	// 完整内容仍然在 Raw 里，界面上可展开查看。
 	for _, f := range d.fams {
 		if out, err := run(ctx, f.bin, "-w", "-S", ManagedChain); err == nil {
 			raw.WriteString("# " + f.bin + " -S " + ManagedChain + "\n")
@@ -209,18 +313,25 @@ func (d *iptablesDriver) DumpManaged() (*ManagedRules, error) {
 				}
 			}
 		}
-		if out, err := run(ctx, f.bin, "-w", "-S", managedBlackChain); err == nil {
-			raw.WriteString("\n# " + f.bin + " -S " + managedBlackChain + "\n")
+
+		for _, item := range []struct{ chain, label string }{
+			{managedBlackChain, "全端口"},
+			{managedBlackFrpChain, "仅 frp 端口"},
+		} {
+			out, err := run(ctx, f.bin, "-w", "-S", item.chain)
+			if err != nil {
+				continue
+			}
+			raw.WriteString("\n# " + f.bin + " -S " + item.chain + "\n")
 			raw.WriteString(out)
 			n := 0
 			for _, line := range strings.Split(out, "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "-A ") {
+				if strings.HasPrefix(strings.TrimSpace(line), "-A ") {
 					n++
 				}
 			}
 			res.Summary = append(res.Summary,
-				fmt.Sprintf("%s: %s 链内封禁 %d 条", f.name, managedBlackChain, n))
+				fmt.Sprintf("%s: %s 链内封禁 %d 条（%s）", f.name, item.chain, n, item.label))
 		}
 	}
 
@@ -243,24 +354,36 @@ func (d *iptablesDriver) DumpSystem() (string, error) {
 }
 
 // Preview 生成将要下发的规则文本，不落盘。
+//
+// 与 syncFamily 共用 buildIPTablesRules / frpBlockRules，保证"预览到的"
+// 就是"会下发的"。
 func (d *iptablesDriver) Preview(des Desired) (string, error) {
 	var b strings.Builder
 	for _, f := range d.fams {
-		black := filterByFamily(des.Blacklist, f.bits)
+		rules := buildIPTablesRules(des, f.bits)
 
 		fmt.Fprintf(&b, "# ===== %s（%s）=====\n", f.bin, f.name)
-		fmt.Fprintf(&b, "%s -N %s\n%s -N %s\n", f.bin, ManagedChain, f.bin, managedBlackChain)
+		fmt.Fprintf(&b, "%s -N %s\n%s -N %s\n%s -N %s\n",
+			f.bin, ManagedChain, f.bin, managedBlackChain, f.bin, managedBlackFrpChain)
 		fmt.Fprintf(&b, "%s -C INPUT -j %s || %s -I INPUT 1 -j %s\n", f.bin, ManagedChain, f.bin, ManagedChain)
-		fmt.Fprintf(&b, "%s -F %s\n%s -F %s\n", f.bin, ManagedChain, f.bin, managedBlackChain)
-		fmt.Fprintf(&b, "%s -A %s -j %s\n", f.bin, ManagedChain, managedBlackChain)
-		if des.RateLimit != nil && des.RateLimit.Enabled {
-			if args, ok := hashlimitArgs(des.RateLimit, des.ProtectPorts, f.bits); ok {
-				fmt.Fprintf(&b, "%s -A %s %s\n", f.bin, ManagedChain, strings.Join(args, " "))
+		fmt.Fprintf(&b, "%s -F %s\n%s -F %s\n%s -F %s\n",
+			f.bin, ManagedChain, f.bin, managedBlackChain, f.bin, managedBlackFrpChain)
+
+		for _, rule := range rules.Guard {
+			fmt.Fprintf(&b, "%s %s\n", f.bin, strings.Join(rule.Args, " "))
+		}
+		for _, bl := range rules.Black {
+			fmt.Fprintf(&b, "%s -A %s -s %s -j DROP\n", f.bin, managedBlackChain, bl)
+		}
+		if len(rules.BlackFrp) > 0 && len(rules.FrpPorts) == 0 {
+			fmt.Fprintf(&b, "# 以下 %d 个地址设为「仅 frp 端口」，但未配置 frp 端口，无法下发：\n",
+				len(rules.BlackFrp))
+			for _, bl := range rules.BlackFrp {
+				fmt.Fprintf(&b, "#   %s\n", bl)
 			}
 		}
-		fmt.Fprintf(&b, "%s -A %s -j RETURN\n", f.bin, ManagedChain)
-		for _, bl := range black {
-			fmt.Fprintf(&b, "%s -A %s -s %s -j DROP\n", f.bin, managedBlackChain, bl)
+		for _, args := range frpBlockRules(rules.BlackFrp, rules.FrpPorts) {
+			fmt.Fprintf(&b, "%s %s\n", f.bin, strings.Join(args, " "))
 		}
 		b.WriteString("\n")
 	}
@@ -271,17 +394,13 @@ func (d *iptablesDriver) Snapshot() (string, error) {
 	ctx := context.Background()
 	var b strings.Builder
 	for _, f := range d.fams {
-		out, err := run(ctx, f.bin, "-w", "-S", ManagedChain)
-		if err != nil {
-			fmt.Fprintf(&b, "# %s %s: %v\n", f.bin, ManagedChain, err)
-		} else {
-			fmt.Fprintf(&b, "# %s %s\n%s\n", f.bin, ManagedChain, out)
-		}
-		out2, err := run(ctx, f.bin, "-w", "-S", managedBlackChain)
-		if err != nil {
-			fmt.Fprintf(&b, "# %s %s: %v\n", f.bin, managedBlackChain, err)
-		} else {
-			fmt.Fprintf(&b, "# %s %s\n%s\n", f.bin, managedBlackChain, out2)
+		for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+			out, err := run(ctx, f.bin, "-w", "-S", chain)
+			if err != nil {
+				fmt.Fprintf(&b, "# %s %s: %v\n", f.bin, chain, err)
+				continue
+			}
+			fmt.Fprintf(&b, "# %s %s\n%s\n", f.bin, chain, out)
 		}
 	}
 	return b.String(), nil
@@ -291,29 +410,43 @@ func (d *iptablesDriver) Snapshot() (string, error) {
 func (d *iptablesDriver) Restore(snapshot string) error {
 	ctx := context.Background()
 	for _, f := range d.fams {
-		if _, err := run(ctx, f.bin, "-w", "-F", ManagedChain); err != nil {
-			return err
-		}
-		if _, err := run(ctx, f.bin, "-w", "-F", managedBlackChain); err != nil {
-			return err
+		for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+			if _, err := run(ctx, f.bin, "-w", "-F", chain); err != nil {
+				return err
+			}
 		}
 	}
+
 	// 快照里存的是 -A 规则行，按顺序回放。
+	//
+	// 用哪个 bin 要从 "# <bin> <chain>" 注释行里跟出来：v4 与 v6 的规则在快照里
+	// 是顺序混排的，回放时若一律用 iptables 执行，v6 规则会落到 v4 表上 ——
+	// 回滚"成功"了，恢复出来的却是错的。
+	bin := ""
 	for _, line := range strings.Split(snapshot, "\n") {
 		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") {
+			if f := strings.Fields(line); len(f) >= 3 {
+				bin = f[1]
+			}
+			continue
+		}
 		if !strings.HasPrefix(line, "-A ") {
 			continue
 		}
-		chain := ""
 		fields := strings.Fields(line)
+		chain := ""
 		if len(fields) >= 2 {
 			chain = fields[1]
 		}
-		if chain != ManagedChain && chain != managedBlackChain {
+		if chain != ManagedChain && chain != managedBlackChain && chain != managedBlackFrpChain {
 			continue
 		}
+		if bin == "" {
+			bin = "iptables"
+		}
 		args := append([]string{"-w"}, fields...)
-		_, _ = run(ctx, "iptables", args...)
+		_, _ = run(ctx, bin, args...)
 	}
 	return nil
 }

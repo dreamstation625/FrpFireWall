@@ -46,6 +46,15 @@
             <el-tag size="small" :type="sourceType(row.source)">{{ sourceName(row.source) }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="范围" width="118">
+          <template #default="{ row }">
+            <el-tooltip :content="scopeTip(row.scope)" placement="top">
+              <el-tag size="small" :type="row.scope === 'frp' ? 'info' : 'warning'">
+                {{ scopeLabel(row.scope) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
         <el-table-column prop="user" label="触发账号" width="100">
           <template #default="{ row }">
@@ -111,6 +120,15 @@
             <el-tag size="small" :type="sourceType(row.source)">{{ sourceName(row.source) }}</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="范围" width="118">
+          <template #default="{ row }">
+            <el-tooltip :content="scopeTip(row.scope)" placement="top">
+              <el-tag size="small" :type="row.scope === 'frp' ? 'info' : 'warning'">
+                {{ scopeLabel(row.scope) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
         <el-table-column label="状态" width="90">
           <template #default="{ row }">
@@ -148,6 +166,24 @@
         <el-form-item label="原因">
           <el-input v-model="banForm.reason" placeholder="例如：恶意扫描" />
         </el-form-item>
+        <el-form-item label="封禁范围">
+          <el-radio-group v-model="banForm.scope">
+            <el-radio-button
+              v-for="o in SCOPE_OPTIONS"
+              :key="o.value"
+              :value="o.value"
+            >
+              {{ o.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div class="hint" style="margin-top: 6px">
+            {{
+              banForm.scope === 'frp'
+                ? '只拒绝该地址访问 frp 服务端口，本机其它端口不受影响。'
+                : '拒绝该地址访问本机的全部端口，含 SSH 与管理面板。确认不会误伤再选。'
+            }}
+          </div>
+        </el-form-item>
         <el-form-item label="时长">
           <el-select v-model="banForm.duration" style="width: 100%">
             <el-option label="永久" :value="0" />
@@ -173,6 +209,7 @@
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import { SCOPE_OPTIONS, scopeLabel, scopeTip } from '@/utils/scope'
 
 const active = ref<any[]>([])
 const history = ref<any[]>([])
@@ -188,7 +225,7 @@ const now = ref(Date.now())
 
 const banVisible = ref(false)
 const banning = ref(false)
-const banForm = reactive({ target: '', reason: '', duration: 0 })
+const banForm = reactive({ target: '', reason: '', duration: 0, scope: 'all' })
 
 let timer: number | undefined
 
@@ -279,7 +316,7 @@ async function batchUnban() {
 }
 
 function openBan() {
-  Object.assign(banForm, { target: '', reason: '', duration: 0 })
+  Object.assign(banForm, { target: '', reason: '', duration: 0, scope: 'all' })
   banVisible.value = true
 }
 
@@ -294,6 +331,7 @@ async function submitBan() {
       target: banForm.target,
       reason: banForm.reason,
       duration_sec: banForm.duration,
+      scope: banForm.scope,
     })
     ElMessage.success('已封禁')
     banVisible.value = false

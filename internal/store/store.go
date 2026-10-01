@@ -229,11 +229,11 @@ func (s *Store) CreateACL(e *model.ACLEntry) error {
 	return s.db.Create(e).Error
 }
 
-// UpsertACL 已存在同 (kind,target) 时更新备注与到期时间，不报错。
+// UpsertACL 已存在同 (kind,target) 时更新备注、范围与到期时间，不报错。
 func (s *Store) UpsertACL(e *model.ACLEntry) error {
 	return s.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "kind"}, {Name: "target"}},
-		DoUpdates: clause.AssignmentColumns([]string{"remark", "expires_at", "updated_at", "country", "province"}),
+		DoUpdates: clause.AssignmentColumns([]string{"scope", "remark", "expires_at", "updated_at", "country", "province"}),
 	}).Create(e).Error
 }
 
@@ -248,6 +248,7 @@ func (s *Store) GetACL(id uint) (*model.ACLEntry, error) {
 func (s *Store) UpdateACL(e *model.ACLEntry) error {
 	return s.db.Model(&model.ACLEntry{}).Where("id = ?", e.ID).
 		Updates(map[string]any{
+			"scope":      e.Scope,
 			"remark":     e.Remark,
 			"expires_at": e.ExpiresAt,
 			"updated_at": time.Now(),
