@@ -61,6 +61,12 @@ DEFAULT_DATA_DIR="/var/lib/frpfirewall"
 DEFAULT_UNIT_DIR="/etc/systemd/system"
 SERVICE="frpfirewall"
 
+# 程序自己的面板默认监听地址，对应 internal/config.DefaultListen。
+# 这里再写一份只有一个用途：不指定 --listen 时也要能打印准确的访问提示 ——
+# 绑 127.0.0.1 和绑 0.0.0.0 该说的话完全不同。两边写不一致只会让提示说错，
+# 不会影响实际监听（真正生效的始终是程序里的那个常量）。
+DEFAULT_LISTEN="0.0.0.0:7930"
+
 # 探测最新正式版用的探针文件：随便挑一个每个 release 都有的资产即可，
 # 我们只要它的 302 跳转地址里的 tag。用 HEAD 请求，不落盘、不下 body。
 PROBE_ASSET="frpfirewall-linux-amd64"
@@ -197,6 +203,45 @@ varch() {
   esac
 }
 
+# 校验 --listen 的取值：必须是 host:port，端口在 1-65535 之间。
+#
+# 只返回值、自己不打日志也不 exit —— 这样既能被测试直接调用，也能让调用方
+# 决定把它算成用法错误（退出码 2）还是别的。写错地址的后果是服务起不来，
+# 值得在安装前就拦下，而不是等 systemd 报 "invalid listen address"。
+valid_listen() {
+  local addr="${1-}" port n
+  if [ -z "$addr" ]; then
+    printf '监听地址不能为空\n' >&2
+    return 1
+  fi
+  case "$addr" in
+    *:*) ;;
+    *) printf '监听地址要写成 host:port，例如 0.0.0.0:7930（当前「%s」）\n' "$addr" >&2
+       return 1 ;;
+  esac
+  port="${addr##*:}"
+  case "$port" in
+    ''|*[!0-9]*) printf '监听地址的端口部分必须是数字（当前「%s」）\n' "$addr" >&2
+                 return 1 ;;
+  esac
+  # 用 10# 显式按十进制解释：否则 08、09 这类前导零会被当成八进制而报错
+  n=$((10#$port))
+  if [ "$n" -lt 1 ] || [ "$n" -gt 65535 ]; then
+    printf '监听端口超出 1-65535 的范围（当前 %s）\n' "$port" >&2
+    return 1
+  fi
+  return 0
+}
+
+# 监听地址是否只对本机可见。用来决定装完该提示"直接访问"还是"得先想办法进去"。
+listen_is_loopback() {
+  case "$(printf '%s' "${1-}" | tr 'A-Z' 'a-z')" in
+    127.0.0.1:*|localhost:*|"\[::1\]:"*) return 0 ;;
+    127.0.0.1|localhost|"::1"|"\[::1\]")  return 0 ;;
+  esac
+  return 1
+}
+
 # ===========================================================================
 # 纯函数区到此结束。测试可以用 FRPFW_LIB_ONLY=1 source 本文件，
 # 只加载上面的函数而不触发下面的任何动作。
@@ -233,6 +278,13 @@ MIRROR="${FRPFW_MIRROR:-}"
 RELEASES_BASE=""
 API_BASE="$API_BASE_DEFAULT"
 WORKDIR=""
+
+# 面板监听地址：空表示"没指定"，交给程序默认值（DEFAULT_LISTEN）。
+# 非空才会生成 systemd 启动参数覆盖。
+LISTEN=""
+
+# --listen 的覆盖文件路径。依赖 UNIT_DIR，所以在 parse_args 末尾才定。
+LISTEN_DROPIN=""
 
 UNIT_SRC=""
 UNIT_MGR=""
@@ -279,6 +331,10 @@ frpfirewall 一键脚本：在线安装 / 升级 / 卸载
       --pre             允许预发布版参与选择（默认只看正式版）
   -b, --binary PATH     离线安装：用本地二进制，不联网下载
   -f, --force           版本相同或更低时也照做（降级需显式加此参数）
+      --listen ADDR     面板监听地址，如 0.0.0.0:7930 或 127.0.0.1:7930
+                        不指定则用程序默认的 0.0.0.0:7930（对所有网卡开放，
+                        装在被防火墙保护的机器上时通常正是想要的）
+                        指定后会写成 systemd 的启动参数覆盖，见下方「注意」
       --no-start        安装后不启动服务
       --purge           卸载时一并删除数据目录
       --check           配合 status：有更新时以退出码 10 结束
@@ -302,6 +358,17 @@ frpfirewall 一键脚本：在线安装 / 升级 / 卸载
   FRPFW_API_BASE     同 --api-url
   NO_COLOR           设为非空则关闭彩色输出
 
+注意：
+  --listen 指定的地址会写进 systemd 的启动参数覆盖文件
+    /etc/systemd/system/frpfirewall.service.d/10-listen.conf
+  它每次启动都生效，会盖掉面板里「系统设置 → 监听地址」的值。想让面板里的
+  设置说了算，删掉那个文件再 systemctl daemon-reload 即可（卸载也会一并
+  清掉）。不带 --listen 安装则不会生成它，监听地址完全由程序默认值决定。
+
+  面板默认走 HTTP。用 0.0.0.0 对外暴露时，登录密码是明文传输的，建议在
+  面板里开启 TLS，或者改用 SSH 隧道：
+    ssh -L 7930:127.0.0.1:7930 root@<服务器>
+
 退出码：
   0 成功 / 未发现更新      1 出错      2 用法错误      10 status --check 发现有更新
 
@@ -315,6 +382,9 @@ frpfirewall 一键脚本：在线安装 / 升级 / 卸载
 
   # 装某个预发布版
   curl -fsSL .../install.sh | sudo bash -s -- install -v 0.0.1-pre.01
+
+  # 只监听内网地址（面板不对外），或换端口
+  curl -fsSL .../install.sh | sudo bash -s -- --listen 192.168.1.10:7930
 
   # 离线安装（二进制和服务单元在同一目录）
   sudo ./install.sh -b ./frpfirewall-linux-amd64
@@ -344,6 +414,7 @@ parse_args() {
       --prefix)        PREFIX="${2-}"; shift 2 ;;
       --data-dir)      DATA_DIR="${2-}"; shift 2 ;;
       --unit-dir)      UNIT_DIR="${2-}"; shift 2 ;;
+      --listen)        LISTEN="${2-}"; shift 2 ;;
       -h|--help)       usage; exit "$EXIT_OK" ;;
       -*)              printf '未知参数: %s（用 --help 查看用法）\n' "$1" >&2; exit "$EXIT_USAGE" ;;
       # 动作名允许出现在任意位置，写成 `install.sh --pre update` 也能认
@@ -362,8 +433,13 @@ parse_args() {
 
   RELEASES_BASE="${RELEASES_BASE:-${GH_BASE}/${REPO}/releases}"
 
-  # 单元路径在这里定，晚于 --unit-dir 的赋值
+  # 这两个路径在这里定，晚于 --unit-dir 的赋值
   UNIT_PATH="${UNIT_DIR%/}/${SERVICE}.service"
+  LISTEN_DROPIN="${UNIT_DIR%/}/${SERVICE}.service.d/10-listen.conf"
+
+  if [ -n "$LISTEN" ] && ! valid_listen "$LISTEN"; then
+    exit "$EXIT_USAGE"
+  fi
 }
 
 # ===========================================================================
@@ -708,6 +784,52 @@ install_unit() {
   install -m 0644 "$src" "$UNIT_PATH"
 }
 
+# 把 --listen 指定的地址写成 systemd 的启动参数覆盖（drop-in）。
+#
+# 为什么用 drop-in 而不是改写主单元：
+#   1. 主单元是发布资产，升级时整个被替换，写进去的东西会丢；
+#   2. drop-in 语义清楚，`systemctl cat frpfirewall` 一眼能看出多带了什么参数；
+#   3. 卸载时删掉它就行，不会在用户定制的单元里留垃圾。
+#
+# 为什么它必须留一个退出的口子：drop-in 里的 -listen 每次启动都生效，
+# 会盖住面板里「系统设置 → 监听地址」填的值。用户想改用面板里那个，
+# 就得先把本文件删掉 —— 这一点在安装完成的提示里也会讲。
+#
+# ExecStart= 那行不能省：systemd 的 ExecStart 是**追加**语义，只写一条新的
+# 会与主单元里那条并存，两条启动命令抢同一个端口，服务直接起不来。
+install_listen_override() {
+  if [ -z "$LISTEN" ]; then
+    # 没指定就顺手清掉旧的。否则一旦用 --listen 装过，之后不带参数重装
+    # 也甩不掉那个地址，用户会以为是程序在跟他对着干。
+    remove_listen_override
+    return 0
+  fi
+  local dir="${LISTEN_DROPIN%/*}"
+  install -d -m 0755 "$dir"
+  cat > "$LISTEN_DROPIN" <<EOF
+# 由 install.sh --listen 生成，重装会被覆盖，不要手工编辑。
+#
+# 这是「启动参数覆盖」：每次启动都生效，会盖掉面板里
+# 「系统设置 → 监听地址」填的值。想让面板里的设置说了算，
+# 删掉本文件后执行 systemctl daemon-reload 再重启服务。
+[Service]
+ExecStart=
+ExecStart=$PREFIX/frpfirewall -data $DATA_DIR -listen $LISTEN
+EOF
+  chmod 0644 "$LISTEN_DROPIN"
+}
+
+# 删除 --listen 的覆盖文件；目录空了也一并收走，不留空壳。
+# 注意只动自己那个文件：用户可能往同目录塞过别的 drop-in。
+remove_listen_override() {
+  [ -n "$LISTEN_DROPIN" ] || return 0
+  if [ -f "$LISTEN_DROPIN" ]; then
+    rm -f "$LISTEN_DROPIN"
+    rmdir "${LISTEN_DROPIN%/*}" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # 等 service 进入 active；成功返回 0
 wait_active() {
   local i
@@ -845,6 +967,13 @@ do_install() {
   # ---- systemd 单元 ----
   log "安装 systemd 单元"
   install_unit "$unit_file"
+  # 监听覆盖要在 daemon-reload 之前落地，一次 reload 就把它带上了。
+  # 不带 --listen 时这个调用负责清掉上一次遗留的覆盖。
+  install_listen_override
+  if [ -n "$LISTEN" ]; then
+    dim "    监听地址覆盖已写入 $LISTEN_DROPIN"
+    dim "    它每次启动都生效，会盖掉面板里「系统设置 → 监听地址」的值"
+  fi
   systemctl daemon-reload
 
   # ---- 换二进制 ----
@@ -909,6 +1038,10 @@ do_install() {
   fi
 
   # ---- 结果 ----
+  # 面板实际会用的监听地址：--listen 优先，没指定就是程序的默认值。
+  # 后面的提示要靠它区分「能直接访问」与「得先想办法进去」。
+  local eff_listen="${LISTEN:-$DEFAULT_LISTEN}"
+
   echo
   echo "=============================================================="
   if [ "$ACTION" = "update" ] && [ -n "$cur" ]; then
@@ -919,13 +1052,29 @@ do_install() {
   echo "=============================================================="
 
   if [ "$first_install" = "1" ]; then
+    local panel_port="${eff_listen##*:}"
     echo
-    echo " 面板地址：   http://<本机IP>:7930"
+    if listen_is_loopback "$eff_listen"; then
+      echo " 面板地址：   http://127.0.0.1:$panel_port（只监听本机，从别的机器打不开）"
+      echo
+      echo " 要从外部访问，用 SSH 隧道最省事："
+      echo "   ssh -L $panel_port:127.0.0.1:$panel_port root@<本机IP>"
+      echo "   然后本地浏览器打开 http://127.0.0.1:$panel_port"
+      echo "   或者重装时加 --listen 0.0.0.0:$panel_port 直接对外"
+    else
+      echo " 面板地址：   http://<本机IP>:$panel_port"
+      echo "   当前监听： $eff_listen"
+      echo
+      warn "云服务器记得放行安全组的入站 $panel_port 端口，否则监听开了也连不上"
+      warn "面板走的是 HTTP，公网可达时登录密码明文传输，建议在面板里开启 TLS"
+    fi
     if [ -f "$DATA_DIR/setup_token.txt" ]; then
+      echo
       echo " 初始化令牌： $(head -1 "$DATA_DIR/setup_token.txt")"
       echo
-      echo " 打开面板后填入令牌并自行设置管理员密码，"
-      echo " 令牌设置完成后自动作废，文件也会被删除。"
+      echo " 打开面板后填入令牌并自行设置管理员密码。"
+      echo " 令牌是必需的：面板默认对全网开放，不能靠「谁先来谁就是管理员」。"
+      echo " 密码设置完成后令牌自动作废，文件也会被删除。"
     else
       echo
       echo " 初始化令牌稍后可从日志中查看："
@@ -1023,6 +1172,8 @@ do_uninstall() {
   # ---- 删单元与二进制 ----
   log "删除 systemd 单元与二进制"
   rm -f "$UNIT_PATH"
+  # --listen 的覆盖文件一并清掉，否则下次装回来会莫名其妙带着旧地址
+  remove_listen_override
   systemctl daemon-reload 2>/dev/null || true
   rm -f "$PREFIX/frpfirewall" "$PREFIX/frpfirewall.prev"
   rm -f "$PREFIX/frpfirewall-panic" "$PREFIX/frpfirewall-panic.sh"

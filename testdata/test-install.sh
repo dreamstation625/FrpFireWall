@@ -138,7 +138,42 @@ for bad in "0.0.1-pre.0" "0.0.1-rc.1" "0.0.1-dev" "1.2" "1.2.3.4" "0..1" "x.y.z"
   fi
 done
 
-section "A2. 与 tools/versioncmp（Go 侧）逐条对照"
+section "A2. 监听地址校验与回环判断"
+
+# 监听地址写错的后果是 systemd 直接拒绝启动，所以在安装前就拦掉，
+# 别等 daemon-reload 才报错。
+for good in "0.0.0.0:7930" "127.0.0.1:7930" "192.168.1.10:8080" "[::]:7930"; do
+  if run_pure "valid_listen '$good'" >/dev/null 2>&1; then
+    printf '  %s %-50s\n' "$(green PASS)" "接受监听地址「$good」"; PASS=$((PASS + 1))
+  else
+    printf '  %s %-50s 却被拒绝\n' "$(red FAIL)" "接受监听地址「$good」"; FAIL=$((FAIL + 1))
+  fi
+done
+
+# 前导零单独测：bash 的 [ -lt ] 会把 08 当八进制而报错，valid_listen 里
+# 用 10# 显式按十进制解释，这条就是钉住它的。
+if run_pure "valid_listen '0.0.0.0:07930'" >/dev/null 2>&1; then
+  printf '  %s %-50s\n' "$(green PASS)" "接受带前导零的端口「07930」"; PASS=$((PASS + 1))
+else
+  printf '  %s %-50s 却被拒绝\n' "$(red FAIL)" "接受带前导零的端口「07930」"; FAIL=$((FAIL + 1))
+fi
+
+for bad_addr in "" "7930" "0.0.0.0" "0.0.0.0:" "0.0.0.0:0" "0.0.0.0:65536" "0.0.0.0:abc"; do
+  if run_pure "valid_listen '$bad_addr'" >/dev/null 2>&1; then
+    printf '  %s %-50s 却被接受\n' "$(red FAIL)" "拒绝非法监听地址「$bad_addr」"; FAIL=$((FAIL + 1))
+  else
+    printf '  %s %-50s\n' "$(green PASS)" "拒绝非法监听地址「$bad_addr」"; PASS=$((PASS + 1))
+  fi
+done
+
+# 这个判断决定装完是提示"直接打开"还是"先想办法进去"，说反了就会重演
+# 「照着提示访问却连不上」那次事故。
+ck "0.0.0.0 不算回环"  "$(run_pure 'listen_is_loopback 0.0.0.0:7930 && echo y || echo n')"     "n"
+ck "127.0.0.1 算回环"  "$(run_pure 'listen_is_loopback 127.0.0.1:7930 && echo y || echo n')"   "y"
+ck "localhost 算回环"  "$(run_pure 'listen_is_loopback localhost:7930 && echo y || echo n')"   "y"
+ck "内网地址不算回环"  "$(run_pure 'listen_is_loopback 192.168.1.10:7930 && echo y || echo n')" "n"
+
+section "A3. 与 tools/versioncmp（Go 侧）逐条对照"
 
 # install.sh 里的比较逻辑必须和程序内 internal/version 完全一致，否则会出现
 # 「面板提示有更新、一键脚本却说已是最新」这种自相矛盾。这里把同一批用例
@@ -644,6 +679,37 @@ ck "旧的 --uninstall 写法仍可用" "$?" "0"
 
 run_sh --pre status
 ck "动作可放在选项之后" "$?" "0"
+
+section "B11. --listen 与 systemd 监听覆盖"
+
+DROPDIR="$UNITDIR/frpfirewall.service.d"
+DROPIN="$DROPDIR/10-listen.conf"
+
+# 前面 B8/B9 已经把东西卸干净了，这里重新装一个来测覆盖文件
+make_release v0.0.5 0.0.5
+refresh_index v0.0.5
+
+run_sh install
+ck "重新装好 0.0.5" "$?" "0"
+ck_has "提示里给出默认监听地址" "$(all_output)" "0.0.0.0:7930"
+ck "未指定 --listen 时不生成覆盖文件" "$(exists "$DROPIN")" "no"
+
+run_sh install --force --listen 0.0.0.0:8888
+ck "--listen 安装成功" "$?" "0"
+ck "覆盖文件已生成" "$(exists "$DROPIN")" "yes"
+ck "覆盖文件带了指定地址" "$(grep -c -e '-listen 0.0.0.0:8888' "$DROPIN")" "1"
+# ExecStart= 那行不能省：systemd 的 ExecStart 是追加语义，不清空会变成两条
+# 启动命令并存，抢同一个端口，服务直接起不来。
+ck "ExecStart 先清空再重设" "$(grep -c '^ExecStart=$' "$DROPIN")" "1"
+
+run_sh install --force
+ck "重装不带 --listen 时清掉旧覆盖" "$?" "0"
+ck "覆盖文件已删除" "$(exists "$DROPIN")" "no"
+
+# 写错的地址要在动手之前就拦掉，否则是 systemd 起不来才报错
+run_sh install --listen 0.0.0.0
+ck "非法 --listen 退出码 2" "$?" "2"
+ck_has "说明了正确格式" "$(all_output)" "host:port"
 
 # ===========================================================================
 section "汇总"

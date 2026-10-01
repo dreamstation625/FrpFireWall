@@ -13,7 +13,7 @@
       <el-form label-width="150px" style="max-width: 720px">
         <el-form-item label="监听地址">
           <el-input v-model="form.server.listen" placeholder="0.0.0.0:7930" />
-          <div class="tip">只监听本机用 127.0.0.1:7930，对外网开放用 0.0.0.0:7930</div>
+          <div class="tip">默认 0.0.0.0:7930，对所有网卡开放；只给本机访问用 127.0.0.1:7930。若装的时候用过 --listen，它优先级更高，这里改了不生效</div>
         </el-form-item>
         <el-form-item label="用户名">
           <el-input v-model="form.server.auth.username" />
