@@ -125,4 +125,19 @@ function redact(text) {
     .join('\n')
 }
 
-module.exports = { ROOT, readCreds, buildConfig, connect, run, upload, redact }
+// 已知明文口令时，把它从**任何要打印的文本**里挖掉。
+//
+// redact() 是按行找 key=value 的形状，而这里的口令是塞在 curl 的
+// -d '{"username":"admin","password":"明文"}' 里 —— 形态完全不同，会被漏掉。
+// 这些命令行会被写进 dist/ 下的日志、也会被贴进对话，所以必须显式替换。
+//
+// 可以传多个（例如登录口令与 sudo 口令）。
+function mask(text, ...secrets) {
+  let out = String(text)
+  for (const s of secrets) {
+    if (s && s.length >= 3) out = out.split(s).join('<已打码>')
+  }
+  return out
+}
+
+module.exports = { ROOT, readCreds, buildConfig, connect, run, upload, redact, mask }
