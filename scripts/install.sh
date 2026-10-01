@@ -842,6 +842,24 @@ install_listen_override() {
   fi
   local dir="${LISTEN_DROPIN%/*}"
   install -d -m 0755 "$dir"
+
+  # systemd 会加载 service.d 下所有 *.conf，不只看我们这一个。如果那里面还躺着
+  # 另一个也写了 ExecStart 的文件（比如照文档手写的 listen.conf），两份叠加
+  # 就是两条启动命令抢同一个端口，服务直接起不来 —— 而 systemd 只会报一句
+  # "start request repeated too quickly"，极难往 drop-in 上联想。
+  #
+  # 只告警不自动删：那个文件是用户自己写的，内容我们没看过，替他删掉可能
+  # 顺手带走别的配置。给文件和命令，让他自己判断。
+  local other
+  for other in "$dir"/*.conf; do
+    if [ -e "$other" ] && [ "$other" != "$LISTEN_DROPIN" ] \
+       && grep -q '^[[:space:]]*ExecStart' "$other" 2>/dev/null; then
+      warn "$other 里也有 ExecStart，两份叠加会让服务起不来"
+      dim "    如果它也是用来指定监听地址的，先删掉再继续："
+      dim "    rm -f $other && systemctl daemon-reload"
+    fi
+  done
+
   cat > "$LISTEN_DROPIN" <<EOF
 # 由 install.sh --listen 生成，重装会被覆盖，不要手工编辑。
 #

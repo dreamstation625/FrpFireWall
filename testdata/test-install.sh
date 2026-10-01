@@ -724,6 +724,22 @@ ck "已是最新时 --listen 仍然生效" "$?" "0"
 ck "覆盖文件已更新为新地址" "$(grep -c -e '-listen 0.0.0.0:9999' "$DROPIN")" "1"
 ck_has "并告知监听地址已设" "$(all_output)" "监听地址已设为 0.0.0.0:9999"
 
+# 脚本只认 10-listen.conf，但 systemd 会加载 service.d 下**所有** *.conf。
+# 里面若还躺着另一个也写了 ExecStart 的文件，两份叠加就是两条启动命令抢同
+# 一个端口，服务直接起不来。这不是假想：文档里给过手写 listen.conf 的方案，
+# 用户先手写再用 --listen 就会撞上，而 systemd 的报错完全指不到 drop-in 上。
+STRAY="$DROPDIR/listen.conf"
+cat > "$STRAY" <<'STRAYEOF'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/frpfirewall -data /var/lib/frpfirewall -listen 0.0.0.0:7930
+STRAYEOF
+run_sh install --force --listen 0.0.0.0:7777
+ck "有冲突 drop-in 时仍能装完" "$?" "0"
+ck_has "告警点出那个文件" "$(all_output)" "$STRAY"
+ck_has "并给出删除命令" "$(all_output)" "rm -f $STRAY"
+rm -f "$STRAY"
+
 # 卸载是显式意图，这时才把覆盖文件一并收走，不留一个指向已删二进制的启动参数
 run_sh uninstall
 ck "卸载成功" "$?" "0"

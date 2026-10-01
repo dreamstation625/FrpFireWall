@@ -214,7 +214,11 @@ systemctl cat frpfirewall | grep ExecStart
 改回来（任选一种）：
 
 ```bash
-# 办法一：加一段启动参数覆盖，立刻可用
+# 办法一（推荐）：让脚本写，文件名和权限都不会搞错
+curl -fsSL https://raw.githubusercontent.com/dreamstation625/FrpFireWall/main/scripts/install.sh \
+  | sudo bash -s -- update --pre --listen 0.0.0.0:7930
+
+# 办法二：手写覆盖文件
 sudo mkdir -p /etc/systemd/system/frpfirewall.service.d
 sudo tee /etc/systemd/system/frpfirewall.service.d/10-listen.conf >/dev/null <<'EOF'
 [Service]
@@ -223,12 +227,21 @@ ExecStart=/usr/local/bin/frpfirewall -data /var/lib/frpfirewall -listen 0.0.0.0:
 EOF
 sudo systemctl daemon-reload && sudo systemctl restart frpfirewall
 
-# 办法二：先按办法一进面板，在「系统设置 → 监听地址」改成 0.0.0.0:7930
-#         保存并重启，值就落进数据库了；之后这个覆盖文件可以删掉
+# 办法三：进了面板之后，在「系统设置 → 监听地址」改成 0.0.0.0:7930 保存并
+#         重启，值就落进数据库了；之后上面的覆盖文件可以删掉
 ```
 
 `ExecStart=` 那行空行不能省：systemd 里 `ExecStart` 是**追加**语义，不清空会变成
 两条启动命令抢同一个端口，服务起不来。
+
+文件名也必须正好是 `10-listen.conf`。systemd 会加载 `service.d/` 下**所有**
+`.conf`，里面只要还有第二份带 `ExecStart` 的（手抄时少写个数字前缀就会这样），
+一样是两条命令抢端口，而且报错只有 `start request repeated too quickly`，很难
+往覆盖文件上联想。装的时候如果看到「… 里也有 ExecStart」的告警就是这个原因：
+
+```bash
+ls -l /etc/systemd/system/frpfirewall.service.d/
+```
 
 想只让本机访问（走 SSH 隧道 `ssh -L 7930:127.0.0.1:7930 root@<服务器>`）就用
 `--listen 127.0.0.1:7930`。但注意：面板只绑回环时，服务启动日志里会有一条 WARN
