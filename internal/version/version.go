@@ -25,8 +25,11 @@ import (
 const DefaultRepo = "dreamstation625/FrpFireWall"
 
 // 这些变量在构建时通过 -ldflags -X 注入，默认值对应 VERSION 文件的内容。
+// 改版本号时 VERSION 与这里的 Version 必须一起改——两者脱节不会让任何
+// 构建失败（CI 与 Makefile 走的都是注入路径），只会让裸 go build 出来的
+// 二进制自称一个错误的版本号，因此由 TestDefaultVersionMatchesVersionFile 兜底。
 var (
-	Version   = "0.0.1"
+	Version   = "0.0.1-pre.01"
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )
