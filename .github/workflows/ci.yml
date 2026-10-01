@@ -80,6 +80,13 @@ jobs:
       - name: 安装脚本测试
         run: bash testdata/test-install.sh
 
+      # 版本号散落在四处（VERSION / version.go / package.json / package-lock.json），
+      # 漏改一处不会编译失败，只会让 internal/version 的对账用例挂掉 —— 而
+      # Release 工作流在同一个位置失败，失败前不产出任何资产。手动改过两次
+      # 两次都漏，所以把 "四处都改到了" 固化下来。
+      - name: 版本脚本测试
+        run: bash testdata/test-version-bump.sh
+
       - name: 编译
         run: CGO_ENABLED=0 go build -trimpath ./...
 

@@ -415,17 +415,30 @@ systemctl restart frpfirewall
 
 ### 发版流程
 
-版本号的唯一来源是仓库根目录的 `VERSION` 文件，发布 tag 必须与它一致，
-不一致 CI 会直接失败——避免出现「tag 说 0.0.2、二进制里却编译进 0.0.1」这种查不出来的事故。
+版本号散落在四处，`VERSION` 只是其中一个 —— 另外三处是
+`internal/version/version.go` 里的默认值、`web/package.json`、
+`web/package-lock.json`（后者两处）。只改 `VERSION` 不会编译失败，
+但 `internal/version` 有一条对账用例要求默认值与 `VERSION` 一致，
+漏改会让单元测试挂掉；如果此时 tag 已经推上去，Release 会在同一步失败，
+且失败前不产出任何资产。
+
+所以用脚本一次改完，别手改：
 
 ```bash
-# 1. 改 VERSION 为要发布的版本号
-echo "0.0.2" > VERSION
+# 1. 四处一起改
+bash scripts/version-bump.sh 0.0.1-pre.07
 # 2. 提交
-git add VERSION && git commit -m "chore: 发布 0.0.2"
-# 3. 打同名 tag 推上去（v 前缀必需）
-git tag v0.0.2 && git push origin main --tags
+git add -A && git commit -m "chore: 版本升至 0.0.1-pre.07"
+# 3. 推 main
+git push origin main
+# 4. 等 main 的 CI 跑绿 —— 这一步不能省，见下
+# 5. 打同名 tag 推上去（v 前缀必需）
+git tag v0.0.1-pre.07 && git push origin v0.0.1-pre.07
 ```
+
+第 4 步的意义：Release 工作流本身就带 `go vet` 与单元测试，CI 挂过的提交
+推 tag 也一定会在相同的位置失败。区别是失败一次会白打一个 tag，还得把 tag
+删掉重打 —— 等 CI 只是几十秒的事。
 
 CI（`.github/workflows/release.yml`）会自动：校验 tag 与 `VERSION` 一致 →
 过发布闸门 → 跑 `go vet` 与单元测试 → 构建前端 → 交叉编译 `linux/amd64` 与 `linux/arm64` →
@@ -435,6 +448,7 @@ tag 里带 `-pre.` 的会被自动标记为 **Pre-release**，不会成为 lates
 正式版则标记为 latest。发布物包含两个架构的二进制、校验和、`install.sh` 与 systemd 单元。
 
 `VERSION` 的格式也由 CI 看门：写 `0.1.0-dev` 这类会被直接拒绝。
+`scripts/version-bump.sh` 用的是同一套正则，非法格式在本地就被挡住。
 
 ### 发布闸门
 

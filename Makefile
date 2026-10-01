@@ -19,6 +19,7 @@ DIST := dist
 help:
 	@echo "frpfirewall 构建目标"
 	@echo "  make version    显示将要编译进二进制的版本号"
+	@echo "  make version-bump V=x.y.z  同步改四处版本号（漏一处就有测试挂）"
 	@echo "  make web        构建前端并输出到 internal/web/dist"
 	@echo "  make build      构建当前平台二进制到 $(DIST)/"
 	@echo "  make release    交叉编译 linux/amd64 与 linux/arm64"
@@ -26,12 +27,27 @@ help:
 	@echo "  make smoke      对已启动的实例跑接口冒烟测试"
 	@echo "  make clean      清理构建产物"
 	@echo
-	@echo "发版流程：改 VERSION → 提交 → 打同名 tag 推送（如 v0.0.1-pre.01）"
+	@echo "发版流程：make version-bump V=0.0.1-pre.07 → 提交 → 推 main"
+	@echo "          → 等 main 的 CI 跑绿 → 再打同名 tag 推送"
 	@echo "          CI 会校验 tag 与 VERSION 一致后自动构建并创建 Release"
+	@echo
+	@echo "          第 2 步不能省：internal/version 里有一条测试要求默认版本号"
+	@echo "          与 VERSION 文件一致。漏改的话 CI 直接红，此时若已经把 tag"
+	@echo "          推上去，Release 会在同一步失败 —— 而失败前不会产出任何资产。"
 
 .PHONY: version
 version:
 	@echo "$(VERSION)"
+
+# ---------- 版本号 ----------
+
+# 版本号散落在四处，只改 VERSION 会让 TestDefaultVersionMatchesVersionFile
+# 挂掉。逻辑放在 scripts/version-bump.sh 里而不是写在这里 —— 开发机上不一定
+# 有 make，脚本可以直接跑、也能被测试覆盖。
+.PHONY: version-bump
+version-bump:
+	@test -n "$(V)" || { echo "用法：make version-bump V=0.0.1-pre.07" >&2; exit 1; }
+	bash scripts/version-bump.sh "$(V)"
 
 # ---------- 前端 ----------
 
