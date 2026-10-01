@@ -1,7 +1,7 @@
 {
   "name": "frpfw-web",
   "private": true,
-  "version": "0.0.1-pre.03",
+  "version": "0.0.1-pre.04",
   "type": "module",
   "scripts": {
     "dev": "vite",
