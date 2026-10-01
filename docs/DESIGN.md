@@ -235,6 +235,45 @@ $ printf '0.0.1\n0.0.1-pre.99\n' | sort -V
 闸门判定为「不发布」时，工作流是**成功**状态而非失败：重推同一个 tag 是常见误操作，
 不该把 CI 变红。判定依据会写进 step summary，避免「绿了但没发布」被误解。
 
+### D10. 一键脚本自带版本比较，并用测试与 Go 侧钉死
+
+`scripts/install.sh` 一个文件管三件事：`install` / `update` / `uninstall`（外加 `status`），
+在线拉取 Release 而不是要求用户先下载好一堆文件。
+
+**必须在脚本里重写一遍版本比较**，这是唯一的重复代码，理由是无法回避的：脚本要在
+一台还没有 Go 工具链的机器上跑，`tools/versioncmp` 用不上。既然要重复，就用测试锁死一致：
+
+- `testdata/test-install.sh` 把同一批用例同时喂给脚本里的 `vcmp` 与 `tools/versioncmp`，
+  逐条断言判定相同；
+- 非法输入（`-rc.1`、`1.2`、`pre.0`）要求两边一致拒绝。
+
+这条守卫不是形式主义：一旦两边漂移，症状是「面板提示有新版本、一键脚本却说已是最新」，
+而且只在特定版本组合下出现，靠人工点很难撞到。
+
+其余取舍：
+
+- **默认只走正式版轨道。** `update` 一律解析最新正式版；要预发布必须显式 `--pre`
+  或 `-v 0.0.1-pre.01`。这与面板内「正式版不追预发布」的规则同源，只是更保守：
+  预发布用户默认更新也会落到正式版上。
+- **探测最新正式版不调 API。** 读 `releases/latest/download/<asset>` 的**第一跳**
+  `Location` 就能拿到 tag。GitHub API 匿名限流 60 次/小时（按出口 IP 算），
+  而下载链接走 CDN 不限流；装机脚本恰恰可能在 NAT 后面被跑很多次。
+  不跟随重定向也有原因——跟到底会落到签名 CDN 地址，那里面已经没有 tag 了。
+  只有 `--pre`（需要枚举全部 release）才走 API。
+- **校验和覆盖全部下载物。** 发布时把二进制、服务单元、救援脚本、脚本自身一起算进
+  `sha256sums.txt`，脚本逐个核对。二进制缺条目直接失败；辅助文件缺条目只警告——
+  早期发布只覆盖了二进制，那种旧版本仍应装得上。
+- **升级先下载、校验、再原子替换，最后才重启。** 换二进制前把旧的另存为 `.prev`，
+  新版本起不来就换回去再重启一次。防火墙程序升级失败是直接掉防护，不能只留一句
+  「启动失败」。
+- **卸载默认保留数据目录**，`--purge` 才删，且删除前有多重护栏（系统目录黑名单、
+  路径深度、目录内必须含 `frpfirewall.db`）。护栏在**动任何东西之前**执行——
+  否则会出现「应用已经删掉了，才告诉你数据目录不许删」。
+- **不内置任何第三方加速地址**，只提供 `--mirror <前缀>`。把用户流量导向不受控的
+  中间人应该是用户的主动选择，不能是默认行为。
+- **顺序要求**：卸载时先 `systemctl stop` 再清内核规则。进程还在跑的话，
+  下一次 reconcile 会把刚清掉的规则重新下发。
+
 ---
 
 ## 3. 总体架构
@@ -872,11 +911,23 @@ LimitNOFILE=65535
   插件 `127.0.0.1:9100`（必须回环）。
 - **运行时依赖**：`iptables` 或 `nftables` 至少装一个（`auto` 优先 nftables）。
   **不需要 ipset**（见 D8）。
-- 升级：替换二进制 + `systemctl restart`，SQLite 自动 migration。
-- 安装脚本 `scripts/install.sh` 会做环境检查、装二进制、建数据目录、注册服务，
-  并打印一次性初始化令牌（浏览器打开面板后用它设置管理员密码）；`--uninstall` 可反向卸载并顺手清理内核残留规则。
+- 升级：跑 `install.sh update`，替换二进制 + `systemctl restart`，SQLite 自动 migration。
+- **一键脚本** `scripts/install.sh` 一个文件管四件事（见 D10）：
+
+  ```bash
+  # 安装 / 升级 / 卸载 / 查状态
+  curl -fsSL .../scripts/install.sh | sudo bash
+  curl -fsSL .../scripts/install.sh | sudo bash -s -- update
+  curl -fsSL .../scripts/install.sh | sudo bash -s -- uninstall [--purge]
+  curl -fsSL .../scripts/install.sh | sudo bash -s -- status
+  ```
+
+  它会做环境检查、下载并逐个核对 sha256、原子替换二进制、注册服务，
+  首次安装打印一次性初始化令牌。`uninstall` 会先停服务再清内核残留规则，
+  数据目录默认保留；`-b <路径>` 是离线安装路径。
 - 救援脚本 `scripts/frpfirewall-panic.sh`：把归属本程序的规则从内核里摘掉，
   只删自有链 / 集合 / 带 `frpfirewall` 注释的规则，不动系统原有规则。支持 `--dry-run`。
+  安装后以 `frpfirewall-panic` 落在 `$PREFIX`，直接在 `$PATH` 里可用。
 
 ---
 

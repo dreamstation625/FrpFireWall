@@ -197,6 +197,17 @@ jobs:
 
           ls -lh dist/
 
+      # 分发文件必须在生成校验和之前全部就位 —— 校验和要覆盖它们全部，
+      # 在线安装脚本会逐个核对，漏一个就会在用户机器上报「不在校验和文件里」。
+      - name: 收集分发文件
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh            dist/install.sh
+          cp scripts/frpfirewall-panic.sh  dist/frpfirewall-panic.sh
+          cp deploy/frpfirewall.service    dist/frpfirewall.service
+          chmod 0755 dist/install.sh dist/frpfirewall-panic.sh
+          ls -lh dist/
+
       # runner 本身就是 Linux，所以可以直接跑一遍，确认版本号真的注入进去了
       - name: 验证二进制
         run: |
@@ -212,19 +223,26 @@ jobs:
           fi
           echo "版本注入校验通过"
 
+          # 救援脚本要能被用户直接下载执行，语法错误必须在发版时就拦住
+          bash -n dist/frpfirewall-panic.sh
+          bash -n dist/install.sh
+          echo "脚本语法检查通过"
+
+      # 覆盖发布里的每一个文件（sha256sums.txt 自己除外）。
+      # 早期版本只算了两个二进制，在线安装脚本对服务单元与救援脚本
+      # 只能跳过校验 —— 这里补上，让每个下载物都可验证。
       - name: 生成校验和
         run: |
           set -euo pipefail
           cd dist
-          sha256sum frpfirewall-linux-* > sha256sums.txt
+          sha256sum \
+            frpfirewall-linux-amd64 \
+            frpfirewall-linux-arm64 \
+            frpfirewall-panic.sh \
+            frpfirewall.service \
+            install.sh \
+            > sha256sums.txt
           cat sha256sums.txt
-
-      - name: 收集安装脚本
-        run: |
-          set -euo pipefail
-          cp scripts/install.sh dist/install.sh
-          cp deploy/frpfirewall.service dist/frpfirewall.service
-          ls -lh dist/
 
       - name: 生成发布说明
         env:
@@ -242,8 +260,25 @@ jobs:
 
             echo "## 安装 / 升级"
             echo
+            echo "在线一键（推荐）："
+            echo
+            echo '```bash'
+            echo "# 安装（已装过则用 update 升级）"
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash"
+            echo
+            echo "# 升级到本次发布的版本"
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash -s -- update"
+            echo
+            echo "# 卸载"
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash -s -- uninstall"
+            echo '```'
+            echo
+            echo "手动下载（离线 / 需要先审脚本时）："
+            echo
             echo '```bash'
             echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/frpfirewall-linux-amd64"
+            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/frpfirewall.service"
+            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/frpfirewall-panic.sh"
             echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/install.sh"
             echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/sha256sums.txt"
             echo
@@ -255,6 +290,12 @@ jobs:
             echo '```'
             echo
             echo "arm64 机器把 \`frpfirewall-linux-amd64\` 换成 \`frpfirewall-linux-arm64\`。"
+            echo
+            echo "GitHub 直连慢的话，给在线脚本加加速前缀："
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash -s -- update --mirror https://ghfast.top/"
+            echo '```'
             echo
             echo "## 变更"
             echo
@@ -307,6 +348,7 @@ jobs:
             dist/frpfirewall-linux-arm64 \
             dist/sha256sums.txt \
             dist/install.sh \
+            dist/frpfirewall-panic.sh \
             dist/frpfirewall.service
 
           echo "::notice::发布完成 v${VERSION}"

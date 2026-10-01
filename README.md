@@ -62,14 +62,37 @@ make build      # 只构建当前平台
 
 ### 2. 安装（Debian / Ubuntu）
 
-把 `dist/frpfirewall-linux-amd64`、`scripts/install.sh`、`scripts/frpfirewall-panic.sh`、
-`deploy/frpfirewall.service` 放到目标机器的同一个目录：
+一条命令，自动下载对应架构的二进制、校验 sha256、装 systemd 单元并启动：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dreamstation625/FrpFireWall/main/scripts/install.sh | sudo bash
+```
+
+装完会打印初始化令牌。脚本只认正式版；要装预发布版加 `--pre`，要装指定版本加 `-v 0.0.1-pre.01`。
+
+**先审脚本再执行**（推荐，脚本可以直读）：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/dreamstation625/FrpFireWall/main/scripts/install.sh
+less install.sh
+sudo bash install.sh
+```
+
+**离线安装**：把二进制、`install.sh`、`frpfirewall.service` 放到同一目录，指定二进制路径：
 
 ```bash
 sudo ./install.sh -b ./frpfirewall-linux-amd64
 ```
 
-脚本会装二进制、建数据目录、注册并启动 systemd 服务，最后打印初始化令牌。
+国内服务器直连 GitHub 慢的话，加加速前缀（脚本不内置任何第三方地址，用不用由你决定）：
+
+```bash
+curl -fsSL .../install.sh | sudo bash -s -- install --mirror https://<你的加速前缀>/
+```
+
+脚本做的事：校验环境（root / systemd / iptables 或 nftables）→ 下载并逐个核对 sha256 →
+原子替换二进制 → 写 systemd 单元并启动。升级时如果新版本起不来，会自动换回旧二进制，
+不会把防护留在半残状态。
 
 ### 3. 设置面板密码
 
@@ -152,13 +175,38 @@ frpfirewall -data /var/lib/frpfirewall
 
 ## 运维
 
+### 升级与卸载
+
+同一个脚本管三件事：`install` / `update` / `uninstall`（缺省是 `install`）。
+
+```bash
+SCRIPT=https://raw.githubusercontent.com/dreamstation625/FrpFireWall/main/scripts/install.sh
+
+# 看当前版本与线上最新版
+curl -fsSL $SCRIPT | sudo bash -s -- status
+
+# 升级（未装则改用 install）
+curl -fsSL $SCRIPT | sudo bash -s -- update
+
+# 卸载：停服务、清内核规则、删二进制与 systemd 单元，数据目录保留
+curl -fsSL $SCRIPT | sudo bash -s -- uninstall
+
+# 连数据目录一起删（有二次确认与多重路径护栏）
+curl -fsSL $SCRIPT | sudo bash -s -- uninstall --purge
+```
+
+已经装到本机的话，`frpfirewall-panic` 也在 `$PATH` 里，不用再去找脚本文件。
+
+常用开关：`-y` 免交互、`--force` 允许降级或同版本重装、`--no-start` 只装不启、
+`--dry-run` 只解析版本和地址不动手、`--pre` 允许预发布版。完整列表见 `--help`。
+
 ### 出事了怎么救
 
 误封导致连不上，或规则下发后网络异常：
 
 ```bash
-sudo ./frpfirewall-panic.sh              # 清掉所有受管规则
-sudo ./frpfirewall-panic.sh --dry-run    # 先看会做什么
+sudo frpfirewall-panic              # 清掉所有受管规则
+sudo frpfirewall-panic --dry-run    # 先看会做什么
 ```
 
 它只删归属 frpfirewall 的对象（两条自有链 + 带 `frpfirewall` 注释的规则 + `frpfirewall_*` 集合），
@@ -286,6 +334,16 @@ make smoke    # 对已启动的实例跑接口冒烟测试
 go test ./...
 ```
 
+一键脚本有自己的回归测试。它会起一个**假 GitHub Releases 服务**，用桩命令替换
+`systemctl` / `iptables` / `install` / `uname` / `id`，在临时目录里真的跑一遍
+安装 → 升级 → 回滚 → 卸载，并把脚本里的版本比较逻辑与 Go 侧逐条对照：
+
+```bash
+bash testdata/test-install.sh
+```
+
+全程不碰真实的 `/usr/local/bin`、`/etc/systemd/system` 与本机防火墙，不需要 root。
+
 本地起服务：
 
 ```bash
@@ -319,8 +377,13 @@ web/                  Vue 3 + Vite + Element Plus 前端
 tools/versioncmp/     发布闸门：判断版本号是否高于已发布的最高版本
 .github/workflows/    CI 与 tag 触发的自动发布
 deploy/               systemd 单元
-scripts/              安装与救援脚本
-testdata/smoke.sh     接口冒烟测试（对着已启动的实例跑）
+scripts/
+  install.sh          一键脚本：在线安装 / 升级 / 卸载
+  frpfirewall-panic.sh 紧急清理受管防火墙规则
+testdata/
+  smoke.sh            接口冒烟测试（对着已启动的实例跑）
+  test-install.sh     一键脚本回归测试（假 Release 服务 + 桩命令，全离线）
+  fake-release-server.py
 docs/DESIGN.md        设计方案
 ```
 

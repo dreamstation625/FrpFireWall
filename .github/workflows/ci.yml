@@ -68,6 +68,14 @@ jobs:
       - name: 单元测试
         run: go test ./... -count=1
 
+      # 一键脚本是用户装机的第一道门，它自己的回归必须固化下来。
+      # 覆盖：版本比较与 Go 侧（internal/version）逐条一致、
+      #       起假 Release 服务跑完整的 安装 → 升级 → 回滚 → 卸载 流程、
+      #       校验和不匹配必须中止、降级拦截、--purge 护栏。
+      # 全程用桩命令，不碰真实的 systemd / iptables / /usr/local。
+      - name: 安装脚本测试
+        run: bash testdata/test-install.sh
+
       - name: 编译
         run: CGO_ENABLED=0 go build -trimpath ./...
 
