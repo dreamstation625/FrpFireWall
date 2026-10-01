@@ -74,6 +74,7 @@ func (s *Store) migrate() error {
 		&model.ACLEntry{},
 		&model.BanRecord{},
 		&model.Policy{},
+		&model.RateRule{},
 		&model.Event{},
 		&model.RuleChange{},
 		&model.FirewallProfile{},
@@ -177,9 +178,71 @@ func (s *Store) GetPolicy() (*model.Policy, error) {
 }
 
 func (s *Store) SavePolicy(p *model.Policy) error {
+	return savePolicyTx(s.db, p)
+}
+
+func savePolicyTx(tx *gorm.DB, p *model.Policy) error {
 	p.ID = 1
 	p.UpdatedAt = time.Now()
-	return s.db.Save(p).Error
+	return tx.Save(p).Error
+}
+
+// ---------- 频控细分规则 ----------
+
+// RateRules 返回全部细分频控规则，按匹配顺序（priority 升序，同值按 id）。
+func (s *Store) RateRules() ([]model.RateRule, error) {
+	var out []model.RateRule
+	err := s.db.Order("priority asc, id asc").Find(&out).Error
+	return out, err
+}
+
+// ReplaceRateRules 用给定列表整体替换细分规则，一次事务完成。
+//
+// 为什么是整体替换而不是逐条增删改：**规则的顺序本身就是配置的一部分**
+// （按顺序匹配，第一条命中的生效）。拆成 N 次请求之后，"顺序"就没人保证了 ——
+// 两次请求之间别的会话插进来一条，顺序就变了，而且看不出来。
+//
+// 顺序直接取数组下标，回写到 priority。前端拖出来的顺序就是最终顺序。
+//
+// 每次替换都重建行（ID 会变）。这是刻意的：没有任何东西跨保存持有规则 ID ——
+// 封禁记录里记的是规则名，界面保存后本来就要重新拉一次列表。
+// 保留 ID 需要逐条 upsert 并处理"ID 不存在"，多出来的分支换不到实际收益。
+func (s *Store) ReplaceRateRules(rules []model.RateRule) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		return replaceRateRulesTx(tx, rules)
+	})
+}
+
+// SavePolicyWithRules 在一个事务里同时保存全局策略与细分规则。
+//
+// 界面上这两样是同一个"保存"按钮，所以库这边也必须是同一次落盘：
+// 分开写的话，规则校验失败会留下"策略已经改了、规则还是旧的"这种半截状态，
+// 而且用户看到的报错是"保存失败"，他并不知道策略其实已经生效了。
+func (s *Store) SavePolicyWithRules(p *model.Policy, rules []model.RateRule) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := savePolicyTx(tx, p); err != nil {
+			return err
+		}
+		return replaceRateRulesTx(tx, rules)
+	})
+}
+
+func replaceRateRulesTx(tx *gorm.DB, rules []model.RateRule) error {
+	if err := tx.Where("1 = 1").Delete(&model.RateRule{}).Error; err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range rules {
+		r := rules[i]
+		r.ID = 0
+		r.Priority = i
+		r.CreatedAt = now
+		r.UpdatedAt = now
+		if err := tx.Create(&r).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------- 防火墙后端偏好 ----------
