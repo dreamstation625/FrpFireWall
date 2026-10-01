@@ -164,6 +164,9 @@ func (s *Server) Routes() http.Handler {
 		// ---- 策略 ----
 		auth.GET("/policy", s.handleGetPolicy)
 		auth.PUT("/policy", s.handleUpdatePolicy)
+		// 细分规则的读取单独一个接口；写入走 PUT /policy 的 rules 字段，
+		// 让"策略 + 规则"落在同一次请求、同一个事务里。
+		auth.GET("/policy/rules", s.handleListRateRules)
 
 		// ---- GeoIP ----
 		auth.POST("/geoip/lookup", s.handleGeoLookup)
@@ -171,6 +174,7 @@ func (s *Server) Routes() http.Handler {
 		auth.GET("/geoip/status", s.handleGeoStatus)
 		auth.POST("/geoip/upload", s.handleGeoUpload)
 		auth.GET("/geoip/countries", s.handleGeoCountries)
+		auth.GET("/geoip/provinces", s.handleGeoProvinces)
 
 		// ---- 事件 ----
 		auth.GET("/events", s.handleListEvents)

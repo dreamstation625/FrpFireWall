@@ -529,44 +529,45 @@ func (s *Server) handleGetPolicy(c *gin.Context) {
 }
 
 func (s *Server) handleUpdatePolicy(c *gin.Context) {
-	var req model.Policy
+	var req policyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		badRequest(c, "请求格式不正确")
 		return
 	}
+	p := req.Policy
 
 	// 校验关键字段，避免把系统配置成"谁都连不上"或"谁都拦不住"
-	if req.WindowSeconds < 1 || req.WindowSeconds > 86400 {
+	if p.WindowSeconds < 1 || p.WindowSeconds > 86400 {
 		badRequest(c, "统计窗口需在 1 ~ 86400 秒之间")
 		return
 	}
-	if req.Threshold < 1 || req.Threshold > 100000 {
+	if p.Threshold < 1 || p.Threshold > 100000 {
 		badRequest(c, "触发阈值需在 1 ~ 100000 之间")
 		return
 	}
-	if req.EscalateWindowHours < 1 {
-		req.EscalateWindowHours = 24
+	if p.EscalateWindowHours < 1 {
+		p.EscalateWindowHours = 24
 	}
-	switch req.BanGranularity {
+	switch p.BanGranularity {
 	case "ip", "cidr24":
 	default:
 		badRequest(c, "封禁粒度只能是 ip 或 cidr24")
 		return
 	}
-	switch req.FailMode {
+	switch p.FailMode {
 	case "open", "close":
 	default:
 		badRequest(c, "fail_mode 只能是 open 或 close")
 		return
 	}
-	switch req.GeoIPMode {
+	switch p.GeoIPMode {
 	case "blacklist", "whitelist":
 	default:
 		badRequest(c, "地域模式只能是 blacklist 或 whitelist")
 		return
 	}
 
-	steps := req.DurationSteps()
+	steps := p.DurationSteps()
 	if len(steps) == 0 {
 		badRequest(c, "阶梯封禁时长不能为空")
 		return
@@ -577,20 +578,38 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 			return
 		}
 	}
-	if req.RateLimitEnabled {
-		if req.RateLimitPerSec < 1 {
+	if p.RateLimitEnabled {
+		if p.RateLimitPerSec < 1 {
 			badRequest(c, "速率限制必须大于 0")
 			return
 		}
-		if req.RateLimitBurst < 1 {
-			req.RateLimitBurst = req.RateLimitPerSec * 2
+		if p.RateLimitBurst < 1 {
+			p.RateLimitBurst = p.RateLimitPerSec * 2
 		}
 	}
 
 	// 国家码规范化
-	req.GeoIPBlockCountries = model.PackageCountries(req.CountryList())
+	p.GeoIPBlockCountries = model.PackageCountries(p.CountryList())
 
-	if err := s.store.SavePolicy(&req); err != nil {
+	// 细分规则：带了就一起校验、一起落盘，没带就完全不碰。
+	//
+	// 校验放在落盘之前，是为了让"某条规则写错了"变成一次明确的 400，
+	// 而不是先存一半再报错。
+	var rules []model.RateRule
+	if req.Rules != nil {
+		var err error
+		if rules, err = normalizeRateRules(*req.Rules); err != nil {
+			badRequest(c, err.Error())
+			return
+		}
+	}
+
+	if req.Rules != nil {
+		if err := s.store.SavePolicyWithRules(&p, rules); err != nil {
+			serverErr(c, err)
+			return
+		}
+	} else if err := s.store.SavePolicy(&p); err != nil {
 		serverErr(c, err)
 		return
 	}
@@ -601,10 +620,14 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 	}
 	s.guard.Apply()
 
+	detail := fmt.Sprintf("更新策略：窗口 %ds / 阈值 %d 次 / 阶梯 %v", p.WindowSeconds, p.Threshold, steps)
+	if req.Rules != nil {
+		detail += fmt.Sprintf(" / 细分规则 %d 条", len(rules))
+	}
 	_ = s.store.AddEvent(&model.Event{
 		Category: model.EvtConfig,
 		IP:       c.ClientIP(),
-		Detail:   fmt.Sprintf("更新策略：窗口 %ds / 阈值 %d 次 / 阶梯 %v", req.WindowSeconds, req.Threshold, steps),
+		Detail:   detail,
 		Actor:    s.currentUser(c),
 	})
 
