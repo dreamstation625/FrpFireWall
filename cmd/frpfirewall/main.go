@@ -88,17 +88,19 @@ func run(dataDir, listenOverride string) error {
 	}
 	cfg.DataDir = dataDir
 
-	missing := map[string]string{}
-	for k, v := range cfg.ToSettings() {
-		if _, ok := saved[k]; !ok {
-			missing[k] = v
-		}
-	}
-	if len(missing) > 0 {
-		if err := st.SetSettings(missing); err != nil {
-			return fmt.Errorf("写入默认配置失败: %w", err)
-		}
-	}
+	// 这里刻意**不**把缺失的配置项按默认值补一行写进数据库。
+	//
+	// 写过一次，代价很实在：它会把「当时的默认值」永久钉死。面板监听地址从
+	// 127.0.0.1:7930 改成 0.0.0.0:7930 之后，老机器升级上来读到的仍然是库里
+	// 那行老地址，新默认值对它们完全无效 —— 升级完照样打不开面板，而这一路
+	// 上没有任何地方提示过"你库里存着旧默认值"。
+	//
+	// 不写库才是和 FromSettings 一致的语义（它的注释就写着"缺失或非法的项
+	// 回落到默认值，这样后续版本新增配置项时不需要写迁移脚本"）。用户在面板里
+	// 点保存时 handleUpdateConfig 会把整份配置落库，那时写进去的才是他自己的
+	// 选择，此后再改默认值就不会动到它。
+	//
+	// 想查当前实际用的是哪套值，看下面这行日志的 panel= 就够了。
 
 	// 命令行覆盖不落库，只影响本次运行。
 	if listenOverride != "" {
@@ -117,6 +119,17 @@ func run(dataDir, listenOverride string) error {
 		"panel", cfg.Server.Listen,
 		"plugin", cfg.Frps.PluginListen,
 	)
+
+	// 面板只绑回环是最容易把人困住的一种配置：别的机器一律连不上，而"改监听
+	// 地址"偏偏只能在面板里做，于是变成一个自己锁自己的死结。启动时明说一句，
+	// 省得去翻防火墙规则、安全组、代理。
+	if config.IsLoopback(cfg.Server.Listen) {
+		logger.Warn("面板只监听回环地址，其他机器无法连接",
+			"addr", cfg.Server.Listen,
+			"how_to_open", "在面板「系统设置 → 监听地址」里改成 0.0.0.0:7930，或用 -listen 0.0.0.0:7930 启动",
+			"note", "本来就只有 SSH 隧道这一种访问方式的话，忽略本行",
+		)
+	}
 
 	// ---- 面板初始化 ----
 	passHash, err := st.GetSetting(model.SettingPasswordHash)

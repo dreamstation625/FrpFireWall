@@ -160,7 +160,7 @@ func (c *Config) normalize() error {
 		c.Frps.PluginPath = "/frps/handler"
 	}
 	// 插件服务必须绑回环：它没有独立鉴权，靠"只接受本机 frps 调用"来兜底。
-	if !isLoopback(c.Frps.PluginListen) {
+	if !IsLoopback(c.Frps.PluginListen) {
 		return fmt.Errorf("frps 插件监听地址必须是回环地址（当前 %q），插件接口不能对外暴露", c.Frps.PluginListen)
 	}
 	if c.Frps.BindPort == 0 {
@@ -233,7 +233,11 @@ func validateRepoSlug(s string) error {
 // Validate 供配置写入前调用，保证入库的都是可用值。
 func (c *Config) Validate() error { return c.normalize() }
 
-func isLoopback(addr string) bool {
+// IsLoopback 判断监听地址是否只绑回环。
+//
+// 两种用途：校验插件地址（它绝不能对外暴露），以及在启动日志里提醒
+// "面板只绑回环、别的机器连不上" —— 后者是最容易把运维锁在门外的配置。
+func IsLoopback(addr string) bool {
 	host := addr
 	if i := strings.LastIndex(addr, ":"); i >= 0 {
 		host = addr[:i]
