@@ -560,13 +560,23 @@ resolve_latest_any_tag() {
   printf '%s\n' "$best"
 }
 
-# 解析出本次要装的 tag（形如 v0.0.1）。失败时返回非零，由调用方给出完整报错。
+# 解析出本次要装的 tag（形如 v0.0.1）。
+#
+# 返回码是留给调用方区分的：
+#   0 成功
+#   1 仓库还没有正式版 —— 这不是错误，是个事实状态
+#   2 查询失败（网络不通、被墙、API 限流）
+#
+# 这个函数**故意不打印任何提示**：它有两个调用方，要的话完全不一样 ——
+# do_install 需要一段完整的报错，do_status 要把同样的信息排进表格里。
+# 由它自己打字的后果是 status 输出被两行 stderr 从中间劈开，而且和表格里
+# 的内容重复。想加提示就加到 explain_resolve_failure。
 resolve_target_tag() {
   if [ -n "$PIN_VERSION" ]; then
     local norm
     norm="$(vnorm "$PIN_VERSION")" || {
       printf '版本号 %s 格式非法。只接受 0.0.1 或 0.0.1-pre.01 两种形态。\n' "$PIN_VERSION" >&2
-      return 1
+      return 2
     }
     printf 'v%s\n' "$norm"
     return 0
@@ -574,11 +584,7 @@ resolve_target_tag() {
 
   if [ "$ALLOW_PRE" -eq 1 ]; then
     local tag
-    tag="$(resolve_latest_any_tag)" || {
-      printf '读取 release 列表失败（网络不通，或 GitHub API 匿名限流）。\n' >&2
-      printf '可以改用 -v <版本号> 直接指定，或稍后重试。\n' >&2
-      return 1
-    }
+    tag="$(resolve_latest_any_tag)" || return 2
     printf '%s\n' "$tag"
     return 0
   fi
@@ -587,17 +593,25 @@ resolve_target_tag() {
   tag="$(probe_latest_stable_tag)" || rc=$?
   case "$rc" in
     0) printf '%s\n' "$tag" ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# 把 resolve_target_tag 的失败码翻译成人话。只给装机路径用 —— status 会把
+# 同样的信息排进表格，不需要这层输出。
+explain_resolve_failure() {
+  case "${1:-2}" in
     1)
       printf '仓库 %s 还没有正式版发布（只有预发布版本）。\n' "$REPO" >&2
       printf '想装预发布版请加 --pre 或 -v <版本号>。\n' >&2
-      return 1
       ;;
     *)
-      printf '访问 %s 失败：网络不通，或被墙/代理拦住了。\n' "$RELEASES_BASE" >&2
-      printf '国内服务器可以加加速前缀，例如：--mirror https://ghfast.top/\n' >&2
-      return 1
+      printf '没能查到最新版本：网络不通、被墙/代理拦住，或 GitHub API 限流。\n' >&2
+      printf '可以试试加速前缀 --mirror https://ghfast.top/，或用 -v <版本号> 直接指定。\n' >&2
       ;;
   esac
+  return 0
 }
 
 # 已安装的版本号；没装或取不到时返回非零
@@ -681,7 +695,7 @@ fetch_asset() {
 # ===========================================================================
 
 do_status() {
-  local cur="" target="" has_update=0 scope="仅正式版"
+  local cur="" target="" has_update=0 scope="仅正式版" qrc=0
 
   cur="$(installed_version)" || cur=""
   if [ "$ALLOW_PRE" -eq 1 ]; then scope="含预发布"; fi
@@ -694,23 +708,32 @@ do_status() {
     printf '  已安装    : 未检测到（%s 不存在或不可执行）\n' "$PREFIX/frpfirewall"
   fi
 
-  # 这里不吞 stderr：查询失败的原因（只有预发布 / 网络不通 / 被限流）
-  # 正是用户最需要看到的东西。
-  if target="$(resolve_target_tag)"; then
-    printf '  最新可用  : %s（%s）\n' "${target#v}" "$scope"
-    if [ -n "$cur" ]; then
-      case "$(vcmp "${target#v}" "$cur" 2>/dev/null || printf 'x')" in
-        1)  has_update=1
-            printf '  状态      : 有新版本，执行 update 升级\n' ;;
-        0)  printf '  状态      : 已是最新\n' ;;
-        *)  printf '  状态      : 本地版本不低于线上最新版（本地是预发布，或已手动降级）\n' ;;
-      esac
-    else
-      printf '  状态      : 未安装，执行 install 安装\n'
-    fi
-  else
-    printf '  最新可用  : 查询失败（原因见上方）\n'
-  fi
+  # 不吞 stderr：真正查询失败时，原因（网络不通 / 被限流）就在那里。
+  target="$(resolve_target_tag)" || qrc=$?
+  case "$qrc" in
+    0)
+      printf '  最新可用  : %s（%s）\n' "${target#v}" "$scope"
+      if [ -n "$cur" ]; then
+        case "$(vcmp "${target#v}" "$cur" 2>/dev/null || printf 'x')" in
+          1)  has_update=1
+              printf '  状态      : 有新版本，执行 update 升级\n' ;;
+          0)  printf '  状态      : 已是最新\n' ;;
+          *)  printf '  状态      : 本地版本不低于线上最新版（本地是预发布，或已手动降级）\n' ;;
+        esac
+      else
+        printf '  状态      : 未安装，执行 install 安装\n'
+      fi
+      ;;
+    1)
+      # 仓库还没有正式版。这是事实状态，不是故障 —— 写成"查询失败"会把人
+      # 引去排查代理和 DNS，白折腾半天。
+      printf '  最新可用  : 无（%s 还没有正式版发布）\n' "$REPO"
+      printf '  提示      : 想装预发布版加 --pre，或用 -v <版本号> 指定\n'
+      ;;
+    *)
+      printf '  最新可用  : 查询失败（网络不通、被限流，或版本号写错了）\n'
+      ;;
+  esac
   printf '\n'
 
   if [ "$CHECK_ONLY" -eq 1 ] && [ "$has_update" -eq 1 ]; then
@@ -865,7 +888,10 @@ do_install() {
     log "离线模式：使用本机二进制，版本 $ver"
   else
     arch="$(varch)" || die "不支持的 CPU 架构：$(uname -m)（目前只发布 amd64 与 arm64）"
-    if ! tag="$(resolve_target_tag)"; then
+    local trc=0
+    tag="$(resolve_target_tag)" || trc=$?
+    if [ "$trc" -ne 0 ]; then
+      explain_resolve_failure "$trc"
       exit "$EXIT_ERR"
     fi
     ver="${tag#v}"
