@@ -32,7 +32,17 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	// Listen 面板监听地址。对外网开放时用 0.0.0.0:7930。
+	// Listen 面板监听地址。
+	//
+	// 默认 0.0.0.0:7930。面板是装在那台被防火墙保护的机器上的，运维多半
+	// 要换台机器打开它，只绑回环等于装完就用不了 —— 一键脚本装完打不开
+	// 面板，排查半天发现是监听地址，这个代价比"默认少暴露一个端口"大。
+	//
+	// 关掉对外访问改成 127.0.0.1:7930（或某个内网地址），但要自己解决
+	// 怎么访问它，比如 SSH 隧道 ssh -L 7930:127.0.0.1:7930 root@<服务器>。
+	//
+	// 对外可达时，安全只剩两道：一次性初始化令牌（防别人抢先设密码）
+	// 与登录防爆破。密码走的是明文 HTTP，所以务必在面板里开启 TLS。
 	Listen string    `json:"listen"`
 	TLS    TLSConfig `json:"tls"`
 	Auth   AuthConfig `json:"auth"`
@@ -88,13 +98,20 @@ type UpdateConfig struct {
 	Repo string `json:"repo"`
 }
 
+// DefaultListen 是面板的默认监听地址。
+//
+// 抽成常量是因为它出现在两处：Default() 与 normalize() 的空值兜底。
+// 两处写得不一致会出现「首次启动写 0.0.0.0，配置被清空后又变回
+// 127.0.0.1」这种查起来很费劲的行为。
+const DefaultListen = "0.0.0.0:7930"
+
 // Default 返回一份可用的默认配置。
 func Default() *Config {
 	return &Config{
 		DataDir: "./data",
 		Backend: "auto",
 		Server: ServerConfig{
-			Listen: "127.0.0.1:7930",
+			Listen: DefaultListen,
 			TLS:    TLSConfig{Enabled: false},
 			Auth: AuthConfig{
 				Username:      "admin",
@@ -128,7 +145,7 @@ func (c *Config) normalize() error {
 	c.DataDir = filepath.Clean(c.DataDir)
 
 	if c.Server.Listen == "" {
-		c.Server.Listen = "127.0.0.1:7930"
+		c.Server.Listen = DefaultListen
 	}
 	if c.Server.Auth.Username == "" {
 		c.Server.Auth.Username = "admin"

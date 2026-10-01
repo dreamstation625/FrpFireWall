@@ -304,7 +304,7 @@ echo
 echo "########## 8. 系统与防火墙 ##########"
 SI=$(get -H "$AUTH" "$BASE/api/v1/system/info")
 check "版本号与 VERSION 一致" "$(printf '%s' "$SI" | jqf data.version)" "$EXPECT_VERSION"
-check "面板监听" "$(printf '%s' "$SI" | jqf data.panel_listen)" "127.0.0.1:7930"
+check "面板监听" "$(printf '%s' "$SI" | jqf data.panel_listen)" "0.0.0.0:7930"
 check "插件监听" "$(printf '%s' "$SI" | jqf data.plugin_listen)" "127.0.0.1:9100"
 check "受保护 bind_port" "$(printf '%s' "$SI" | jqf data.bind_port)" "7000"
 check "受保护 proxy_ports 2 个" "$(printf '%s' "$SI" | jqf data.proxy_ports)" "[2]"
@@ -324,7 +324,7 @@ CFG=$(get -H "$AUTH" "$BASE/api/v1/config")
 # 若误取外层 data（含 config/restart_required/data_dir），
 # 回填时 guard / update / log 都会变成零值，等于把配置悄悄清空。
 CFGBODY=$(printf '%s' "$CFG" | jqf data.config)
-check "面板监听读自数据库" "$(printf '%s' "$CFG" | jqf data.config.server.listen)" "127.0.0.1:7930"
+check "面板监听读自数据库" "$(printf '%s' "$CFG" | jqf data.config.server.listen)" "0.0.0.0:7930"
 check "插件监听读自数据库" "$(printf '%s' "$CFG" | jqf data.config.frps.plugin_listen)" "127.0.0.1:9100"
 check "数据目录回显" "$(printf '%s' "$CFG" | jqf data.data_dir)" "testdata/data"
 check "当前无待生效改动" "$(printf '%s' "$CFG" | jqf data.restart_required)" "false"
