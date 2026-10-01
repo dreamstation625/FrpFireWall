@@ -702,14 +702,25 @@ ck "覆盖文件带了指定地址" "$(grep -c -e '-listen 0.0.0.0:8888' "$DROPI
 # 启动命令并存，抢同一个端口，服务直接起不来。
 ck "ExecStart 先清空再重设" "$(grep -c '^ExecStart=$' "$DROPIN")" "1"
 
+# 不带 --listen 重装时**保留**覆盖文件。
+# 删掉它听起来更"干净"，但库里可能存着一行老默认值 127.0.0.1:7930，
+# 覆盖文件一没，服务就退回只监听回环 —— 人进不去面板，也就改不回来。
 run_sh install --force
-ck "重装不带 --listen 时清掉旧覆盖" "$?" "0"
-ck "覆盖文件已删除" "$(exists "$DROPIN")" "no"
+ck "重装不带 --listen 时保留旧覆盖" "$?" "0"
+ck "覆盖文件仍在" "$(exists "$DROPIN")" "yes"
+ck_has "提示里说明它仍在生效" "$(all_output)" "仍然会盖住面板里的监听设置"
+ck_has "并给出让它让位的做法" "$(all_output)" "rm -f $DROPIN"
 
 # 写错的地址要在动手之前就拦掉，否则是 systemd 起不来才报错
 run_sh install --listen 0.0.0.0
 ck "非法 --listen 退出码 2" "$?" "2"
 ck_has "说明了正确格式" "$(all_output)" "host:port"
+ck "校验失败时不动已有的覆盖文件" "$(exists "$DROPIN")" "yes"
+
+# 卸载是显式意图，这时才把覆盖文件一并收走，不留一个指向已删二进制的启动参数
+run_sh uninstall
+ck "卸载成功" "$?" "0"
+ck "卸载时收走监听覆盖" "$(exists "$DROPIN")" "no"
 
 # ===========================================================================
 section "汇总"

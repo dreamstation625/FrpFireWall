@@ -822,9 +822,22 @@ install_unit() {
 # 会与主单元里那条并存，两条启动命令抢同一个端口，服务直接起不来。
 install_listen_override() {
   if [ -z "$LISTEN" ]; then
-    # 没指定就顺手清掉旧的。否则一旦用 --listen 装过，之后不带参数重装
-    # 也甩不掉那个地址，用户会以为是程序在跟他对着干。
-    remove_listen_override
+    # 没指定时**不动**已有的覆盖文件。
+    #
+    # 早先写的是「顺手清掉旧的」，本意是别让 --listen 装过一次就永远甩不掉。
+    # 但那个清理删掉的可能是用户唯一的救命通道：面板监听地址存在数据库里，
+    # 库里很可能留着一行老默认值 127.0.0.1:7930（首次启动时按当时的默认值
+    # 写进去的）。覆盖文件一删，服务立刻退回只监听回环 —— 人进不去面板，
+    # 也就没有任何地方能把它改回来，升级反而把本来还能用的机器弄成打不开。
+    #
+    # 保留 + 明确告知它仍然生效，比替用户做决定安全。要让它让位就把文件删掉，
+    # 提示里连命令一起给了。
+    if [ -n "$LISTEN_DROPIN" ] && [ -f "$LISTEN_DROPIN" ]; then
+      warn "保留已有的监听覆盖文件，它仍然会盖住面板里的监听设置"
+      dim "    $LISTEN_DROPIN"
+      dim "    想让面板里的设置说了算："
+      dim "    rm -f $LISTEN_DROPIN && systemctl daemon-reload && systemctl restart $SERVICE"
+    fi
     return 0
   fi
   local dir="${LISTEN_DROPIN%/*}"

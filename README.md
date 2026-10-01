@@ -183,15 +183,62 @@ frpfirewall -data /var/lib/frpfirewall
 
 运行期策略（频次阈值、阶梯时长、地域封禁、速率限制）在 **频控策略** 页，改完即时生效，不用重启。
 
-监听地址改错导致面板打不开时，可以用启动参数临时覆盖：
-`frpfirewall -data /var/lib/frpfirewall -listen 0.0.0.0:7930`。
+### 面板打不开怎么排查
+
+先看服务到底绑在哪个地址，这一步就能把"监听问题"和"网络/安全组问题"分开：
+
+```bash
+ss -lntp | grep 7930
+```
+
+- 显示 `0.0.0.0:7930` → 监听没问题，去查云安全组 / 本机防火墙 / 代理
+- 显示 `127.0.0.1:7930` → 只绑了回环，别的机器连不上，按下面处理
 
 改监听地址有两个地方，优先级不同，别搞混：
 
+- **安装时的 `--listen`** 写成 systemd 启动参数覆盖
+  `/etc/systemd/system/frpfirewall.service.d/10-listen.conf`
 - **面板里改**（系统设置 → 监听地址）写进数据库，改完重启生效
-- **安装时 `--listen`** 写的是 systemd 启动参数覆盖
-  `/etc/systemd/system/frpfirewall.service.d/10-listen.conf`，**优先级高于面板里
-  那个**。想让面板里的设置说了算，删掉该文件后 `systemctl daemon-reload`
+
+`-listen` 一旦给了就盖住数据库里的值。所以先看有没有覆盖文件：
+
+```bash
+systemctl cat frpfirewall | grep ExecStart
+```
+
+#### ⚠️ 从 0.0.1-pre.02 及更早升上来的，监听地址不会自动变
+
+那些版本的默认值就是 `127.0.0.1:7930`，而且首次启动时会把它写进数据库。升级只
+换二进制，库里那行老地址原样留着，**新版本的默认值对老机器完全无效**。
+
+改回来（任选一种）：
+
+```bash
+# 办法一：加一段启动参数覆盖，立刻可用
+sudo mkdir -p /etc/systemd/system/frpfirewall.service.d
+sudo tee /etc/systemd/system/frpfirewall.service.d/10-listen.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/frpfirewall -data /var/lib/frpfirewall -listen 0.0.0.0:7930
+EOF
+sudo systemctl daemon-reload && sudo systemctl restart frpfirewall
+
+# 办法二：先按办法一进面板，在「系统设置 → 监听地址」改成 0.0.0.0:7930
+#         保存并重启，值就落进数据库了；之后这个覆盖文件可以删掉
+```
+
+`ExecStart=` 那行空行不能省：systemd 里 `ExecStart` 是**追加**语义，不清空会变成
+两条启动命令抢同一个端口，服务起不来。
+
+想只让本机访问（走 SSH 隧道 `ssh -L 7930:127.0.0.1:7930 root@<服务器>`）就用
+`--listen 127.0.0.1:7930`。但注意：面板只绑回环时，服务启动日志里会有一条 WARN
+提醒你别的机器连不上——那是有意为之的话可以忽略。
+
+改错地址把自己关在门外时，可以用启动参数临时救急（不写库、只影响本次运行）：
+`frpfirewall -data /var/lib/frpfirewall -listen 0.0.0.0:7930`。
+
+重新安装时**不会**自动删除已有的覆盖文件——它可能是你唯一能进面板的通道。要让它
+让位就手动删，安装提示里会把命令打出来。
 
 ### 面板的安全要求
 
