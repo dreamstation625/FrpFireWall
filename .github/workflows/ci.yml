@@ -83,6 +83,28 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      # 平台专用的二进制包（esbuild / rollup / swc 等）只能作为传递的 optional 依赖存在。
+      # 一旦被显式写进 dependencies，在别的平台上 npm ci 会直接 EBADPLATFORM 失败 —— 
+      # 而且报错只出现在 CI 上，本地（写它的那个平台）永远复现不了。
+      - name: 检查是否显式声明了平台专用包
+        working-directory: web
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const all = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+            const bad = Object.keys(all).filter(
+              (n) =>
+                /^@(esbuild|rollup|swc|parcel|biome)\//.test(n) ||
+                /-(win32|linux|darwin|freebsd|android|openbsd)-/.test(n)
+            );
+            if (bad.length) {
+              console.error("检测到平台专用的显式依赖：" + bad.join(", "));
+              console.error("它们应作为 esbuild/rollup 的 optional 传递依赖存在，不应显式声明。");
+              process.exit(1);
+            }
+            console.log("未发现平台专用的显式依赖");
+          '
+
       # 用 ci 而不是 install：lockfile 与 package.json 不一致时直接失败，
       # 避免依赖在 CI 上被静默升级。
       - name: 安装依赖
