@@ -1,8 +1,97 @@
 <template>
   <div v-loading="loading">
+    <div class="page-card panel" style="margin-bottom: 16px">
+      <div class="panel-head">
+        <span class="section-title">细分规则</span>
+        <div>
+          <el-button size="small" type="primary" plain @click="addRule">新增规则</el-button>
+        </div>
+      </div>
+
+      <div class="hint" style="margin-bottom: 12px">
+        从上到下按顺序匹配，<strong>第一条命中的规则取代全局规则</strong> —— 窗口、阈值、阶梯、限速全部换成这条规则的。
+        一条都没命中才走下面的全局规则。地域封禁名单不受影响，它始终先生效。
+      </div>
+
+      <div v-if="guardProblems.length" class="alert-danger" style="margin-bottom: 12px">
+        <div>以下规则没能生效，请检查：</div>
+        <div v-for="(p, i) in guardProblems" :key="i">· {{ p }}</div>
+      </div>
+
+      <el-table :data="rules" size="small" border>
+        <el-table-column label="顺序" width="60" align="center">
+          <template #default="{ $index }">
+            <span class="mono">{{ $index + 1 }}</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="启用" width="66" align="center">
+          <template #default="{ row }">
+            <el-switch v-model="row.enabled" size="small" />
+          </template>
+        </el-table-column>
+
+        <el-table-column label="规则名" min-width="150" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span :class="{ 'rule-off': !row.enabled }">{{ row.name }}</span>
+            <div v-if="row.remark" class="hint">{{ row.remark }}</div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="落点" width="88" align="center">
+          <template #default="{ row }">
+            <el-tooltip :content="LAYER_TIP[rowLayer(row)]" placement="top">
+              <el-tag size="small" :type="LAYER_TAG_TYPE[rowLayer(row)]">
+                {{ LAYER_LABEL[rowLayer(row)] }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="匹配条件" min-width="210">
+          <template #default="{ row }">
+            <div v-for="(p, i) in conditionParts(row, countryLabel)" :key="i">{{ p }}</div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="动作" min-width="190">
+          <template #default="{ row }">
+            <div v-for="(p, i) in actionParts(row)" :key="i">{{ p }}</div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="操作" width="200" align="center">
+          <template #default="{ $index }">
+            <el-button size="small" link type="primary" :disabled="$index === 0" @click="moveRule($index, -1)">
+              上移
+            </el-button>
+            <el-button
+              size="small"
+              link
+              type="primary"
+              :disabled="$index === rules.length - 1"
+              @click="moveRule($index, 1)"
+            >
+              下移
+            </el-button>
+            <el-button size="small" link type="primary" @click="editRule($index)">编辑</el-button>
+            <el-button size="small" link type="danger" @click="removeRule($index)">删除</el-button>
+          </template>
+        </el-table-column>
+
+        <template #empty>
+          <span class="hint">还没有细分规则，所有流量都按下面的全局规则处理。</span>
+        </template>
+      </el-table>
+
+      <div class="hint" style="margin-top: 10px">
+        规则的先后顺序就是匹配顺序。改动后需要点右上角「保存并生效」—— 策略和规则在同一次请求里一起保存。
+      </div>
+    </div>
+
     <div class="page-card panel">
       <div class="panel-head">
-        <span class="section-title">频控策略</span>
+        <span class="section-title">全局规则（细分规则没命中时生效）</span>
         <div>
           <el-button size="small" @click="load">重新加载</el-button>
           <el-button size="small" @click="resetToSaved">放弃修改</el-button>
@@ -37,38 +126,7 @@
         <el-divider content-position="left">阶梯封禁时长</el-divider>
 
         <el-form-item label="封禁阶梯">
-          <div style="width: 100%">
-            <div v-for="(step, i) in steps" :key="i" class="step-row">
-              <span class="step-idx">第 {{ i + 1 }} 次</span>
-              <template v-if="step.unit === 'forever'">
-                <el-tag type="danger" size="small" style="width: 130px">永久封禁</el-tag>
-              </template>
-              <template v-else>
-                <el-input-number v-model="step.value" :min="1" :max="9999" size="small" controls-position="right" style="width: 130px" />
-                <el-select v-model="step.unit" size="small" style="width: 100px; margin-left: 8px">
-                  <el-option label="秒" value="s" />
-                  <el-option label="分钟" value="m" />
-                  <el-option label="小时" value="h" />
-                  <el-option label="天" value="d" />
-                </el-select>
-                <el-button size="small" style="margin-left: 8px" @click="step.unit = 'forever'">
-                  设为永久
-                </el-button>
-              </template>
-              <div class="step-ops">
-                <el-button size="small" link type="primary" :disabled="i === 0" @click="move(i, -1)">上移</el-button>
-                <el-button size="small" link type="danger" :disabled="steps.length <= 1" @click="removeStep(i)">删除</el-button>
-              </div>
-            </div>
-            <el-button size="small" style="margin-top: 8px" @click="addStep">新增一级</el-button>
-            <div class="hint" style="margin-top: 8px">
-              升级窗口内反复触发就逐级下移，用满最后一级后维持该级时长。
-              「永久」只能放最后一级，放在别处后面几级永远不会生效。
-            </div>
-            <div class="hint">
-              等价配置：<span class="mono">{{ durationsPreview }}</span>
-            </div>
-          </div>
+          <BanStepsEditor v-model="steps" />
         </el-form-item>
 
         <el-form-item label="升级统计窗口">
@@ -187,37 +245,47 @@
             <span class="unit">包</span>
             <div class="hint">
               允许短暂突发不被丢弃，一般设为速率的 2 倍。由系统防火墙在网络层执行，
-              只作用于受保护的 frp 端口。
+              只作用于受保护的 frp 端口。它是<strong>兜底</strong>：上面细分规则里的限速会先匹配、先生效。
             </div>
           </el-form-item>
         </template>
       </el-form>
     </div>
+
+    <RateRuleDialog
+      v-model="ruleDialogVisible"
+      :rule="editingRule"
+      :countries="countries"
+      :provinces="provinces"
+      @saved="onRuleSaved"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
-
-type Unit = 's' | 'm' | 'h' | 'd' | 'forever'
-interface Step {
-  value: number
-  unit: Unit
-}
+import BanStepsEditor from '@/components/BanStepsEditor.vue'
+import RateRuleDialog from '@/components/RateRuleDialog.vue'
+import { type Step, parseStepsOrDefault, stepsToCSV, validateSteps } from '@/utils/duration'
+import {
+  LAYER_LABEL,
+  LAYER_TAG_TYPE,
+  LAYER_TIP,
+  type Layer,
+  type RateRule,
+  actionParts,
+  conditionParts,
+  layerOf,
+} from '@/utils/raterule'
 
 const loading = ref(false)
 const saving = ref(false)
 const dirty = ref(false)
 const saved = ref<any>(null)
 
-const steps = ref<Step[]>([
-  { value: 10, unit: 'm' },
-  { value: 1, unit: 'h' },
-  { value: 1, unit: 'd' },
-  { value: 0, unit: 'forever' },
-])
+const steps = ref<Step[]>(parseStepsOrDefault(''))
 
 const form = reactive({
   window_seconds: 60,
@@ -236,69 +304,89 @@ const form = reactive({
 
 const selectedCountries = ref<string[]>([])
 const countries = ref<any[]>([])
+const provinces = ref<any[]>([])
 const countryAvailable = ref(false)
 const capability = ref<any>({})
+
+// ---- 细分规则 ----
+
+const rules = ref<RateRule[]>([])
+const guardProblems = ref<string[]>([])
+const ruleDialogVisible = ref(false)
+const editingIndex = ref(-1)
+const editingRule = ref<RateRule | null>(null)
 
 const rateSupported = computed(() => capability.value?.rate_limit !== false)
 
 const countriesGrouped = computed(() => countries.value)
 
-// ---- 阶梯时长 <-> 秒序列 ----
+const countryLabel = (code: string) => {
+  const c = countries.value.find((x) => x.code === code)
+  return c?.name || code
+}
 
-const UNIT_SEC: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 }
+// 落点优先用后端算的那份（保存过的规则都带），没保存过的新行本地推一遍。
+// 两边推的是同一条规则（有端口落内核），所以不会出现两种答案。
+const rowLayer = (row: RateRule): Layer => row.layer || layerOf(row)
 
-function parseSteps(csv: string): Step[] {
-  const out: Step[] = []
-  for (const raw of String(csv || '').split(',')) {
-    const s = raw.trim()
-    if (!s) continue
-    const v = Number(s)
-    if (!Number.isFinite(v) || v < 0) continue
-    if (v === 0) {
-      out.push({ value: 0, unit: 'forever' })
-      continue
-    }
-    if (v % 86400 === 0) out.push({ value: v / 86400, unit: 'd' })
-    else if (v % 3600 === 0) out.push({ value: v / 3600, unit: 'h' })
-    else if (v % 60 === 0) out.push({ value: v / 60, unit: 'm' })
-    else out.push({ value: v, unit: 's' })
+/**
+ * 提交给后端的字段白名单。
+ *
+ * 显式列出而不是整个对象丢过去：id / layer 是服务端算的，
+ * 顺便传回去会让人以为它们是可以由客户端决定的（而且后端确实会忽略 id）。
+ */
+function rulePayload(r: RateRule) {
+  return {
+    name: r.name,
+    enabled: r.enabled,
+    countries: r.countries,
+    provinces: r.provinces,
+    cidrs: r.cidrs,
+    ports: r.ports,
+    per_sec: r.per_sec,
+    burst: r.burst,
+    window_seconds: r.window_seconds,
+    threshold: r.threshold,
+    ban_durations: r.ban_durations,
+    remark: r.remark,
   }
-  return out.length ? out : [{ value: 10, unit: 'm' }]
 }
 
-function stepToSec(s: Step): number {
-  if (s.unit === 'forever') return 0
-  return Math.max(1, Math.floor(s.value)) * UNIT_SEC[s.unit]
+function addRule() {
+  editingIndex.value = -1
+  editingRule.value = null
+  ruleDialogVisible.value = true
 }
 
-const durationsPreview = computed(() => {
-  const parts = steps.value.map((s) => (s.unit === 'forever' ? '永久(0)' : String(stepToSec(s))))
-  return parts.join(',')
-})
+function editRule(i: number) {
+  editingIndex.value = i
+  editingRule.value = { ...rules.value[i] }
+  ruleDialogVisible.value = true
+}
 
-function addStep() {
-  const last = steps.value[steps.value.length - 1]
-  // 新增的一级默认比上一级更长；上一级是永久就把新级插到永久之前
-  if (last && last.unit === 'forever') {
-    steps.value.splice(steps.value.length - 1, 0, { value: 7, unit: 'd' })
+function onRuleSaved(r: RateRule) {
+  if (editingIndex.value >= 0) {
+    rules.value.splice(editingIndex.value, 1, r)
   } else {
-    steps.value.push({ value: 7, unit: 'd' })
+    rules.value.push(r)
   }
-  touch()
 }
 
-function removeStep(i: number) {
-  if (steps.value.length <= 1) return
-  steps.value.splice(i, 1)
-  touch()
+async function removeRule(i: number) {
+  const r = rules.value[i]
+  try {
+    await ElMessageBox.confirm(`确定删除规则「${r.name}」吗？`, '确认删除', { type: 'warning' })
+  } catch {
+    return
+  }
+  rules.value.splice(i, 1)
 }
 
-function move(i: number, dir: number) {
+function moveRule(i: number, dir: number) {
   const j = i + dir
-  if (j < 0 || j >= steps.value.length) return
-  const arr = steps.value
+  if (j < 0 || j >= rules.value.length) return
+  const arr = rules.value
   ;[arr[i], arr[j]] = [arr[j], arr[i]]
-  touch()
 }
 
 // ---- 脏标记 ----
@@ -308,7 +396,7 @@ let baseline = ''
 // 任何字段变动都重新比对基线，而不是简单地置 true，
 // 这样「改了又改回去」也能正确显示为未修改。
 watch(
-  [() => ({ ...form }), steps, selectedCountries],
+  [() => ({ ...form }), steps, selectedCountries, rules],
   () => {
     if (!baseline) return
     dirty.value = snapshot() !== baseline
@@ -316,15 +404,13 @@ watch(
   { deep: true }
 )
 
-function touch() {
-  dirty.value = true
-}
-
 function snapshot() {
   return JSON.stringify({
     ...form,
     steps: steps.value.map((s) => ({ value: s.value, unit: s.unit })),
     countries: [...selectedCountries.value].sort(),
+    // 顺序本身是配置的一部分，所以不能排序
+    rules: rules.value.map(rulePayload),
   })
 }
 
@@ -333,12 +419,23 @@ function markClean() {
   dirty.value = false
 }
 
+// 规则表 + 编译状态。保存之后要重新拉一次：服务端会规范化条件
+// （端口合并、省份收敛、裸 IP 补掩码），不重拉的话基线立刻对不上，
+// 刚点完保存就显示"有未保存的修改"。
+async function loadRuleMeta() {
+  const [r, info]: any[] = await Promise.all([api.listRateRules(), api.systemInfo()])
+  rules.value = (r?.rules || []) as RateRule[]
+  guardProblems.value = info?.guard?.rule_problems || []
+  capability.value = info?.capability || {}
+}
+
 async function load() {
   loading.value = true
   try {
-    const [p, g] = await Promise.all([
+    const [p, g, prov] = await Promise.all([
       api.getPolicy() as any,
       api.geoCountries() as any,
+      api.geoProvinces() as any,
     ])
 
     const policy = p || {}
@@ -357,7 +454,7 @@ async function load() {
     form.rate_limit_per_sec = policy.rate_limit_per_sec ?? 20
     form.rate_limit_burst = policy.rate_limit_burst ?? 40
 
-    steps.value = parseSteps(policy.ban_durations)
+    steps.value = parseStepsOrDefault(policy.ban_durations)
     selectedCountries.value = String(policy.geoip_block_countries || '')
       .split(',')
       .map((s) => s.trim().toUpperCase())
@@ -365,9 +462,9 @@ async function load() {
 
     countries.value = g?.countries || []
     countryAvailable.value = !!g?.available
+    provinces.value = prov?.provinces || []
 
-    const info: any = await api.systemInfo()
-    capability.value = info?.capability || {}
+    await loadRuleMeta()
 
     markClean()
   } finally {
@@ -381,12 +478,10 @@ function resetToSaved() {
 }
 
 async function save() {
-  // 校验：永久只能出现在最后一级
-  for (let i = 0; i < steps.value.length; i++) {
-    if (steps.value[i].unit === 'forever' && i !== steps.value.length - 1) {
-      ElMessage.error('「永久封禁」只能放在最后一级')
-      return
-    }
+  const stepErr = validateSteps(steps.value)
+  if (stepErr) {
+    ElMessage.error(stepErr)
+    return
   }
   if (form.geoip_block_enabled && selectedCountries.value.length === 0) {
     ElMessage.error('已启用地域封禁但没选任何国家，请先选择或关闭该开关')
@@ -398,7 +493,7 @@ async function save() {
     const body = {
       window_seconds: form.window_seconds,
       threshold: form.threshold,
-      ban_durations: steps.value.map((s) => String(stepToSec(s))).join(','),
+      ban_durations: stepsToCSV(steps.value),
       escalate_window_hours: form.escalate_window_hours,
       ban_granularity: form.ban_granularity,
       fail_mode: form.fail_mode,
@@ -410,18 +505,21 @@ async function save() {
       rate_limit_enabled: form.rate_limit_enabled,
       rate_limit_per_sec: form.rate_limit_per_sec,
       rate_limit_burst: form.rate_limit_burst,
+      // 传空数组也是这个字段：后端据此区分"清空所有规则"和"不动规则"
+      rules: rules.value.map(rulePayload),
     }
 
     const r: any = await api.updatePolicy(body)
     saved.value = r
     // 后端会规范化国家码并回填，这里以服务端返回为准
     if (r) {
-      steps.value = parseSteps(r.ban_durations)
+      steps.value = parseStepsOrDefault(r.ban_durations)
       selectedCountries.value = String(r.geoip_block_countries || '')
         .split(',')
         .map((s) => s.trim().toUpperCase())
         .filter(Boolean)
     }
+    await loadRuleMeta()
     markClean()
     ElMessage.success('策略已保存并生效')
   } finally {
@@ -456,26 +554,9 @@ onMounted(load)
   font-size: 12.5px;
 }
 
-.step-row {
-  display: flex;
-  align-items: center;
-  gap: 0;
-  padding: 6px 0;
-  border-bottom: 1px dashed #eef0f4;
-}
-
-.step-row:last-of-type {
-  border-bottom: none;
-}
-
-.step-idx {
-  width: 78px;
-  color: #5a6472;
-  font-size: 13px;
-}
-
-.step-ops {
-  margin-left: auto;
+.rule-off {
+  color: #a8b0bd;
+  text-decoration: line-through;
 }
 
 .opt-code {

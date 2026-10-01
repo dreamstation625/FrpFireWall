@@ -105,12 +105,16 @@ export const api = {
 
   // ---- 策略 ----
   getPolicy: () => http.get('/policy'),
+  // 细分规则与全局策略一起保存（后端在同一个事务里落盘），
+  // 所以写入走 updatePolicy 的 rules 字段，没有单独的写接口。
   updatePolicy: (body: Record<string, unknown>) => http.put('/policy', body),
+  listRateRules: () => http.get('/policy/rules'),
 
   // ---- GeoIP ----
   geoLookup: (ip: string) => http.post('/geoip/lookup', { ip }),
   geoStatus: () => http.get('/geoip/status'),
   geoCountries: () => http.get('/geoip/countries'),
+  geoProvinces: () => http.get('/geoip/provinces'),
   geoUpload: (name: string, file: File) => {
     const fd = new FormData()
     fd.append('name', name)
