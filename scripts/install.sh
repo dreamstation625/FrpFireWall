@@ -917,6 +917,19 @@ do_install() {
       0)
         if [ "$FORCE" -eq 0 ]; then
           log "已是最新版本 $cur，无需操作"
+          # 但 --listen 是用户明确下达的指令，不能因为版本没变就一起丢掉。
+          # 想改监听地址的人多半是"面板打不开了，先把地址改对"，这里默默跳过
+          # 会让他以为参数没生效，转头去翻防火墙和安全组。
+          if [ -n "$LISTEN" ]; then
+            install_listen_override
+            systemctl daemon-reload 2>/dev/null || true
+            log "监听地址已设为 $LISTEN"
+            if [ "$DO_START" -eq 1 ]; then
+              systemctl restart "$SERVICE" \
+                || warn "重启失败，看日志： journalctl -u $SERVICE -n 30"
+            fi
+            return 0
+          fi
           if [ "$DO_START" -eq 1 ]; then
             systemctl is-active --quiet "$SERVICE" || {
               log "服务当前未运行，正在启动"
