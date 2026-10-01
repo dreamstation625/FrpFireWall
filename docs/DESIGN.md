@@ -893,6 +893,7 @@ LimitNOFILE=65535
 | P7 | 构建打包：go:embed、交叉编译、systemd、安装/救援脚本 | ✅ 完成 |
 | P8 | 冒烟测试（177 项断言全通过） | ✅ 完成 |
 | P9 | 版本号与自动发布：git 仓库 + `VERSION` + CI + tag 触发 Release + 前端检查更新 | ✅ 完成 |
+| P10 | 发布闸门：版本号不高于已发布最高版本就不构建（`tools/versioncmp`） | ✅ 完成 |
 
 **已做的验证**：真实起服务跑完整链路（177 项断言）—— 前端产物 embed 与 SPA 回退、
 首次初始化令牌流程（错误令牌 401 / 过短密码 400 / 重复初始化 409 / 令牌文件清除）、
@@ -905,9 +906,31 @@ JWT 鉴权与防爆破、策略读写与非法输入拒绝、系统配置读写�
 更新检查配置读写后能原样还原、回填配置不会把其它开关清成零值）。
 执行方式：`bash testdata/smoke.sh`（会自动还原被改动的策略与配置；版本断言取自 `VERSION` 文件而非硬编码）。
 
+**发布链路实测**（真跑过，不是纸面推演）：
+
+- CI 两个 job 全绿（前端 9/9、后端 11/11 步骤）。
+- tag `v0.0.1-pre.01` 触发的 Release 工作流 15 个步骤全绿，产物为
+  `frpfirewall-linux-amd64`（28.7 MB）、`frpfirewall-linux-arm64`（26.9 MB）、
+  `sha256sums.txt`、`install.sh`、`frpfirewall.service`。
+- release 属性正确：`prerelease=true`、`draft=false`、**不是 latest**
+  （`/releases/latest` 返回 404）——正式版用户不会被引到这个预发布版上。
+- 发布闸门用真实的 GitHub Releases 数据、配合 workflow 里逐字相同的命令验证：
+  「已发布最高版本 = 本次 tag」时判定 `publish=false` 并跳过构建
+  （没有 gh CLI / token，调不了 GitHub 的 re-run API，因此这条路径没能在
+  真实 workflow 上触发过；真实 workflow 上跑到的是下面的自愈路径）。
+- 意外条件下实测到一条自愈路径：release 被删后重推同一个 tag 能正常重建、
+  15 个步骤全绿。这正是「基准取已发布 release 而非 git tag」带来的性质——
+  顺便也证明**删 tag 会连带删掉它的 release**，别拿删 tag 当重跑手段。
+
 **已做的单元测试**：`go test ./...` —— `internal/version` 覆盖版本号解析 / 格式化 / 比较 /
 更新筛选（含正式版永不追预发布、预发布版同号正式版优先）；`internal/update` 覆盖正向缓存、
-失败负缓存、强制绕过、`Peek` 不联网、非法 tag 计入 `skipped_tags` 而不整体失败。
+失败负缓存、强制绕过、`Peek` 不联网、非法 tag 计入 `skipped_tags` 而不整体失败；
+`tools/versioncmp` 以 28 个子用例覆盖发布闸门的判定，含「预发布转正」
+（`0.0.1 > 0.0.1-pre.99`）、「正式版已发布后推同号 pre 应跳过」、
+「无法解析的历史 tag 不阻塞也不参与比较」，以及非法候选版本号必须硬报错。
+另有一个测试把「`version.Version` 默认值必须等于 `VERSION` 文件内容」钉死——
+两者脱节不会让任何构建失败（CI 与 Makefile 走的都是注入路径），
+只会让裸 `go build` 出来的二进制自称一个错误的版本号。
 另外用真实数据源端到端验证过：检查源指向 `cli/cli` 能取到最新正式版与其资产列表；
 指向 `kubernetes/kubernetes` 时 7 个 `-alpha` / `-beta` / `-rc` tag 被跳过而不是导致整体失败。
 
