@@ -204,6 +204,37 @@ iptables 侧不引入 ipset，改用独立黑名单子链逐条 `-A`。
 - **可关闭。** 纯内网或不允许出网的服务器可以在面板里关掉在线检查，
   此时界面仍显示当前版本与发布页链接。
 
+#### 发布闸门：只有版本号提升才构建
+
+`release.yml` 在校验完 tag 与 `VERSION` 一致之后、动任何构建之前，先做一次判定：
+候选 tag 的版本必须**严格高于已发布 release 里的最高版本**，否则跳过整个构建与发布。
+
+| 场景 | 判定 |
+|---|---|
+| 重复推送同一个 tag | 跳过 |
+| 推出比线上更旧的版本 | 跳过（否则 latest 会被指回旧版本） |
+| 正式版已发布后推同号 `-pre` | 跳过（`0.0.1-pre.02 < 0.0.1`，属倒退） |
+| 发布失败后重跑同一个 tag | 发布 |
+
+**基准取「已发布的 release」而不是 git tag**，这是这里唯一反直觉的地方：
+tag 在 release 建成之前就已经存在。若拿 tag 当基准，「构建失败」或
+「release 创建失败」之后重跑工作流时，本次 tag 已经在基准列表里，会被判成
+「没有提升」而永远跳过——失败的发布就再也修不好了。改用已发布列表后自洽：
+首发与失败重跑都算提升，只有真正发布过之后再重推才会跳过。
+
+比较直接复用 `internal/version` 的 `Parse` / `Compare`（见 `tools/versioncmp`），
+不在 CI 里另写一份。原因是这条规则有个容易写反的分支——**同号段正式版大于预发布版**
+（`0.0.1 > 0.0.1-pre.99`）。用 shell 或 `sort -V` 手写几乎必错：
+
+```console
+$ printf '0.0.1\n0.0.1-pre.99\n' | sort -V
+0.0.1            # ← sort 认为它更小
+0.0.1-pre.99     # ← 而按本项目的语义，它更小
+```
+
+闸门判定为「不发布」时，工作流是**成功**状态而非失败：重推同一个 tag 是常见误操作，
+不该把 CI 变红。判定依据会写进 step summary，避免「绿了但没发布」被误解。
+
 ---
 
 ## 3. 总体架构
@@ -305,13 +336,14 @@ FrpFireWall/
 │   │   └── handlers_update.go   # 版本更新状态与主动检查
 │   └── web/               # go:embed 前端产物 + SPA 回退
 ├── web/                   # Vue3 前端源码
+├── tools/versioncmp/      # 发布闸门：候选版本是否高于已发布最高版本
 ├── testdata/              # 冒烟测试脚本与辅助工具
 ├── scripts/
 │   ├── install.sh
 │   └── frpfirewall-panic.sh     # 一键清空本程序规则（救援用）
 ├── .github/workflows/
-│   ├── ci.yml             # 提交守门：版本格式、go vet、单元测试、前端构建
-│   └── release.yml        # tag 触发：校验 → 构建 → 创建 Release
+│   ├── ci.yml             # 提交守门：版本格式、平台依赖、go vet、单元测试、前端构建
+│   └── release.yml        # tag 触发：校验 → 发布闸门 → 构建 → 创建 Release
 ├── deploy/frpfirewall.service
 └── docs/DESIGN.md
 ```

@@ -236,13 +236,36 @@ git tag v0.0.2 && git push origin main --tags
 ```
 
 CI（`.github/workflows/release.yml`）会自动：校验 tag 与 `VERSION` 一致 →
-跑 `go vet` 与单元测试 → 构建前端 → 交叉编译 `linux/amd64` 与 `linux/arm64` →
+过发布闸门 → 跑 `go vet` 与单元测试 → 构建前端 → 交叉编译 `linux/amd64` 与 `linux/arm64` →
 实地跑一遍二进制确认版本号注入成功 → 生成 `sha256sums.txt` → 创建 Release。
 
 tag 里带 `-pre.` 的会被自动标记为 **Pre-release**，不会成为 latest；
 正式版则标记为 latest。发布物包含两个架构的二进制、校验和、`install.sh` 与 systemd 单元。
 
 `VERSION` 的格式也由 CI 看门：写 `0.1.0-dev` 这类会被直接拒绝。
+
+### 发布闸门
+
+**只有版本号真的提升了才会构建。** 工作流在动手构建之前，先拿候选 tag 的版本号与
+已发布的 release 比对，必须**严格高于**其中最高的那个，否则打印一条 notice 后
+跳过整个构建与发布（工作流本身仍算成功）。
+
+会被挡下的情形：
+
+| 场景 | 结果 |
+| --- | --- |
+| 重复推送同一个 tag | 跳过，而不是报「release 已存在」 |
+| 推一个比线上更旧的版本 | 跳过，避免把 latest 指回旧版本 |
+| 正式版已发布，再推同号 `-pre` | 跳过（`0.0.1-pre.02 < 0.0.1`，属倒退） |
+| 发布失败后重跑同一个 tag | **正常发布** |
+
+最后一行是关键：比较基准取的是**已发布的 release**，不是 git tag。tag 在 release
+建成之前就已存在，若拿 tag 当基准，「构建失败」或「release 创建失败」之后重跑会被
+判成「没有提升」而永远跳过，失败的发布就再也修不好了。
+
+比较逻辑直接复用 `internal/version`（也就是面板里检查更新用的同一套），
+免得在 CI 里另写一份产生漂移——尤其「同号段正式版大于预发布版」这条规则很容易写反。
+守门程序在 `tools/versioncmp`，有独立单元测试。
 
 ---
 
@@ -293,6 +316,7 @@ internal/frpsplugin/  frps httpPlugins 协议实现
 internal/api/         REST API 与 JWT 鉴权
 internal/web/         go:embed 前端产物
 web/                  Vue 3 + Vite + Element Plus 前端
+tools/versioncmp/     发布闸门：判断版本号是否高于已发布的最高版本
 .github/workflows/    CI 与 tag 触发的自动发布
 deploy/               systemd 单元
 scripts/              安装与救援脚本

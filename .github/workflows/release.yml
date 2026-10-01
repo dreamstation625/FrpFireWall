@@ -5,8 +5,12 @@ name: Release
 #   v0.0.1          正式版（默认 Release，GitHub 会标记为 latest）
 #   v0.0.2-pre.01   预发布版（自动标记为 Pre-release，不会成为 latest）
 #
-# 工作流会先校验 tag 与 VERSION 文件一致，不一致直接失败，
-# 避免出现「tag 说 0.0.2、二进制里却编译进 0.0.1」这种查不出来的事故。
+# 两道闸门，都过不了就不构建：
+#
+#   1. tag 必须与 VERSION 文件一致，避免出现「tag 说 0.0.2、
+#      二进制里却编译进 0.0.1」这种查不出来的事故；
+#   2. 版本号必须真的高于已发布的最高版本，重复推送同一个 tag、
+#      或者推一个更旧的版本，都会被挡下并跳过整个构建。
 on:
   push:
     tags:
@@ -71,11 +75,63 @@ jobs:
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # 守门需要跑项目自己的版本比较实现，所以 Go 要装在它前面。
+      # setup-go 读 go.mod 定版本、带模块缓存，本身很快；真正耗时的是
+      # 后面的 npm ci 与交叉编译，那两步才是这里要省掉的。
       - name: 安装 Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      # 守门：版本号相对已发布的 release 没有提升，就直接收工，不浪费构建资源。
+      #
+      # 基准取「已发布的 release」而不是 git tag。tag 在 release 建成之前就已经
+      # 存在，若拿 tag 当基准，「构建失败」或「release 创建失败」之后重跑会被判成
+      # 「没有提升」而永远跳过，失败的发布就再也修不好了。用 release 列表则自洽：
+      # 首发和失败重跑都算提升，只有「已发布之后重推同一个 tag」才会跳过。
+      #
+      # 比较逻辑复用 internal/version（即程序里检查更新用的那一套），
+      # 免得在 CI 里另写一份产生漂移 —— 尤其是「同号段正式版大于预发布版」
+      # （0.0.1 > 0.0.1-pre.99）这条规则，手写很容易搞反。
+      - name: 检查版本号是否提升
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # --limit 200 远大于本项目可预见的 release 数量。
+          # 这里不加 `|| true`：拿不到基准就不该盲目发布，失败反而更安全。
+          gh release list --limit 200 --json tagName --jq '.[].tagName' > /tmp/released.txt
+          echo "已发布版本数: $(grep -c . /tmp/released.txt || true)"
+
+          # 人类可读说明走 stderr，key=value 走 stdout
+          go run ./tools/versioncmp \
+            -candidate "${GITHUB_REF_NAME}" \
+            -existing /tmp/released.txt > /tmp/gate.txt
+
+          cat /tmp/gate.txt
+          cat /tmp/gate.txt >> "$GITHUB_OUTPUT"
+
+          publish="$(sed -n 's/^publish=//p' /tmp/gate.txt)"
+          reason="$(sed -n 's/^reason=//p' /tmp/gate.txt)"
+          max="$(sed -n 's/^max=//p' /tmp/gate.txt)"
+
+          {
+            echo "### 发布闸门"
+            echo
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 本次 tag | \`${GITHUB_REF_NAME}\` |"
+            echo "| 已发布最高版本 | \`${max:-（无）}\` |"
+            echo "| 判定 | ${reason} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$publish" != "true" ]; then
+            echo "::notice title=跳过发布::${reason}"
+            exit 0
+          fi
 
       - name: 安装 Node
         uses: actions/setup-node@v4

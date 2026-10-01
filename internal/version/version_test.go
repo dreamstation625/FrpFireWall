@@ -1,6 +1,11 @@
 package version
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestParse(t *testing.T) {
 	cases := []struct {
@@ -236,5 +241,24 @@ func TestCurrentParses(t *testing.T) {
 	}
 	if n.IsZero() {
 		t.Fatalf("Current() 得到零值版本")
+	}
+}
+
+// Version 的默认值必须与仓库根目录的 VERSION 文件保持一致。
+//
+// 正式构建会用 -ldflags -X 覆盖它，所以默认值只影响裸 go build 的场景。
+// 但两者一旦脱节，裸构建出来的二进制就会自称一个错误的版本号，而
+// CI 全绿也发现不了——CI 和 Makefile 走的都是注入路径，谁都不会碰默认值。
+// 改版本号时容易只改 VERSION 忘记这里，所以用测试钉死。
+func TestDefaultVersionMatchesVersionFile(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "VERSION"))
+	if err != nil {
+		t.Fatalf("读取 VERSION 文件失败: %v", err)
+	}
+	want := strings.TrimSpace(string(raw))
+
+	if Version != want {
+		t.Errorf("version.Version = %q，但 VERSION 文件是 %q；改版本号时这两处要一起改",
+			Version, want)
 	}
 }
