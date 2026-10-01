@@ -110,14 +110,18 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 		return Verdict{Allow: true, Reason: "no-policy"}
 	}
 
-	// 5. GeoIP 国家/地区判定（应用层实时解析，不落内核集合）
+	// 5. GeoIP 国家/地区判定（全局名单）
+	//
+	// 这是一份**名单**，回答"谁不许来"，和"来了之后怎么限"是两件事。
+	// 所以它恒定生效，细分规则取代不了它 —— 故意排在细分规则之前：
+	// 被名单挡住的地址在这里就返回了，根本走不到下一步。
 	if policy.GeoIPBlockEnabled && geoInfo.Found && geoInfo.Country != "" {
 		if m.countryBlocked(policy, geoInfo.Country) {
 			reason := fmt.Sprintf("来源国家/地区 %s 命中封禁名单", geoInfo.CountryName)
 			if policy.GeoIPMode == "whitelist" {
 				reason = fmt.Sprintf("来源国家/地区 %s 不在放行名单内", geoInfo.CountryName)
 			}
-			m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo)
+			m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo, nil)
 			m.pushEvent(&model.Event{
 				Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
@@ -127,24 +131,55 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 		}
 	}
 
-	// 6. 滑动窗口频次统计
-	win := time.Duration(policy.WindowSeconds) * time.Second
+	// 6. 细分规则：按优先级取第一条命中的，命中即取代全局的频控参数。
+	//
+	//    取代的范围仅限"频控参数"（限速、窗口、阈值、阶梯），不含上一步的
+	//    地域名单，也不含自动封禁 / 观察模式这类全局开关 —— 那几个是行为开关，
+	//    不是"这条规则用多大力度"。
+	rule := m.matchAppRule(addr, geoInfo)
+
+	// 7. 频控参数：命中规则就用规则的，否则用全局策略。
+	tag, win, threshold, steps, who := "", time.Duration(0), 0, []int64(nil), ""
+	if rule != nil {
+		tag, win, threshold, steps = rule.tag(), rule.window, rule.threshold, rule.steps
+		who = "规则「" + rule.name + "」："
+	} else {
+		win = time.Duration(policy.WindowSeconds) * time.Second
+		threshold = policy.Threshold
+	}
 	if win <= 0 {
 		win = time.Minute
 	}
 
-	m.mu.Lock()
-	w := m.windows[ip]
-	if w == nil {
-		w = &hitWindow{}
-		m.windows[ip] = w
+	// 8. 先计数，再判限速。
+	//
+	//    顺序不能反：如果限速拒掉的连接直接返回、不计入窗口，攻击者只要把速率
+	//    提到限速之上，窗口就永远攒不满、也就永远封不掉 —— 限速反而成了封禁的
+	//    挡箭牌。计满了自然会在下面触发封禁。
+	hits := 0
+	if threshold > 0 {
+		hits = m.countWindow(tag, ip, now, win)
 	}
-	hits := w.add(now, win)
-	m.mu.Unlock()
 
-	if policy.Threshold > 0 && hits >= policy.Threshold {
-		detail := fmt.Sprintf("%d 秒内登录尝试 %d 次，超过阈值 %d 次",
-			policy.WindowSeconds, hits, policy.Threshold)
+	// 9. 应用层限速。
+	//
+	//    全局的限速不在这里做：它按端口分流，而插件回调拿不到被访问的端口，
+	//    只能落在内核（见 DESIGN D16）。这里只做细分规则自己那份 ——
+	//    细分规则的条件是属地与网段，内核表达不出来。
+	if rule != nil && rule.perSec > 0 && !rule.bucket.allow(ip, now) {
+		detail := fmt.Sprintf("规则「%s」：单个来源 IP 每秒最多 %d 个连接，已超限", rule.name, rule.perSec)
+		m.pushEvent(&model.Event{
+			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Country: geoInfo.Country, Province: geoInfo.Province,
+			Detail: detail,
+		})
+		return Verdict{Allow: false, Reason: "rate-limited", Detail: detail}
+	}
+
+	// 10. 阈值判定
+	if threshold > 0 && hits >= threshold {
+		detail := fmt.Sprintf("%s%d 秒内登录尝试 %d 次，超过阈值 %d 次",
+			who, int(win.Seconds()), hits, threshold)
 
 		if !policy.AutoBanEnabled {
 			m.pushEvent(&model.Event{
@@ -155,7 +190,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 			return Verdict{Allow: true, Reason: "threshold-hit-no-autoban"}
 		}
 
-		m.triggerBan(addr, model.SourceAuto, detail, user, geoInfo)
+		m.triggerBan(addr, model.SourceAuto, detail, user, geoInfo, steps)
 		m.pushEvent(&model.Event{
 			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,

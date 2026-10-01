@@ -151,8 +151,12 @@ func buildIPTablesRules(des Desired, bits int) iptRules {
 	)
 
 	// 连接速率限制（per-IP），放在封禁判定之后、兜底 RETURN 之前。
-	if des.RateLimit != nil && des.RateLimit.Enabled {
-		for _, args := range hashlimitRules(des.RateLimit, r.FrpPorts) {
+	//
+	// 顺序就是优先级：全局兜底规则在最前面（作用面最宽），细分规则依次排在后面。
+	// 想让"细分优先"真正成立，上层编译时就得把细分规则放在前面 ——
+	// 这里不做任何重排，照单下发。
+	for _, rl := range filterRateRules(des.RateLimits, bits) {
+		for _, args := range rateLimitArgs(rl) {
 			r.Guard = append(r.Guard, iptRule{
 				Args: append([]string{"-A", ManagedChain}, args...),
 				Soft: true,
@@ -509,21 +513,18 @@ func filterByFamily(targets []string, bits int) []string {
 	return out
 }
 
-// hashlimitRules 生成 per-IP 连接速率限制规则。
+// rateLimitArgs 把一条限速规则展开成 iptables 参数。
 //
-// hashlimit 是 iptables 里唯一能做到"按源 IP 分别计数"的现成模块，
-// 正好用来兜住"不发 frp 协议、纯 TCP 扫描 bindPort"的流量——
-// 这类流量不会触发 frps 插件，只能靠网络层限速拦。
+// 展开成「来源 × 端口分块」的笛卡尔积，而不是靠 iptables 自己对重复的 -s
+// 做隐式展开 —— 展开出来的条数得能提前数清楚，否则"到底下了几条规则"
+// 只能上机器数。端口按区间个数切块（multiport 的 15 个名额数的是端口或区间的
+// 个数，20000:30000 只占一个）。
 //
-// 端口超过 multiport 上限时会拆成多条：拆出来的每条共用同一个 --hashlimit-name，
-// 因而共享同一张计数表。否则每个端口块各算一份配额，实际放行量会按块数翻倍。
-func hashlimitRules(spec *RateLimitSpec, ports portrange.Set) [][]string {
-	if spec == nil || !spec.Enabled || spec.PerSec <= 0 {
+// 同一个 Key 拆出来的所有条共用同一个 --hashlimit-name，因而共享同一张计数表。
+// 各条各算一份配额的话，实际放行量会按条数翻倍 —— 这块以前踩过。
+func rateLimitArgs(r RateLimitRule) [][]string {
+	if r.PerSec <= 0 {
 		return nil
-	}
-	burst := spec.Burst
-	if burst <= 0 {
-		burst = spec.PerSec * 2
 	}
 
 	head := []string{
@@ -532,30 +533,39 @@ func hashlimitRules(spec *RateLimitSpec, ports portrange.Set) [][]string {
 	}
 	tail := []string{
 		"-m", "hashlimit",
-		"--hashlimit-above", fmt.Sprintf("%d/sec", spec.PerSec),
-		"--hashlimit-burst", fmt.Sprint(burst),
+		"--hashlimit-above", fmt.Sprintf("%d/sec", r.PerSec),
+		"--hashlimit-burst", fmt.Sprint(r.burst()),
 		"--hashlimit-mode", "srcip",
-		"--hashlimit-name", "frpfirewall_rl",
+		"--hashlimit-name", hashlimitName(r.Key),
 		"--hashlimit-htable-expire", "60000",
 		"-j", "DROP",
 	}
 
-	// 不限端口：对全部新建连接生效。
-	if len(ports) == 0 {
-		args := make([]string, 0, len(head)+len(tail))
-		args = append(args, head...)
-		args = append(args, tail...)
-		return [][]string{args}
+	// 没有来源限制时也要走一遍循环，用一个空来源占位，避免两套拼装逻辑。
+	sources := r.Sources
+	if len(sources) == 0 {
+		sources = []string{""}
 	}
 
-	chunks := ports.Chunks(multiportMax)
-	out := make([][]string, 0, len(chunks))
-	for _, c := range chunks {
-		args := make([]string, 0, len(head)+len(tail)+4)
-		args = append(args, head...)
-		args = append(args, "-m", "multiport", "--dports", iptPorts(c))
-		args = append(args, tail...)
-		out = append(out, args)
+	chunks := []portrange.Set{nil}
+	if ps := r.Ports.Normalize(); len(ps) > 0 {
+		chunks = ps.Chunks(multiportMax)
+	}
+
+	out := make([][]string, 0, len(sources)*len(chunks))
+	for _, src := range sources {
+		for _, c := range chunks {
+			args := make([]string, 0, len(head)+len(tail)+6)
+			args = append(args, head...)
+			if src != "" {
+				args = append(args, "-s", src)
+			}
+			if len(c) > 0 {
+				args = append(args, "-m", "multiport", "--dports", iptPorts(c))
+			}
+			args = append(args, tail...)
+			out = append(out, args)
+		}
 	}
 	return out
 }

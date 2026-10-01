@@ -173,7 +173,7 @@ func TestBuildIPTablesRulesOrder(t *testing.T) {
 func TestBuildIPTablesRulesRateLimitIsSoft(t *testing.T) {
 	withRate := buildIPTablesRules(Desired{
 		ProtectPorts: portrange.Ports(7000),
-		RateLimit:    &RateLimitSpec{Enabled: true, PerSec: 20},
+		RateLimits:   []RateLimitRule{{Key: "global", PerSec: 20, Ports: portrange.Ports(7000)}},
 	}, 32)
 
 	soft, hard := 0, 0
@@ -219,10 +219,10 @@ func TestBuildIPTablesRulesNormalizesPorts(t *testing.T) {
 
 // 限速规则要按区间生成，并且拆块后共用同一张计数表 ——
 // 各块各算一份配额会让实际放行量随块数翻倍。
-func TestHashlimitRulesUseRanges(t *testing.T) {
-	spec := &RateLimitSpec{Enabled: true, PerSec: 20}
+func TestRateLimitArgsUseRanges(t *testing.T) {
+	base := RateLimitRule{Key: "r1", PerSec: 20}
 
-	one := hashlimitRules(spec, portrange.Ports(7000))
+	one := rateLimitArgs(withPorts(base, portrange.Ports(7000)))
 	if len(one) != 1 {
 		t.Fatalf("单端口应生成 1 条，实际 %d 条", len(one))
 	}
@@ -230,7 +230,7 @@ func TestHashlimitRulesUseRanges(t *testing.T) {
 		t.Errorf("限速规则应带端口条件：%s", line)
 	}
 
-	if got := hashlimitRules(spec, nil); len(got) != 1 {
+	if got := rateLimitArgs(base); len(got) != 1 {
 		t.Errorf("未配端口应生成 1 条不限端口的规则，实际 %d 条", len(got))
 	} else if line := strings.Join(got[0], " "); strings.Contains(line, "--dports") {
 		t.Errorf("未配端口时不该出现 dport 条件：%s", line)
@@ -241,15 +241,157 @@ func TestHashlimitRulesUseRanges(t *testing.T) {
 	for p := 7000; p < 7040; p += 2 {
 		ports = append(ports, p)
 	}
-	chunked := hashlimitRules(spec, portrange.Ports(ports...))
+	chunked := rateLimitArgs(withPorts(base, portrange.Ports(ports...)))
 	if len(chunked) != 2 {
 		t.Fatalf("20 段端口应拆成 2 条，实际 %d 条", len(chunked))
 	}
+	names := map[string]bool{}
 	for _, args := range chunked {
-		if !strings.Contains(strings.Join(args, " "), "--hashlimit-name frpfirewall_rl") {
+		line := strings.Join(args, " ")
+		name := hashlimitName(base.Key)
+		if !strings.Contains(line, "--hashlimit-name "+name) {
 			t.Errorf("拆块后必须共用同一个 hashlimit 计数表：%v", args)
 		}
+		names[name] = true
 	}
+	if len(names) != 1 {
+		t.Errorf("拆块后计数表名应当只有一个，实际 %v", names)
+	}
+}
+
+// 来源条件按「来源 × 端口块」展开成笛卡尔积，不能靠 iptables 自己对重复的 -s
+// 做隐式展开 —— 展开出来几条得能提前数清楚。
+func TestRateLimitArgsExpandsSources(t *testing.T) {
+	r := RateLimitRule{
+		Key:     "r2",
+		PerSec:  5,
+		Sources: []string{"1.2.3.0/24", "10.0.0.1/32"},
+		Ports:   portrange.Ports(7000),
+	}
+	got := rateLimitArgs(r)
+	if len(got) != 2 {
+		t.Fatalf("2 个来源 × 1 个端口块 = 2 条，实际 %d 条", len(got))
+	}
+	for i, src := range r.Sources {
+		line := strings.Join(got[i], " ")
+		if !strings.Contains(line, "-s "+src) {
+			t.Errorf("第 %d 条应带来源 %s：%s", i, src, line)
+		}
+	}
+
+	// 同一来源多个端口块 → 条数相乘，计数表仍是同一个。
+	r2 := r
+	r2.Ports = portrange.Ports(7000, 7002, 7004, 7006, 7008, 7010, 7012, 7014, 7016,
+		7018, 7020, 7022, 7024, 7026, 7028, 7030)
+	multi := rateLimitArgs(r2)
+	if len(multi) != 4 { // 2 个来源 × 2 个端口块
+		t.Fatalf("2 个来源 × 2 个端口块 = 4 条，实际 %d 条", len(multi))
+	}
+}
+
+// 只有 IPv6 来源的规则落在 IPv4 这一侧时必须整条跳过。
+// 退化成"不限来源"等于把一条限定规则放大成全网限速，方向正好反了。
+func TestFilterRateRulesDropsWrongFamily(t *testing.T) {
+	list := []RateLimitRule{
+		{Key: "any", PerSec: 1},
+		{Key: "v4", PerSec: 1, Sources: []string{"1.2.3.0/24"}},
+		{Key: "v6", PerSec: 1, Sources: []string{"2001:db8::/32"}},
+		{Key: "both", PerSec: 1, Sources: []string{"1.2.3.0/24", "2001:db8::/32"}},
+	}
+
+	v4 := filterRateRules(list, 32)
+	keys := make([]string, 0, len(v4))
+	for _, r := range v4 {
+		keys = append(keys, r.Key)
+	}
+	want := []string{"any", "v4", "both"}
+	if strings.Join(keys, ",") != strings.Join(want, ",") {
+		t.Fatalf("IPv4 侧应保留 %v，实际 %v", want, keys)
+	}
+	for _, r := range v4 {
+		if r.Key == "both" && len(r.Sources) != 1 {
+			t.Errorf("both 在 IPv4 侧应只剩 IPv4 来源，实际 %v", r.Sources)
+		}
+	}
+
+	v6 := filterRateRules(list, 128)
+	keys = keys[:0]
+	for _, r := range v6 {
+		keys = append(keys, r.Key)
+	}
+	want = []string{"any", "v6", "both"}
+	if strings.Join(keys, ",") != strings.Join(want, ",") {
+		t.Fatalf("IPv6 侧应保留 %v，实际 %v", want, keys)
+	}
+}
+
+// --hashlimit-name 有 15 字符上限，超了 iptables 会拒绝整条命令。
+// 而规则名是中文，装不进去，所以只能从 Key 派生 —— 派生结果必须合法、稳定、
+// 且不同的 Key 不能撞成同一个名字。
+func TestHashlimitNameIsShortAndDistinct(t *testing.T) {
+	keys := []string{
+		"global", "r1", "r2", "r36", "rzzz",
+		"香港限速", "一条名字特别特别长的规则用来把标题撑爆掉再看看会不会出问题",
+		"", "!!!",
+	}
+	seen := map[string]string{}
+	for _, k := range keys {
+		name := hashlimitName(k)
+		if len(name) > hashlimitMaxName {
+			t.Errorf("Key %q 派生出的表名 %q 有 %d 字符，超过上限 %d",
+				k, name, len(name), hashlimitMaxName)
+		}
+		for _, r := range name {
+			ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') || r == '_'
+			if !ok {
+				t.Errorf("Key %q 派生出的表名 %q 含非法字符 %q", k, name, r)
+			}
+		}
+		if prev, dup := seen[name]; dup {
+			t.Errorf("Key %q 与 %q 撞成同一个表名 %q", k, prev, name)
+		}
+		seen[name] = k
+	}
+}
+
+// nft 侧一条规则一个动态集合：集合名同样要合法、稳定、不撞。
+func TestRateSetNameDistinct(t *testing.T) {
+	a := rateSetName("r1")
+	b := rateSetName("一条中文规则名")
+	c := rateSetName("r2")
+	if a == b || b == c || a == c {
+		t.Fatalf("集合名撞了：%q %q %q", a, b, c)
+	}
+	if a != rateSetName("r1") {
+		t.Error("同一个 Key 应当派生出同一个集合名")
+	}
+	if !strings.HasPrefix(a, setRatePrefix) {
+		t.Errorf("集合名应带前缀 %q，实际 %q", setRatePrefix, a)
+	}
+}
+
+// 老版本只建了一个全局集合 frpfirewall_rate，前缀判定要能把它也认出来，
+// 否则升级之后它会一直留在内核里。
+func TestIsRateSetName(t *testing.T) {
+	yes := []string{"frpfirewall_rate", "frpfirewall_rate_global", "frpfirewall_rate_r1"}
+	no := []string{"frpfirewall_black", "frpfirewall_black_frp", "rate", ""}
+	for _, n := range yes {
+		if !isRateSetName(n) {
+			t.Errorf("%q 应当被认成限速集合", n)
+		}
+	}
+	for _, n := range no {
+		if isRateSetName(n) {
+			t.Errorf("%q 不该被认成限速集合", n)
+		}
+	}
+}
+
+// withPorts 给规则补上端口，省得每个用例都写一遍字段名。
+func withPorts(r RateLimitRule, p portrange.Set) RateLimitRule {
+	r.Ports = p
+	return r
 }
 
 // 预览必须与实际下发一致，否则预览就成了误导。

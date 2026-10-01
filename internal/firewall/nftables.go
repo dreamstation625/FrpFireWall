@@ -317,16 +317,41 @@ func (d *nftablesDriver) Sync(des Desired) error {
 	// 只有 IPv4 落点能做：动态集合的元素类型是 ipv4_addr，IPv6 得另建一个
 	// ipv6_addr 的动态集合。与其为了对称下发一条在 ip6 家族里语法不合法的
 	// 规则（整份事务会被拒），不如在这一半上干脆跳过。
-	rateOn := false
-	if des.RateLimit != nil && des.RateLimit.Enabled && d.Capability().RateLimit {
+	rates := planRateRules(des.RateLimits)
+	if len(rates) > 0 && d.Capability().RateLimit {
 		if s, ok := d.stackFor(32); ok {
-			if err := d.ensureSet(ctx, s, setRate, "ipv4_addr", true); err == nil {
-				rateOn = true
-			} else {
-				d.warn("当前 nftables 不支持动态集合，已跳过 per-IP 连接速率限制")
+			failed := make(map[string]bool, len(rates))
+			for _, p := range rates {
+				if err := d.ensureSet(ctx, s, p.set, "ipv4_addr", true); err != nil {
+					failed[p.rule.Key] = true
+					d.warn(fmt.Sprintf("限速规则「%s」的动态集合建不出来，已跳过这条：%v", p.rule.Name, err))
+				}
 			}
+			if len(failed) > 0 {
+				kept := rates[:0]
+				for _, p := range rates {
+					if !failed[p.rule.Key] {
+						kept = append(kept, p)
+					}
+				}
+				rates = kept
+			}
+		} else {
+			d.warn("当前 nftables 只找到 IPv6 落点，per-IP 连接速率限制只支持 IPv4，已跳过")
+			rates = nil
 		}
+	} else if len(rates) > 0 {
+		d.warn(fmt.Sprintf("nftables %s 版本过低，不支持动态集合，已跳过 per-IP 连接速率限制",
+			d.report.NFTablesVersion))
+		rates = nil
+	} else {
+		rates = nil
 	}
+
+	// 动态集合带 timeout，元素会自己过期；但规则改速率、改条件、删掉之后，
+	// 旧的集合会一直留在内核里。它们不参与判决（规则每次全量重建），
+	// 却会在 `nft list sets` 里越堆越多，排障时干扰判断。按前缀清掉不在本次期望里的。
+	d.pruneRateSets(ctx, rates)
 
 	// 「仅 frp 端口」的条目在没配端口时生成不出规则，会变成"看起来封了其实没封"。
 	// 这种情况必须报出来，不能静默。
@@ -336,7 +361,7 @@ func (d *nftablesDriver) Sync(des Desired) error {
 			len(des.BlacklistFrp)))
 	}
 
-	script := renderScript(d.stacks, des, handles, rateOn)
+	script := renderScript(d.stacks, des, handles, rates)
 
 	// 语法预检：不通过就整个放弃，绝不带着半截规则上生产。
 	if _, err := runStdin(ctx, script, "nft", "-c", "-f", "-"); err != nil {
@@ -354,8 +379,8 @@ func (d *nftablesDriver) Sync(des Desired) error {
 // 表达式却落在 ip 家族的链上"这种错误，用桩命令测永远发现不了（桩只会点头），
 // 看脚本本身却一眼可见。Preview 也复用它，保证"预览到的"就是"会下发的"。
 //
-// handles 按链给出要删的规则 handle；rateOn 表示限速规则是否可以下发。
-func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, rateOn bool) string {
+// handles 按链给出要删的规则 handle；rates 是本次要落地的限速规则（可为空）。
+func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, rates []nftRatePlan) string {
 	var b strings.Builder
 
 	// 驱动入口再归一化一次，作为 Set 类型约定的兜底：直接手写 Set 字面量的
@@ -399,11 +424,15 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 	}
 
 	// 3. 限速规则。表达式里的 saddr 是 IPv4 的，所以只落在 v4 链上。
-	if rateOn {
-		if expr, ok := nftRateLimitExpr(des.RateLimit, ports); ok {
-			if s, ok := stackOf(stacks, 32); ok {
+	//
+	//    insert 一律插到链首，所以想让最终顺序等于 rates 的顺序，输出就得倒着来。
+	//    顺序是有意义的：细分规则要排在全局兜底前面（第一条命中的生效）。
+	if s, ok := stackOf(stacks, 32); ok {
+		for i := len(rates) - 1; i >= 0; i-- {
+			p := rates[i]
+			if expr, ok := nftRateExpr(p.rule, p.set); ok {
 				fmt.Fprintf(&b, "insert rule %s %s %s %s comment \"%s\"\n",
-					s.target.Family, s.target.Table, s.target.Chain, expr, commentRate)
+					s.target.Family, s.target.Table, s.target.Chain, expr, rateComment(p.rule.Key))
 			}
 		}
 	}
@@ -634,9 +663,17 @@ func (d *nftablesDriver) Preview(des Desired) (string, error) {
 				s.target.Family, s.target.Table, name, s.setType())
 		}
 	}
+	for _, p := range planRateRules(des.RateLimits) {
+		s, ok := stackOf(stacks, 32)
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, "add set %s %s %s { type ipv4_addr; flags dynamic,timeout; timeout 10s; }\n",
+			s.target.Family, s.target.Table, p.set)
+	}
 
 	fmt.Fprintf(&b, "\n# --- 本次下发的原子事务 ---\n")
-	b.WriteString(renderScript(stacks, des, nil, des.RateLimit != nil && des.RateLimit.Enabled))
+	b.WriteString(renderScript(stacks, des, nil, planRateRules(des.RateLimits)))
 
 	fmt.Fprintf(&b, "\n# 白名单不写入内核：生成黑名单时会剔除白名单地址，效果等价且无 verdict 歧义。\n")
 	return b.String(), nil
@@ -649,6 +686,14 @@ func (d *nftablesDriver) Snapshot() (string, error) {
 	for _, s := range d.stacks {
 		if out, err := run(ctx, "nft", "list", "set", s.target.Family, s.target.Table, s.set()); err == nil {
 			fmt.Fprintf(&b, "# set %s\n%s\n", s.set(), out)
+		}
+		// 限速集合一条规则一个，名字是算出来的，只能先列出来再逐个 dump。
+		if s.bits == 32 {
+			for _, name := range d.listOwnRateSets(ctx, s) {
+				if out, err := run(ctx, "nft", "list", "set", s.target.Family, s.target.Table, name); err == nil {
+					fmt.Fprintf(&b, "# set %s\n%s\n", name, out)
+				}
+			}
 		}
 		if !listedChain[s.target] {
 			listedChain[s.target] = true
@@ -676,9 +721,13 @@ func (d *nftablesDriver) Restore(snapshot string) error {
 				"handle", strconv.Itoa(h))
 		}
 	}
-	// 限速集合只建在 IPv4 落点上（见 Sync 的说明）
+	// 限速集合只建在 IPv4 落点上（见 Sync 的说明）。
+	// 挨个 flush 而不是只 flush 一个：现在是一条规则一个集合，
+	// 老版本那个单一的 frpfirewall_rate 也要一起清掉。
 	if s, ok := d.stackFor(32); ok {
-		_, _ = run(ctx, "nft", "flush", "set", s.target.Family, s.target.Table, setRate)
+		for _, name := range d.listOwnRateSets(ctx, s) {
+			_, _ = run(ctx, "nft", "flush", "set", s.target.Family, s.target.Table, name)
+		}
 	}
 	return nil
 }
@@ -765,33 +814,121 @@ func halfStackWarning(missing string) string {
 		present, missing, missing)
 }
 
-// nftRateLimitExpr 生成 per-IP 连接速率限制表达式。
+// nftRatePlan 是一条限速规则在 nft 上的落地形态：规则本身 + 它专用的动态集合名。
+type nftRatePlan struct {
+	set  string
+	rule RateLimitRule
+}
+
+// planRateRules 选出能在 IPv4 落点上表达出来的限速规则。
+//
+// nft 的动态集合元素类型是 ipv4_addr，所以限速只落在 IPv4 链上。
+// 来源段按协议栈过滤的事交给 filterRateRules —— 那条判断错了不会报错，
+// 只会静默放大成全网限速，两个驱动共用一份实现。
+func planRateRules(list []RateLimitRule) []nftRatePlan {
+	out := make([]nftRatePlan, 0, len(list))
+	for _, r := range filterRateRules(list, 32) {
+		if r.PerSec <= 0 {
+			continue
+		}
+		out = append(out, nftRatePlan{set: rateSetName(r.Key), rule: r})
+	}
+	return out
+}
+
+// nftRateExpr 生成一条 per-IP 连接速率限制表达式。
 //
 // nftables 没有 hashlimit 等价物，标准做法是用带 timeout 的动态集合计数：
 //
-//	tcp dport { 7000 } ct state new add @frpfirewall_rate { ip saddr limit rate over 20/second burst 40 packets } drop
+//	tcp dport { 20000-30000 } ct state new add @frpfirewall_rate_x { ip saddr limit rate over 20/second burst 40 packets } drop
 //
 // 表达式只对 IPv4 有效（集合元素类型是 ipv4_addr），所以只用在 IPv4 落点上。
-func nftRateLimitExpr(spec *RateLimitSpec, ports portrange.Set) (string, bool) {
-	if spec == nil || !spec.Enabled || spec.PerSec <= 0 {
+//
+// 来源条件写成集合字面量而不是拆成多条规则：来源数量不该把规则条数乘上去，
+// 而且这些规则共用同一个集合与同一张计数表，拆开反而要小心别让配额翻倍。
+func nftRateExpr(r RateLimitRule, set string) (string, bool) {
+	if r.PerSec <= 0 || set == "" {
 		return "", false
-	}
-	burst := spec.Burst
-	if burst <= 0 {
-		burst = spec.PerSec * 2
 	}
 
 	var b strings.Builder
-	if len(ports) > 0 {
+	if len(r.Sources) > 0 {
+		fmt.Fprintf(&b, "ip saddr { %s } ", strings.Join(r.Sources, ", "))
+	}
+	if ps := r.Ports.Normalize(); len(ps) > 0 {
 		// 限速规则是单条规则，没法像 iptables 那样按块拆，所以这里直接
 		// 把整个区间集合写进集合字面量 —— 区间写法让它天然只有几个元素。
-		fmt.Fprintf(&b, "tcp dport { %s } ", nftPorts(ports))
+		fmt.Fprintf(&b, "tcp dport { %s } ", nftPorts(ps))
 	} else {
 		b.WriteString("tcp ")
 	}
 	fmt.Fprintf(&b, "ct state new add @%s { ip saddr limit rate over %d/second burst %d packets } drop",
-		setRate, spec.PerSec, burst)
+		set, r.PerSec, r.burst())
 	return b.String(), true
+}
+
+// listOwnRateSets 列出内核里属于本程序的限速集合。
+//
+// 只认 nft -j 的输出：`nft list sets` 的文本格式会按列宽折行，
+// 用正则去啃迟早会栽在某个版本上（这套代码里已经栽过一次）。
+func (d *nftablesDriver) listOwnRateSets(ctx context.Context, s nftStack) []string {
+	out, err := run(ctx, "nft", "-j", "list", "sets")
+	if err != nil {
+		return nil
+	}
+
+	var doc struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		return nil
+	}
+
+	var names []string
+	for _, item := range doc.Nftables {
+		raw, ok := item["set"]
+		if !ok {
+			continue
+		}
+		var st struct {
+			Family string `json:"family"`
+			Table  string `json:"table"`
+			Name   string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &st); err != nil {
+			continue
+		}
+		if st.Family != s.target.Family || st.Table != s.target.Table {
+			continue
+		}
+		if !isRateSetName(st.Name) {
+			continue
+		}
+		names = append(names, st.Name)
+	}
+	return names
+}
+
+// pruneRateSets 删掉内核里不再需要的限速集合。
+//
+// 动态集合的元素会自己过期，但集合本身不会消失。规则改速率、改条件、删掉之后，
+// 旧集合会一直留着 —— 不参与判决（规则每次全量重建），却会在 `nft list sets`
+// 里越堆越多，排障时得先去认哪些是废的。删不掉也不影响功能，所以忽略错误。
+func (d *nftablesDriver) pruneRateSets(ctx context.Context, rates []nftRatePlan) {
+	s, ok := d.stackFor(32)
+	if !ok {
+		return
+	}
+	keep := make(map[string]bool, len(rates))
+	for _, p := range rates {
+		keep[p.set] = true
+	}
+	for _, name := range d.listOwnRateSets(ctx, s) {
+		if keep[name] {
+			continue
+		}
+		_, _ = run(ctx, "nft", "delete", "set", s.target.Family, s.target.Table, name)
+	}
 }
 
 // nftVersionAtLeast 比较 nftables 版本号。

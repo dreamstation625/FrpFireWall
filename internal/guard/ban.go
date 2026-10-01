@@ -13,8 +13,11 @@ import (
 // Apply 触发一次异步重新对齐。改完名单或策略后调用。
 func (m *Manager) Apply() { m.scheduleApply() }
 
-// triggerBan 是引擎内部触发的封禁（频次超限 / GeoIP 命中）。
-func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *geoip.Info) {
+// triggerBan 是引擎内部触发的封禁（频次超限 / GeoIP 命中 / 命中细分规则）。
+//
+// steps 是本次使用的阶梯封禁时长，由调用方给：细分规则自带自己的阶梯，
+// 全局策略用 Policy 里的那份。见 nextDuration 的说明。
+func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *geoip.Info, steps []int64) {
 	addr = addr.Unmap()
 
 	m.mu.RLock()
@@ -52,7 +55,7 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 		return
 	}
 
-	dur, step := m.nextDuration(target, policy)
+	dur, step := m.nextDuration(target, policy, steps)
 
 	now := time.Now()
 	rec := &model.BanRecord{
@@ -233,11 +236,7 @@ func (m *Manager) Unban(target, by string) error {
 	m.mu.Lock()
 	st, ok := m.bans[t]
 	delete(m.bans, t)
-	if st != nil {
-		if w := m.windows[windowKey(st.Prefix)]; w != nil {
-			w.reset()
-		}
-	}
+	m.resetWindowsForLocked(p.Addr().String())
 	m.mu.Unlock()
 
 	if ok && st.RecordID > 0 {
@@ -273,9 +272,7 @@ func (m *Manager) UnbanByRecordID(id uint, by string) error {
 	m.mu.Lock()
 	_, ok := m.bans[rec.Target]
 	delete(m.bans, rec.Target)
-	if w := m.windows[rec.TargetAddr()]; w != nil {
-		w.reset()
-	}
+	m.resetWindowsForLocked(rec.TargetAddr())
 	m.mu.Unlock()
 
 	if err := m.store.ReleaseBan(rec.ID, by, model.BanReleased); err != nil {
@@ -298,18 +295,30 @@ func (m *Manager) UnbanByRecordID(id uint, by string) error {
 
 // nextDuration 按阶梯策略算出本次封禁时长与阶梯序号。
 //
-// 阶梯判定依据：查该 target 最近一条封禁记录，若还在升级窗口内则往上跳一级，
-// 否则从第一级重新开始。这样"偶尔踩线"和"持续攻击"会被区别对待。
-func (m *Manager) nextDuration(target string, policy *model.Policy) (time.Duration, int) {
-	if policy == nil {
-		return 10 * time.Minute, 1
+// 阶梯**表**由调用方给：细分规则自带自己的阶梯，全局策略用 Policy 里的那份。
+// 传空则回退到全局，再空则回退到 10 分钟（策略表被改坏时的兜底，不能让封禁
+// 因为"没读到配置"变成 0 秒即立刻解封）。
+//
+// 阶梯**序号**仍然只看该地址最近一次封禁是第几级，与"这次是哪条规则触发的"
+// 无关。理由：升级说的是"这个人屡教不改"，换一条规则命中不改变这个事实。
+// 反过来，如果按规则分别记序号，攻击者只要在两条规则之间来回触发，
+// 等级就会被永远压在第一级 —— 那正好是升级机制想防的事。
+func (m *Manager) nextDuration(target string, policy *model.Policy, steps []int64) (time.Duration, int) {
+	if len(steps) == 0 && policy != nil {
+		steps = policy.DurationSteps()
+	}
+	if len(steps) == 0 {
+		steps = []int64{600}
 	}
 
-	steps := policy.DurationSteps()
-	step := 0
+	windowHours := 0
+	if policy != nil {
+		windowHours = policy.EscalateWindowHours
+	}
 
+	step := 0
 	if last, err := m.store.LastBanOfTarget(target); err == nil && last != nil {
-		window := time.Duration(policy.EscalateWindowHours) * time.Hour
+		window := time.Duration(windowHours) * time.Hour
 		if window > 0 && time.Since(last.BannedAt) < window {
 			step = last.HitCount
 		}

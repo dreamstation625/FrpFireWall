@@ -71,18 +71,24 @@ type BanView struct {
 
 // Stats 是引擎运行状态，供概览页展示。
 type Stats struct {
-	Enabled        bool      `json:"enabled"`
-	DryRun         bool      `json:"dry_run"`
-	Backend        string    `json:"backend"`
-	BackendOK      bool      `json:"backend_ok"`
-	ActiveBans     int       `json:"active_bans"`
-	WhiteCount     int       `json:"white_count"`
-	BlackCount     int       `json:"black_count"`
-	TrustedCount   int       `json:"trusted_count"`
-	WindowsTracked int       `json:"windows_tracked"`
-	LastSyncAt     time.Time `json:"last_sync_at"`
-	LastSyncErr    string    `json:"last_sync_err"`
-	LastSyncRules  int       `json:"last_sync_rules"`
+	Enabled        bool   `json:"enabled"`
+	DryRun         bool   `json:"dry_run"`
+	Backend        string `json:"backend"`
+	BackendOK      bool   `json:"backend_ok"`
+	ActiveBans     int    `json:"active_bans"`
+	WhiteCount     int    `json:"white_count"`
+	BlackCount     int    `json:"black_count"`
+	TrustedCount   int    `json:"trusted_count"`
+	WindowsTracked int    `json:"windows_tracked"`
+	// AppRuleCount / KernelRuleCount 是当前生效的细分规则条数，按落点分。
+	AppRuleCount    int `json:"app_rule_count"`
+	KernelRuleCount int `json:"kernel_rule_count"`
+	// RuleProblems 是编译不过、被跳过的规则原因。界面必须显示出来 ——
+	// 一条规则在列表里显示"已启用"、实际一条都没生效，是最难发现的那类问题。
+	RuleProblems  []string  `json:"rule_problems,omitempty"`
+	LastSyncAt    time.Time `json:"last_sync_at"`
+	LastSyncErr   string    `json:"last_sync_err"`
+	LastSyncRules int       `json:"last_sync_rules"`
 }
 
 // Verdict 是一次判定结论。
@@ -121,6 +127,16 @@ type Manager struct {
 	black   []blockTarget
 	bans    map[string]*banState
 	windows map[string]*hitWindow
+
+	// appRules 是按优先级排好的细分规则（应用层那部分）。
+	// kernelRules 是细分规则里落在内核的那部分，交给驱动编译成限速规则。
+	//
+	// 两者都是从 rate_rules 表编译出来的，一次 Refresh 整体替换 ——
+	// 判定路径上只读，不加锁也不会有半新半旧的状态。
+	appRules    []appRule
+	kernelRules []kernelRule
+	// ruleProblems 记录编译不过、被跳过的规则，界面要把它显示出来。
+	ruleProblems []string
 
 	lastSyncAt    time.Time
 	lastSyncErr   string
@@ -197,6 +213,15 @@ func (m *Manager) Refresh() error {
 		return fmt.Errorf("读取黑名单失败: %w", err)
 	}
 
+	ruleRows, err := m.store.RateRules()
+	if err != nil {
+		return fmt.Errorf("读取频控细分规则失败: %w", err)
+	}
+	appRules, kernelRules, skipped := compileRules(ruleRows)
+	for _, s := range skipped {
+		m.log.Error("频控细分规则无法生效，已跳过", "reason", s)
+	}
+
 	prot, protErr := newProtector(m.cfg.Frps.TrustedProxies...)
 	if protErr != nil {
 		m.log.Warn("可信回源段配置有问题", "err", protErr)
@@ -211,6 +236,9 @@ func (m *Manager) Refresh() error {
 	m.protect = prot
 	m.white = white
 	m.black = black
+	m.appRules = appRules
+	m.kernelRules = kernelRules
+	m.ruleProblems = skipped
 	m.mu.Unlock()
 
 	if protErr != nil {
@@ -412,13 +440,7 @@ func (m *Manager) desired() firewall.Desired {
 		BlacklistFrp: blackFrp,
 		Whitelist:    white,
 		ProtectPorts: m.protectPortsLocked(),
-	}
-	if m.policy != nil && m.policy.RateLimitEnabled {
-		des.RateLimit = &firewall.RateLimitSpec{
-			Enabled: true,
-			PerSec:  m.policy.RateLimitPerSec,
-			Burst:   m.policy.RateLimitBurst,
-		}
+		RateLimits:   m.rateLimitsLocked(),
 	}
 	return des
 }
@@ -459,16 +481,26 @@ func (m *Manager) Stats() Stats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// 内核规则数把全局兜底也算进去：界面上要回答的是"现在有几条限速规则
+	// 在内核里"，而不是"细分规则有几条"。
+	kernelRules := len(m.kernelRules)
+	if m.policy != nil && m.policy.RateLimitEnabled && m.policy.RateLimitPerSec > 0 {
+		kernelRules++
+	}
+
 	s := Stats{
-		Enabled:        m.guardEnabled(),
-		DryRun:         m.dryRun(),
-		ActiveBans:     len(m.bans),
-		WhiteCount:     len(m.white),
-		BlackCount:     len(m.black),
-		WindowsTracked: len(m.windows),
-		LastSyncAt:     m.lastSyncAt,
-		LastSyncErr:    m.lastSyncErr,
-		LastSyncRules:  m.lastSyncRules,
+		Enabled:         m.guardEnabled(),
+		DryRun:          m.dryRun(),
+		ActiveBans:      len(m.bans),
+		WhiteCount:      len(m.white),
+		BlackCount:      len(m.black),
+		WindowsTracked:  len(m.windows),
+		AppRuleCount:    len(m.appRules),
+		KernelRuleCount: kernelRules,
+		RuleProblems:    append([]string(nil), m.ruleProblems...),
+		LastSyncAt:      m.lastSyncAt,
+		LastSyncErr:     m.lastSyncErr,
+		LastSyncRules:   m.lastSyncRules,
 	}
 	if m.protect != nil {
 		s.TrustedCount = m.protect.TrustedCount()
@@ -548,10 +580,7 @@ func (m *Manager) Lookup(target string) map[string]any {
 	blockScope := m.blockScopeLocked(m.black, addr)
 	trusted := m.protect != nil && m.protect.IsTrustedProxy(addr)
 	b, banned := m.findBanLocked(addr, policy, time.Now())
-	var windowCount int
-	if w := m.windows[addr.String()]; w != nil && policy != nil {
-		windowCount = w.count(time.Now(), time.Duration(policy.WindowSeconds)*time.Second)
-	}
+	appRules := m.appRules
 	m.mu.RUnlock()
 
 	result["whitelisted"] = isWhite
@@ -560,8 +589,28 @@ func (m *Manager) Lookup(target string) map[string]any {
 		result["block_scope"] = blockScope
 	}
 	result["trusted_proxy"] = trusted
-	result["window_hits"] = windowCount
 	result["banned"] = banned
+
+	// 窗口命中数要和判定走同一套选择逻辑，否则排障时会看到
+	// "查询说有 12 次命中、判定却说没到阈值"这种自相矛盾的结论。
+	geoNow := m.lookupGeo(addr)
+	now := time.Now()
+	tag, win, who := "", time.Duration(0), "全局策略"
+	if r := pickAppRule(appRules, addr, geoNow); r != nil {
+		who = "规则「" + r.name + "」"
+		if r.threshold > 0 {
+			tag, win = r.tag(), r.window
+		}
+	} else if policy != nil {
+		win = time.Duration(policy.WindowSeconds) * time.Second
+	}
+	hits := 0
+	if win > 0 {
+		hits = m.windowCount(tag, addr.String(), now, win)
+	}
+	result["window_rule"] = who
+	result["window_hits"] = hits
+
 	if banned {
 		result["ban"] = BanView{
 			Target:       b.Target,
@@ -571,12 +620,10 @@ func (m *Manager) Lookup(target string) map[string]any {
 			HitCount:     b.HitCount,
 			BannedAt:     b.BannedAt,
 			Permanent:    b.Permanent(),
-			RemainingSec: int64(b.Remaining(time.Now()) / time.Second),
+			RemainingSec: int64(b.Remaining(now) / time.Second),
 		}
 	}
-	if m.geo != nil {
-		result["geoip"] = m.geo.Lookup(addr)
-	}
+	result["geoip"] = geoNow
 	return result
 }
 
@@ -661,10 +708,7 @@ func (m *Manager) expireBans() {
 		if !b.Expires.IsZero() && !b.Expires.After(now) {
 			expired = append(expired, b)
 			delete(m.bans, k)
-			// 窗口计数用的是纯 IP 作为 key，这里要对应上
-			if w := m.windows[windowKey(b.Prefix)]; w != nil {
-				w.reset()
-			}
+			m.resetWindowsForLocked(b.Prefix.Addr().String())
 		}
 	}
 	m.mu.Unlock()
@@ -690,7 +734,7 @@ func (m *Manager) expireBans() {
 	m.scheduleApply()
 }
 
-// pruneWindows 淘汰长时间无活动的计数窗口，防止内存随历史 IP 无限增长。
+// pruneWindows 淘汰长时间无活动的计数窗口与令牌桶，防止内存随历史 IP 无限增长。
 func (m *Manager) pruneWindows() {
 	cutoff := time.Now().Add(-30 * time.Minute)
 
@@ -700,6 +744,9 @@ func (m *Manager) pruneWindows() {
 		if w.last.Before(cutoff) {
 			delete(m.windows, k)
 		}
+	}
+	for i := range m.appRules {
+		m.appRules[i].bucket.prune(cutoff)
 	}
 }
 
@@ -755,10 +802,56 @@ func (m *Manager) banKeyLocked(addr netip.Addr, policy *model.Policy) string {
 	return m.banPrefix(addr, policy).String()
 }
 
-// windowKey 是滑动窗口计数的 key。始终用纯 IP，
-// 因为频次统计要精确到单个来源，不能跟着封禁粒度走。
-func windowKey(p netip.Prefix) string {
-	return p.Addr().String()
+// windowKey 是滑动窗口计数的 key：规则标签 + 来源 IP。
+//
+// 必须带规则标签：细分规则的窗口与阈值可以和全局完全不同，共用一个窗口会让
+// 「某地区限速」和全局策略互相把对方的计数顶上去 —— 表现成"阈值莫名其妙
+// 提前触发"，而且看哪一条配置都挑不出毛病。
+//
+// IP 部分始终用单个 IP，不跟封禁粒度走：频次统计要精确到来源。
+// ruleTag 为空表示全局策略。
+func windowKey(ruleTag, ip string) string {
+	return ruleTag + "|" + ip
+}
+
+// countWindow 记一次命中并返回窗口内的总数。
+func (m *Manager) countWindow(ruleTag, ip string, now time.Time, win time.Duration) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := windowKey(ruleTag, ip)
+	w := m.windows[k]
+	if w == nil {
+		w = &hitWindow{}
+		m.windows[k] = w
+	}
+	return w.add(now, win)
+}
+
+// windowCount 读窗口内的命中数，不记录新命中。
+func (m *Manager) windowCount(ruleTag, ip string, now time.Time, win time.Duration) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	w := m.windows[windowKey(ruleTag, ip)]
+	if w == nil {
+		return 0
+	}
+	return w.count(now, win)
+}
+
+// resetWindowsFor 把某个地址在所有规则下的窗口计数归零。
+//
+// 必须扫全部规则，不能只清全局那一个：细分规则各有各的窗口，漏掉哪个，
+// 那个规则的阈值就形同虚设 —— 解封之后第一次访问就重新达标。
+//
+// 调用方需持有写锁。
+func (m *Manager) resetWindowsForLocked(ip string) {
+	suffix := "|" + ip
+	for k, w := range m.windows {
+		if strings.HasSuffix(k, suffix) {
+			w.reset()
+		}
+	}
 }
 
 // matchAnyLocked 判断地址是否命中某个前缀集合。调用方需持有锁。

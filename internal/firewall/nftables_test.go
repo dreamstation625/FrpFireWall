@@ -76,7 +76,7 @@ func TestRenderScriptFamilyPlacement(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := renderScript(tc.stacks, des, nil, false)
+			got := renderScript(tc.stacks, des, nil, nil)
 			for _, w := range tc.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", w, got)
@@ -96,7 +96,7 @@ func TestRenderScriptCoversEveryStack(t *testing.T) {
 	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
 	stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
 
-	got := renderScript(stacks, Desired{Blacklist: []string{"203.0.113.7", "2001:db8::1"}}, nil, false)
+	got := renderScript(stacks, Desired{Blacklist: []string{"203.0.113.7", "2001:db8::1"}}, nil, nil)
 
 	for _, want := range []string{
 		"flush set inet filter frpfirewall_black",
@@ -118,7 +118,7 @@ func TestRenderScriptDeletesHandlesOncePerSharedChain(t *testing.T) {
 	stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
 	handles := map[nftTarget][]int{inet: {11, 12}}
 
-	got := renderScript(stacks, Desired{}, handles, false)
+	got := renderScript(stacks, Desired{}, handles, nil)
 
 	for _, h := range []string{"handle 11", "handle 12"} {
 		if n := strings.Count(got, h); n != 1 {
@@ -134,7 +134,7 @@ func TestRenderScriptDeletesHandlesPerChain(t *testing.T) {
 	stacks := []nftStack{{target: ip4, bits: 32}, {target: ip6, bits: 128}}
 	handles := map[nftTarget][]int{ip4: {21}, ip6: {31}}
 
-	got := renderScript(stacks, Desired{}, handles, false)
+	got := renderScript(stacks, Desired{}, handles, nil)
 
 	if !strings.Contains(got, "delete rule ip filter INPUT handle 21") {
 		t.Errorf("没有删除 ip 链上的旧规则\n%s", got)
@@ -150,19 +150,103 @@ func TestRenderScriptDeletesHandlesPerChain(t *testing.T) {
 // 限速表达式里的 saddr 是 IPv4 的（动态集合元素类型为 ipv4_addr），
 // 落到 IPv6 链上会被 nft 拒绝，所以只有 v4 链才生成。
 func TestRenderScriptRateLimitOnlyOnIPv4Stack(t *testing.T) {
-	des := Desired{
-		ProtectPorts: portrange.Ports(7000),
-		RateLimit:    &RateLimitSpec{Enabled: true, PerSec: 20},
+	des := Desired{RateLimits: []RateLimitRule{{Key: "global", PerSec: 20}}}
+	rates := planRateRules(des.RateLimits)
+	if len(rates) != 1 {
+		t.Fatalf("应当规划出 1 条限速规则，实际 %d 条", len(rates))
 	}
+	set := rates[0].set
 
 	ip6Only := []nftStack{{target: nftTarget{Family: "ip6", Table: "filter", Chain: "INPUT"}, bits: 128}}
-	if got := renderScript(ip6Only, des, nil, true); strings.Contains(got, setRate) {
+	if got := renderScript(ip6Only, des, nil, rates); strings.Contains(got, set) {
 		t.Errorf("IPv6 落点上不该生成限速规则\n%s", got)
 	}
 
 	ip4Only := []nftStack{{target: nftTarget{Family: "ip", Table: "filter", Chain: "INPUT"}, bits: 32}}
-	if got := renderScript(ip4Only, des, nil, true); !strings.Contains(got, setRate) {
+	if got := renderScript(ip4Only, des, nil, rates); !strings.Contains(got, set) {
 		t.Errorf("IPv4 落点上应当生成限速规则\n%s", got)
+	}
+}
+
+// 多条限速规则要各自生成一条规则、各自一个动态集合。
+//
+// 共用一个集合是不行的：nft 的 limit 是挂在集合上的状态对象，
+// 一个集合只有一套速率，共用就等于所有规则只能用同一个速率。
+func TestRenderScriptRateRulesAreIsolated(t *testing.T) {
+	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
+	stacks := []nftStack{{target: inet, bits: 32}}
+
+	des := Desired{RateLimits: []RateLimitRule{
+		{Key: "r1", Name: "香港限速", Sources: []string{"203.0.113.0/24"}, Ports: portrange.Span(20000, 30000), PerSec: 5},
+		{Key: "r2", Name: "某段限速", Sources: []string{"198.51.100.0/24"}, Ports: portrange.Ports(880, 8443), PerSec: 50, Burst: 100},
+		{Key: "global", Name: "全局兜底", Ports: portrange.Ports(7000), PerSec: 20},
+	}}
+	got := renderScript(stacks, des, nil, planRateRules(des.RateLimits))
+
+	for _, want := range []string{
+		`ip saddr { 203.0.113.0/24 } tcp dport { 20000-30000 } ct state new add @frpfirewall_rate_r1 { ip saddr limit rate over 5/second burst 10 packets } drop`,
+		`ip saddr { 198.51.100.0/24 } tcp dport { 880, 8443 } ct state new add @frpfirewall_rate_r2 { ip saddr limit rate over 50/second burst 100 packets } drop`,
+		`tcp dport { 7000 } ct state new add @frpfirewall_rate_global { ip saddr limit rate over 20/second burst 40 packets } drop`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
+		}
+	}
+	// 每条规则一个集合，三个不同的集合名。
+	for _, name := range []string{"frpfirewall_rate_r1", "frpfirewall_rate_r2", "frpfirewall_rate_global"} {
+		if !strings.Contains(got, "@"+name) {
+			t.Errorf("缺少集合 %s", name)
+		}
+	}
+}
+
+// 细分规则必须排在全局兜底之前 —— 内核是"先匹配先生效"，
+// 全局排前面的话细分规则永远轮不到，等于配了没用。
+//
+// insert 一律插到链首，所以脚本里的先后与链上顺序**相反**：
+// 要最后生效的反而要最先写进脚本。
+func TestRenderScriptRateRuleOrder(t *testing.T) {
+	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
+	stacks := []nftStack{{target: inet, bits: 32}}
+	des := Desired{RateLimits: []RateLimitRule{
+		{Key: "r1", PerSec: 5, Ports: portrange.Ports(7001)},
+		{Key: "global", PerSec: 20, Ports: portrange.Ports(7002)},
+	}}
+
+	got := renderScript(stacks, des, nil, planRateRules(des.RateLimits))
+
+	inserts := insertOrder(got)
+	fine, global := -1, -1
+	for i, line := range inserts {
+		if strings.Contains(line, "@frpfirewall_rate_r1") {
+			fine = i
+		}
+		if strings.Contains(line, "@frpfirewall_rate_global") {
+			global = i
+		}
+	}
+	if fine < 0 || global < 0 {
+		t.Fatalf("两条限速规则都该出现\n%s", got)
+	}
+	// insertOrder 已经把脚本顺序翻成链上的真实顺序，直接比大小即可。
+	if fine > global {
+		t.Errorf("链上细分规则应排在全局兜底之前，实际 fine=%d global=%d\n%s",
+			fine, global, got)
+	}
+}
+
+// 只有 IPv6 来源的规则在 IPv4 落点上必须整条消失，不能退化成"不限来源"。
+func TestPlanRateRulesSkipsWrongFamily(t *testing.T) {
+	list := []RateLimitRule{
+		{Key: "v6only", PerSec: 5, Sources: []string{"2001:db8::/32"}},
+		{Key: "v4only", PerSec: 5, Sources: []string{"203.0.113.0/24"}},
+	}
+	got := planRateRules(list)
+	if len(got) != 1 {
+		t.Fatalf("应只剩 IPv4 那条，实际 %d 条", len(got))
+	}
+	if got[0].rule.Key != "v4only" {
+		t.Fatalf("留下的应当是 v4only，实际 %q", got[0].rule.Key)
 	}
 }
 
@@ -199,7 +283,7 @@ func TestPreviewContainsSameStatementsAsSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := renderScript(d.stacks, des, nil, false)
+	want := renderScript(d.stacks, des, nil, nil)
 	if !strings.Contains(got, want) {
 		t.Errorf("预览没有包含实际会下发的语句\n--- 预览 ---\n%s\n--- 实际 ---\n%s", got, want)
 	}
@@ -257,7 +341,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 
 	t.Run("inet 双栈：每个协议栈各有 tcp 与 udp", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
-		got := renderScript(stacks, des, nil, false)
+		got := renderScript(stacks, des, nil, nil)
 
 		for _, want := range []string{
 			"add element inet filter frpfirewall_black_frp { 198.51.100.9/32 }",
@@ -282,7 +366,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 		got := renderScript(stacks, Desired{
 			BlacklistFrp: []string{"198.51.100.9"},
 			ProtectPorts: portrange.Span(20000, 30000).Merge(portrange.Ports(880, 8443)),
-		}, nil, false)
+		}, nil, nil)
 
 		want := "tcp dport { 880, 8443, 20000-30000 } ip saddr @frpfirewall_black_frp drop"
 		if !strings.Contains(got, want) {
@@ -300,7 +384,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 
 	t.Run("集合始终 flush，避免改范围后残留", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}}
-		got := renderScript(stacks, Desired{}, nil, false)
+		got := renderScript(stacks, Desired{}, nil, nil)
 		if !strings.Contains(got, "flush set inet filter frpfirewall_black_frp") {
 			t.Errorf("frp 集合没有被 flush：地址从该范围移走后元素会残留，那个端口会一直被挡着\n%s", got)
 		}
@@ -308,7 +392,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 
 	t.Run("没配 frp 端口时不生成引用集合的规则", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}}
-		got := renderScript(stacks, Desired{BlacklistFrp: []string{"198.51.100.9"}}, nil, false)
+		got := renderScript(stacks, Desired{BlacklistFrp: []string{"198.51.100.9"}}, nil, nil)
 
 		if strings.Contains(got, "dport") {
 			t.Errorf("没有端口却生成了带 dport 的规则\n%s", got)
@@ -321,7 +405,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 	t.Run("某协议栈没有该类地址就不为它插规则", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
 		onlyV4 := Desired{BlacklistFrp: []string{"198.51.100.9"}, ProtectPorts: portrange.Ports(7000)}
-		got := renderScript(stacks, onlyV4, nil, false)
+		got := renderScript(stacks, onlyV4, nil, nil)
 
 		if !strings.Contains(got, "ip saddr @"+setBlackFrp+" drop") {
 			t.Errorf("IPv4 落点上缺少 frp 规则\n%s", got)
@@ -333,7 +417,7 @@ func TestRenderScriptFrpScope(t *testing.T) {
 
 	t.Run("ip 家族下不出现 ip6 表达式", func(t *testing.T) {
 		stacks := []nftStack{{target: ip4, bits: 32}}
-		got := renderScript(stacks, des, nil, false)
+		got := renderScript(stacks, des, nil, nil)
 		if strings.Contains(got, "ip6 saddr") {
 			t.Errorf("ip 家族的链里出现了 ip6 表达式，nft 会拒掉整份脚本\n%s", got)
 		}
@@ -353,7 +437,7 @@ func TestRenderScriptFrpRulesComeAfterAllPortRules(t *testing.T) {
 		Blacklist:    []string{"203.0.113.7"},
 		BlacklistFrp: []string{"198.51.100.9"},
 		ProtectPorts: portrange.Ports(7000),
-	}, nil, false)
+	}, nil, nil)
 
 	all, frp := -1, -1
 	for i, line := range insertOrder(got) {
