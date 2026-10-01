@@ -8,7 +8,7 @@
 # 说明：
 #   · 数据目录为空时会走一遍初始化流程（读 setup_token.txt 设置密码）
 #   · 数据目录已初始化时用固定测试密码登录，脚本可重复运行
-#   · 脚本会临时改写策略与配置，结束时恢复
+#   · 脚本会临时改写策略、细分规则与配置，结束时恢复（原有的细分规则会原样放回去）
 set -u
 
 BASE="http://127.0.0.1:7930"
@@ -33,6 +33,8 @@ FAIL=0
 get() { "${CURL[@]}" "$@"; }
 # 取 JSON 里某个点分路径的值（数组打印成 [长度]）
 jqf() { node "$ROOT/testdata/jq.js" "$1"; }
+# 取原始 JSON（数组原样输出，不折叠成 [长度]），用于把整个数组再喂回请求体
+jqr() { node "$ROOT/testdata/jq.js" --raw "$1"; }
 # 取出 data 子对象，用于回填后再 PUT
 jqd() { node "$ROOT/testdata/jq.js" data; }
 mut() { node "$ROOT/testdata/mutate.js" "$@"; }
@@ -231,6 +233,101 @@ R=$(printf '%s' "$BODY" | mut geoip_block_countries=us,ru,cn -id -updated_at > /
 check "国家码规范化为大写" "$(printf '%s' "$R" | jqf data.geoip_block_countries)" "US,RU,CN"
 
 echo
+echo "########## 4b. 频控细分规则（落点、互斥、顺序、事务） ##########"
+RULES_URL="$BASE/api/v1/policy/rules"
+
+# 跑测试之前先记下原有规则，结束时原样放回去。
+# 不清空就走的话，第二次运行会因为"已经有规则了"而满屏失败。
+RULES0=$(get -H "$AUTH" "$RULES_URL" | jqr data.rules)
+check_list "规则列表空时返回 []（不是 null）" "$(printf '%s' "$RULES0" | jqf '')"
+
+# ---- 内核层规则：填了端口 ----
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"扫描端口","ports":"443, 8443","per_sec":5}]' > /tmp/r1.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/r1.json)
+check "保存 1 条细分规则" "$(printf '%s' "$R" | jqf ok)" "true"
+RL=$(get -H "$AUTH" "$RULES_URL")
+check "规则已落库" "$(printf '%s' "$RL" | jqf data.rules)" "[1]"
+check "带端口的规则落点标为内核" "$(printf '%s' "$RL" | jqf data.rules.0.layer)" "kernel"
+check "端口已归一化（去掉空格）" "$(printf '%s' "$RL" | jqf data.rules.0.ports)" "443,8443"
+
+# 落库不等于生效：这条限速必须真的进到判定引擎的内核规则表里。
+# 只断言接口返回的话，Refresh/编译那一段整个挂掉也照样"通过"。
+KRC=$(get -H "$AUTH" "$BASE/api/v1/system/info" | jqf data.guard.kernel_rule_count)
+if [ "$KRC" -ge 1 ] 2>/dev/null; then
+  printf '  %s %-44s %s\n' "$(green PASS)" "细分限速已进入内核规则表" "$KRC"; PASS=$((PASS + 1))
+else
+  printf '  %s %-44s %s\n' "$(red FAIL)" "细分限速已进入内核规则表" "$KRC"; FAIL=$((FAIL + 1))
+fi
+
+# ---- 应用层规则：地区 + 省份 + 封禁，且要保住顺序 ----
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"扫描端口","ports":"443, 8443","per_sec":5},{"name":"广东访客","provinces":"广东省","countries":"hk","per_sec":5,"window_seconds":30,"threshold":3,"ban_durations":"60,300"}]' > /tmp/r2.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/r2.json)
+check "保存 2 条细分规则" "$(printf '%s' "$R" | jqf ok)" "true"
+RL=$(get -H "$AUTH" "$RULES_URL")
+check "顺序 = 提交顺序" "$(printf '%s' "$RL" | jqf data.rules)" "[2]"
+check "第 1 条仍是内核层" "$(printf '%s' "$RL" | jqf data.rules.0.layer)" "kernel"
+check "第 2 条是应用层" "$(printf '%s' "$RL" | jqf data.rules.1.layer)" "app"
+check "省份归一化：广东省 → 广东" "$(printf '%s' "$RL" | jqf data.rules.1.provinces)" "广东"
+check "国家码规范化为大写" "$(printf '%s' "$RL" | jqf data.rules.1.countries)" "HK"
+GI=$(get -H "$AUTH" "$BASE/api/v1/system/info")
+check "应用层规则已生效" "$(printf '%s' "$GI" | jqf data.guard.app_rule_count)" "1"
+# rule_problems 带 omitempty：为空时字段整个不出现，所以"undefined"就是"没有坏规则"
+check "没有编译不过的规则" "$(printf '%s' "$GI" | jqf data.guard.rule_problems)" "undefined"
+
+# ---- 互斥与校验：这些都必须在保存时就报错，不能静默少生效一半 ----
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"混搭","countries":"HK","ports":"443","per_sec":5}]' > /tmp/rb1.json
+check_err "拒绝地区+端口写在同一条" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/rb1.json | jqf error)" "无法生效"
+
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"内核封禁","ports":"443","per_sec":5,"window_seconds":60,"threshold":3,"ban_durations":"60"}]' > /tmp/rb2.json
+check_err "拒绝给内核层规则配封禁" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/rb2.json | jqf error)" "不能配置封禁"
+
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"空条件","per_sec":5}]' > /tmp/rb3.json
+check_err "拒绝没有任何匹配条件的规则" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/rb3.json | jqf error)" "没有任何匹配条件"
+
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"假省份","provinces":"火星","per_sec":5}]' > /tmp/rb4.json
+check_err "拒绝无法识别的省份" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/rb4.json | jqf error)" "无法识别"
+
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"坏端口","ports":"70000","per_sec":5}]' > /tmp/rb5.json
+check_err "拒绝越界端口" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/rb5.json | jqf error)" "无法识别"
+
+printf '%s' "$BODY" | mut -id -updated_at \
+  'rules=[{"name":"好的","countries":"HK","per_sec":5},{"name":"混搭","countries":"HK","ports":"443","per_sec":5}]' > /tmp/rb6.json
+check_err "校验失败时指出是第几条" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/rb6.json | jqf error)" "第 2 条规则"
+
+# ---- rules 字段缺席 ≠ 空数组 ----
+# 这两种请求必须能区分开：混成一种的话，一个不带 rules 的脚本
+#（或旧版前端）会把用户配好的规则全删掉，而且返回 200、没有任何提示。
+printf '%s' "$BODY" | mut -id -updated_at > /tmp/r3.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/r3.json)
+check "不带 rules 的保存返回成功" "$(printf '%s' "$R" | jqf ok)" "true"
+check "不带 rules 的保存不动规则" "$(get -H "$AUTH" "$RULES_URL" | jqf data.rules)" "[2]"
+
+printf '%s' "$BODY" | mut -id -updated_at 'rules=[]' > /tmp/r4.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/r4.json)
+check "显式空数组清空规则" "$(get -H "$AUTH" "$RULES_URL" | jqf data.rules)" "[0]"
+check "清空后应用层规则数归零" \
+  "$(get -H "$AUTH" "$BASE/api/v1/system/info" | jqf data.guard.app_rule_count)" "0"
+
+# 还原跑之前就存在的规则
+printf '%s' "$BODY" | mut -id -updated_at "rules=$RULES0" > /tmp/r5.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/r5.json)
+check "原有规则已还原" \
+  "$(get -H "$AUTH" "$RULES_URL" | jqf data.rules)" "$(printf '%s' "$RULES0" | jqf '')"
+
+echo
 echo "########## 5. GeoIP ##########"
 GS=$(get -H "$AUTH" "$BASE/api/v1/geoip/status")
 check_ok "数据目录" "$(printf '%s' "$GS" | jqf data.data_dir)"
@@ -245,6 +342,12 @@ else
   printf '  %s %-44s %s\n' "$(red FAIL)" "国家列表已生成" "$CNT"; FAIL=$((FAIL + 1))
 fi
 check "属地库可用性（未加载时为 false）" "$(printf '%s' "$GC" | jqf data.available)" "false"
+GP=$(get -H "$AUTH" "$BASE/api/v1/geoip/provinces")
+check "省份候选 34 项" "$(printf '%s' "$GP" | jqf data.provinces)" "[34]"
+# 候选名必须是归一化之后的形态（不带「省 / 市 / 自治区」后缀），
+# 否则下拉框给用户的是一个永远不命中的值。
+check "省份候选名为归一形态" "$(printf '%s' "$GP" | jqf data.provinces.0.name)" "北京"
+check "省份可用性与地域封禁同源" "$(printf '%s' "$GP" | jqf data.available)" "false"
 R=$(get -X POST "$BASE/api/v1/geoip/lookup" -H "$AUTH" -H 'Content-Type: application/json' -d '{"ip":"8.8.8.8"}')
 check "属地查询回显 IP" "$(printf '%s' "$R" | jqf data.geoip.ip)" "8.8.8.8"
 check "未加载库时 found=false" "$(printf '%s' "$R" | jqf data.geoip.found)" "false"
