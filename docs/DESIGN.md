@@ -349,6 +349,58 @@ D11 把默认监听地址从 `127.0.0.1:7930` 改成了 `0.0.0.0:7930`，但老�
 `0.0.0.0`，出现回环即意味着有人显式改过，值得唠叨一句（提示里注明"只有 SSH
 隧道这一种访问方式的话忽略本行"）。
 
+### D13. nftables 规则的落点按协议栈分开，不能只记一个
+
+**触发过的真实故障**：某台机器上 `nft` 报
+
+```
+Error: conflicting protocols specified: ip vs. ip6
+insert rule ip filter INPUT ip6 saddr @frpfirewall_black6 drop comment "frpfirewall:black6"
+                              ^^^^^^^^^
+```
+
+根因是驱动里只存了一个落点（family/table/chain）。那台机器上存在的是
+`table ip filter` + `chain INPUT`，于是整份脚本的每条规则都往 `ip` 家族里插 ——
+包括那条 `ip6 saddr` 的。
+
+nftables 的 family 决定这条链处理哪个协议栈：
+
+| family | 处理 | 链里能写什么 |
+|---|---|---|
+| `inet` | IPv4 + IPv6 | `ip saddr` 与 `ip6 saddr` 都行 |
+| `ip` | 只有 IPv4 | 写 `ip6` 表达式直接语法冲突 |
+| `ip6` | 只有 IPv6 | 写 `ip` 表达式同理 |
+
+而 `ip` 与 `ip6` 是彼此独立的家族，想同时管住两个协议栈就必须有**两条**链。
+系统里 `table ip filter` 与 `table ip6 filter` 并存是常态（ufw、docker、
+iptables-nft 生成的规则都长这样），所以驱动里存的是「每个协议栈一个落点」。
+
+对比 iptables 驱动就能看出问题：它天然有 `fams []ipFamily`，`iptables` 与
+`ip6tables` 各跑各的，不存在混淆的可能。nftables 侧把两个协议栈挤进一个
+target 才埋下了这个雷。
+
+**为什么这个错误特别隐蔽**：脚本有语法错误时 `nft -c -f -` 预检失败 → 按设计
+**整份放弃**（这个设计是对的，绝不下发半截规则）→ 结果是那条链上一个规则都没有，
+**IPv4 封禁跟着一起失效**。而界面上只看到一句"规则语法预检失败"，看不出是
+IPv6 那条规则把 IPv4 的一起陪葬了。
+
+配套的三条：
+
+- **缺一半必须告警。** 只找到 `ip` 没有 `ip6`（或反过来）时，缺的那一半确实下发
+  不了。机器若有那半边连通性，被封的地址换个协议栈就能绕过 —— 而这从界面上
+  完全看不出来，所以必须由后端明确说出来。
+- **只生成能落地的规则。** 限速表达式里的 `saddr` 是 IPv4 的（动态集合元素类型为
+  `ipv4_addr`），所以只落在 v4 链上；IPv6 要另建一个 `ipv6_addr` 的动态集合，
+  暂未实现。宁可这一半跳过，也不为对称塞一条会让整份事务被拒的规则。
+- **`AddBlock` / `DelBlock` 找不到该协议栈的落点时报错，不静默成功。** 静默成功
+  会让用户以为已经封上了。
+
+**验证方式**：把「生成脚本」抽成纯函数 `renderScript`，
+`internal/firewall/nftables_test.go` 直接断言脚本文本。这类错误桩命令永远测不出来
+（桩不解析语法、只会点头），真实内核上又只有报错那一刻才知道 —— 只有断言脚本
+本身能防住。`Preview` 复用同一个函数，保证"预览到的"就是"会下发的"（原来是两份
+独立实现，迟早漂移）。
+
 
 ## 3. 总体架构
 
@@ -508,9 +560,11 @@ iptables -w -D FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 
 #### nftables 驱动的具体落地
 
+集合建在自己的名字空间里，规则插进系统已有的 input 链。family/table/chain 由
+探测决定，两种典型形态：
+
 ```bash
-# 集合建在自己的名字空间里，规则插进系统已有的 input 链。
-# 下面是系统存在 inet/filter/input 的情形，实际 family/table/chain 由探测决定。
+# 形态一：系统有 inet/filter/input —— 一条链同时承载双栈
 nft -f - <<'EOF'
 add set inet filter frpfirewall_black  { type ipv4_addr; flags interval; }
 add set inet filter frpfirewall_black6 { type ipv6_addr; flags interval; }
@@ -521,11 +575,28 @@ insert rule inet filter input ip6 saddr @frpfirewall_black6 drop comment "frpfir
 EOF
 ```
 
+```bash
+# 形态二：系统是 table ip filter + table ip6 filter（ufw / docker /
+# iptables-nft 常见）—— 两个家族互不相通，必须各插各的链
+nft -f - <<'EOF'
+add set ip  filter frpfirewall_black  { type ipv4_addr; flags interval; }
+add set ip6 filter frpfirewall_black6 { type ipv6_addr; flags interval; }
+add set ip  filter frpfirewall_rate   { type ipv4_addr; flags interval; }
+
+insert rule ip  filter INPUT ip  saddr @frpfirewall_black  drop comment "frpfirewall:black"
+insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6 drop comment "frpfirewall:black6"
+EOF
+```
+
 要点：
 - **不建自己的 base chain**，只往系统已有链里插规则（原因见 D3）。
+- **落点按协议栈分开记**（见 D13）：驱动存的是「每个协议栈一个落点」，不是单个
+  family/table/chain。往 `ip` 家族的链里写 `ip6` 表达式，nft 会拒绝整份脚本。
 - 所有变更通过 `nft -f` 一次性提交，天然原子；提交前先用 `nft -c -f -` 做语法预检。
 - 限速用集合 + `limit rate over N/second burst M packets`，需 nft ≥ 0.9.3。
-- 规则归属靠 `comment` 标记识别；读回来时用 `nft -a list chain` 拿 handle，用 `nft -j list ruleset` 做集合探测。
+  动态集合元素类型是 `ipv4_addr`，所以限速只落在 IPv4 链上。
+- 规则归属靠 `comment` 标记识别；读回来时用 `nft -a list chain` 拿 handle，
+  用 `nft -j list ruleset` 做集合探测（一次调用拿全部 INPUT 链，按家族分组）。
 
 #### 后端探测与切换（`支持多种系统`）
 
