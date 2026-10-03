@@ -303,7 +303,15 @@ func (r *Resolver) Lookup(addr netip.Addr) *Info {
 			if isp != "" && isp != "0" {
 				info.ISP = isp
 			}
-			if info.Country == "" {
+			// 只有在 xdb 真给出了省市明细时才兜底成 CN，不能写成「xdb 查到了就当中国」。
+			// xdb 同样收录国外记录，返回形如 "美国|0|0|0|0"，省市位都是 "0"。
+			// 那样一来，只装 ip2region、没装 mmdb 的机器上（README 还专门推荐这条
+			// 「不依赖 MaxMind 账号」的路），任何国外 IP 都会被标成 CN ——
+			// 「只放行中国」的白名单等于放行全世界，而且界面上显示的国家名
+			// 还是「中国」，看不出异常。
+			// 代价：中国 IP 但 xdb 只到国家级（没有省市）时会漏标 CN。ip2region
+			// 的国内数据基本都到市级，这种情况远比国外记录少见，选这个方向。
+			if info.Country == "" && regionImpliesCN(regionStr) {
 				info.Country = "CN"
 				info.CountryName = CountryName("CN")
 				info.Found = true
@@ -427,6 +435,9 @@ func pickName(names map[string]string) string {
 }
 
 // parseRegion 解析 ip2region 的返回格式："国家|区域|省份|城市|ISP"。
+//
+// 注意国家（索引 0）和区域（索引 1）**故意不返回**：它们是中文名（"中国"/"美国"），
+// 要用得上得再维护一层中文国名到 ISO 码的映射，而判定需要的信息靠省市位就够。
 func parseRegion(s string) (province, city, isp string) {
 	parts := strings.Split(s, "|")
 	get := func(i int) string {
@@ -436,6 +447,16 @@ func parseRegion(s string) (province, city, isp string) {
 		return ""
 	}
 	return get(2), get(3), get(4)
+}
+
+// regionImpliesCN 判断 xdb 的返回值是否足以推断「这个 IP 在中国」。
+//
+// 依据是省市位有没有实际内容，而不是国家位：ip2region 收录国外记录时返回形如
+// "美国|0|0|0|0"，省市位恒为占位符 "0"。用省市位判断，国外记录自然被排除，
+// 不需要解析中文国名。
+func regionImpliesCN(regionStr string) bool {
+	prov, city, _ := parseRegion(regionStr)
+	return (prov != "" && prov != "0") || (city != "" && city != "0")
 }
 
 func containsStr(list []string, s string) bool {
