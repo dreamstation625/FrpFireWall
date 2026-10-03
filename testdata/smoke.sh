@@ -353,6 +353,32 @@ check "属地查询回显 IP" "$(printf '%s' "$R" | jqf data.geoip.ip)" "8.8.8.8
 check "未加载库时 found=false" "$(printf '%s' "$R" | jqf data.geoip.found)" "false"
 check "属地查询同时返回拦截状态" "$(printf '%s' "$R" | jqf data.state.valid)" "true"
 
+# 下载源与加速源清单。这里是**只读断言，不实际下载**：冒烟脚本不该依赖外网，
+# 而且 GeoLite2-City 有 64MB。真正的下载由 geoip 包的测试 + 手工验证覆盖。
+GSRC=$(get -H "$AUTH" "$BASE/api/v1/geoip/sources")
+check "可下载库 3 个" "$(printf '%s' "$GSRC" | jqf data.sources)" "[3]"
+check "第 1 个落地名" "$(printf '%s' "$GSRC" | jqf data.sources.0.name)" "GeoLite2-Country.mmdb"
+check "第 3 个落地名" "$(printf '%s' "$GSRC" | jqf data.sources.2.name)" "ip2region.xdb"
+# 上游文件名和落地名不一样（ip2region_v4.xdb → ip2region.xdb），写错就下不回来
+check_err "ip2region 上游是 v4 文件" "$(printf '%s' "$GSRC" | jqf data.sources.2.url)" "ip2region_v4.xdb"
+check_err "mmdb 取 P3TERX 的 release" "$(printf '%s' "$GSRC" | jqf data.sources.0.url)" "P3TERX/GeoLite.mmdb"
+check "自动模式的保留值" "$(printf '%s' "$GSRC" | jqf data.auto)" "auto"
+check_list_nonempty "加速源列表非空" "$(printf '%s' "$GSRC" | jqf data.mirrors)"
+check_ok "加速源带 ID" "$(printf '%s' "$GSRC" | jqf data.mirrors.0.id)"
+check_ok "加速源带名字" "$(printf '%s' "$GSRC" | jqf data.mirrors.0.name)"
+# 下载接口的参数校验必须在发请求之前拦下来 —— 这是脚本里唯一能安全覆盖的部分。
+check_err "拒绝白名单外的文件名" \
+  "$(get -X POST "$BASE/api/v1/geoip/download" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"name":"../evil.mmdb","mirror":"auto"}' | jqf error)" "不支持下载"
+# 加速源前缀只认内置表。随便传一段前缀等于开放任意 URL 转发，
+# 面板能连到的内网地址会被逐个探测一遍。
+check_err "拒绝未知加速源" \
+  "$(get -X POST "$BASE/api/v1/geoip/download" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"name":"GeoLite2-Country.mmdb","mirror":"https://attacker.example/"}' | jqf error)" "未知的加速源"
+check_err "缺少 name 报错" \
+  "$(get -X POST "$BASE/api/v1/geoip/download" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{}' | jqf error)" "缺少 name"
+
 echo
 echo "########## 6. frp 接入 ##########"
 SN=$(get -H "$AUTH" "$BASE/api/v1/frps/snippet")
