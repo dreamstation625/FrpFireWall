@@ -77,6 +77,11 @@ type Resolver struct {
 	// 重载持写锁（此时会关闭旧句柄，必须独占）。
 	mu sync.RWMutex
 
+	// downloadMu 保证同一时刻只有一个下载任务。
+	// 除了省带宽，主要是两个下载会撞在同一个 <file>.tmp 上。
+	// 用 TryLock 而不是 Lock：第二个请求直接告诉用户「正在下」，不用干等。
+	downloadMu sync.Mutex
+
 	dataDir string
 
 	country *maxminddb.Reader
@@ -292,29 +297,25 @@ func (r *Resolver) Lookup(addr netip.Addr) *Info {
 		r.regionQueryMu.Unlock()
 
 		if err == nil && regionStr != "" {
-			prov, cityName, isp := parseRegion(regionStr)
-			// "0" 是 ip2region 表示"无该级数据"的占位符
-			if prov != "" && prov != "0" {
-				info.Province = prov
+			rec := parseRegion(regionStr)
+			if !isPlaceholder(rec.province) {
+				info.Province = rec.province
 			}
-			if cityName != "" && cityName != "0" {
-				info.City = cityName
+			if !isPlaceholder(rec.city) {
+				info.City = rec.city
 			}
-			if isp != "" && isp != "0" {
-				info.ISP = isp
+			if !isPlaceholder(rec.isp) {
+				info.ISP = rec.isp
 			}
-			// 只有在 xdb 真给出了省市明细时才兜底成 CN，不能写成「xdb 查到了就当中国」。
-			// xdb 同样收录国外记录，返回形如 "美国|0|0|0|0"，省市位都是 "0"。
-			// 那样一来，只装 ip2region、没装 mmdb 的机器上（README 还专门推荐这条
-			// 「不依赖 MaxMind 账号」的路），任何国外 IP 都会被标成 CN ——
-			// 「只放行中国」的白名单等于放行全世界，而且界面上显示的国家名
-			// 还是「中国」，看不出异常。
-			// 代价：中国 IP 但 xdb 只到国家级（没有省市）时会漏标 CN。ip2region
-			// 的国内数据基本都到市级，这种情况远比国外记录少见，选这个方向。
-			if info.Country == "" && regionImpliesCN(regionStr) {
-				info.Country = "CN"
-				info.CountryName = CountryName("CN")
-				info.Found = true
+			// MaxMind 没给出国家时，用 xdb 的国家码兜底。
+			// 用的是 ISO 码这个专门字段，不是「有没有省市」—— 国外记录同样带省市
+			// （1.1.1.1 是 Queensland / Brisbane），按那个判据会把它标成 CN。
+			if info.Country == "" {
+				if cc := rec.fallbackCountry(); cc != "" {
+					info.Country = cc
+					info.CountryName = CountryName(cc)
+					info.Found = true
+				}
 			}
 			sources = append(sources, "ip2region")
 		}
@@ -340,13 +341,35 @@ func (r *Resolver) LookupString(s string) *Info {
 	return r.Lookup(addr)
 }
 
+// maxFileSize 单个库文件的大小上限。最大的是 GeoLite2-City（约 64MB），
+// 留足余量；上传与下载共用同一个上限。
+const maxFileSize = 200 << 20
+
+// isKnownFile 判断文件名是否在白名单里。库文件名只允许这几个，
+// 否则一个 ../ 就能把文件写到数据目录外面。
+func isKnownFile(name string) bool {
+	switch name {
+	case FileCountry, FileCity, FileRegion:
+		return true
+	}
+	return false
+}
+
 // SaveUpload 把上传的库文件写入数据目录并重新加载。
 // name 必须是白名单里的文件名之一，避免任意路径写入。
 func (r *Resolver) SaveUpload(name string, src io.Reader) error {
-	switch name {
-	case FileCountry, FileCity, FileRegion:
-	default:
-		return fmt.Errorf("不支持的文件名 %q，只接受 %s / %s / %s",
+	_, err := r.install(name, src, maxFileSize)
+	return err
+}
+
+// install 把 src 的内容装成 name 对应的库文件：
+// 写临时文件 → 校验文件头 → 原子替换 → 热加载。
+//
+// 校验不通过就删掉临时文件、旧库原样在用 —— 把下载到一半的坏文件换上去，
+// 属地功能会整个失效，比安装失败严重得多。返回写入的字节数，供调用方判断超限。
+func (r *Resolver) install(name string, src io.Reader, maxSize int64) (int64, error) {
+	if !isKnownFile(name) {
+		return 0, fmt.Errorf("不支持的文件名 %q，只接受 %s / %s / %s",
 			name, FileCountry, FileCity, FileRegion)
 	}
 
@@ -355,41 +378,89 @@ func (r *Resolver) SaveUpload(name string, src io.Reader) error {
 
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return fmt.Errorf("创建临时文件失败: %w", err)
-	}
-	if _, err := io.Copy(f, src); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("写入失败: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("关闭文件失败: %w", err)
+		return 0, fmt.Errorf("创建临时文件失败: %w", err)
 	}
 
-	// 先校验新文件可用，再替换，避免把好库换成坏的。
-	if name == FileRegion {
-		if _, _, err := openRegion(tmp); err != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("ip2region 文件校验失败: %w", err)
-		}
-	} else {
-		rd, err := maxminddb.Open(tmp)
-		if err != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("mmdb 文件校验失败: %w", err)
-		}
-		_ = rd.Close()
+	// 多读一个字节，好把「正好等于上限」和「超过上限」分开。
+	lr := &io.LimitedReader{R: src, N: maxSize + 1}
+	n, copyErr := io.Copy(f, lr)
+	closeErr := f.Close()
+
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return n, fmt.Errorf("写入失败: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return n, fmt.Errorf("关闭文件失败: %w", closeErr)
+	}
+	if n > maxSize {
+		_ = os.Remove(tmp)
+		return n, fmt.Errorf("文件大小 %d 字节，超过上限 %d 字节", n, maxSize)
 	}
 
-	if err := os.Rename(tmp, dst); err != nil {
+	if err := verifyArtifact(name, tmp); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("替换文件失败: %w", err)
+		return n, err
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.reloadLocked()
+
+	// 替换前必须先放开旧句柄：Windows 上 Go 打开文件只共享 READ|WRITE，
+	// 没有 FILE_SHARE_DELETE，被 mmap 着的目标文件会拒绝被替换
+	// （ERROR_SHARING_VIOLATION）。Linux 上无所谓，但一套代码要两边都能跑。
+	// 这里有写锁，并发的 Lookup 取不到读锁，不会看到「reader 全为 nil」的中间态。
+	r.closeReadersLocked()
+
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		// 旧文件还在（rename 没成功），重新打开它，别让属地功能一直缺着。
+		_ = r.reloadLocked()
+		return n, fmt.Errorf("替换文件失败: %w", err)
+	}
+	if err := r.reloadLocked(); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// verifyArtifact 在替换旧库之前先确认新文件真的能用。
+func verifyArtifact(name, path string) error {
+	if name == FileRegion {
+		searcher, _, err := openRegion(path)
+		if err != nil {
+			return fmt.Errorf("ip2region 文件校验失败: %w", err)
+		}
+		// 必须关掉：openRegion 会打开文件并一直持有句柄。不关的话下一步的
+		// os.Rename 会撞上自己 —— Windows 上直接报「being used by another
+		// process」，连删临时文件都一起失败，留下一个 11MB 的 .tmp；
+		// Linux 上 rename 能过，但每次安装泄漏一个 fd。
+		searcher.Close()
+		return nil
+	}
+	rd, err := maxminddb.Open(path)
+	if err != nil {
+		return fmt.Errorf("mmdb 文件校验失败: %w", err)
+	}
+	_ = rd.Close()
+	return nil
+}
+
+// closeReadersLocked 关闭并清空所有库句柄。调用方必须持有写锁。
+func (r *Resolver) closeReadersLocked() {
+	if r.country != nil {
+		_ = r.country.Close()
+		r.country = nil
+	}
+	if r.city != nil {
+		_ = r.city.Close()
+		r.city = nil
+	}
+	if r.region != nil {
+		r.region.Close()
+		r.region = nil
+	}
 }
 
 // ---- MaxMind 记录结构 ----
@@ -434,11 +505,31 @@ func pickName(names map[string]string) string {
 	return ""
 }
 
-// parseRegion 解析 ip2region 的返回格式："国家|区域|省份|城市|ISP"。
+// regionRecord 是 ip2region 返回的一条记录。
+type regionRecord struct {
+	country  string // 国名，中英混用："中国" / "United States"
+	code     string // ISO 国家码："CN" / "US" / "AU"
+	province string
+	city     string
+	isp      string
+}
+
+// parseRegion 解析 ip2region xdb 的返回值。
 //
-// 注意国家（索引 0）和区域（索引 1）**故意不返回**：它们是中文名（"中国"/"美国"），
-// 要用得上得再维护一层中文国名到 ISO 码的映射，而判定需要的信息靠省市位就够。
-func parseRegion(s string) (province, city, isp string) {
+// 格式固定 5 段：国家|省份|城市|ISP|国家码。实测（ip2region_v4.xdb，版本号 4，
+// 与 ip2region.xdb 同格式 —— xdb 只有 IPv4VersionNo=4 / IPv6VersionNo=6 两种版本，
+// 不存在另一套字段布局）：
+//
+//	中国|江苏省|南京市|0|CN
+//	中国|北京市|北京市|电信|CN
+//	United States|California|0|Google LLC|US
+//	Reserved|Reserved|Reserved|0|0        ← 保留地址段
+//
+// **不要按"国家|区域|省份|城市|ISP"从索引 2 起取**。老代码就是这么写的，
+// 结果在真库上省份拿到的是城市名（南京市）、城市拿到 "0"、ISP 拿到国家码（CN）——
+// 而且看起来毫无异常。省份规则因此只能命中北京/上海/天津/重庆四个直辖市
+// （它们省市同名），拿直辖市测根本发现不了。
+func parseRegion(s string) regionRecord {
 	parts := strings.Split(s, "|")
 	get := func(i int) string {
 		if i < len(parts) {
@@ -446,17 +537,34 @@ func parseRegion(s string) (province, city, isp string) {
 		}
 		return ""
 	}
-	return get(2), get(3), get(4)
+	return regionRecord{
+		country:  get(0),
+		province: get(1),
+		city:     get(2),
+		isp:      get(3),
+		code:     get(4),
+	}
 }
 
-// regionImpliesCN 判断 xdb 的返回值是否足以推断「这个 IP 在中国」。
+// isPlaceholder 判断某一级是不是「没有数据」。
+// "0" 是最常见的占位符，保留地址段给的是 "Reserved"。
+func isPlaceholder(s string) bool {
+	s = strings.TrimSpace(s)
+	return s == "" || s == "0" || strings.EqualFold(s, "Reserved")
+}
+
+// fallbackCountry 取出可用于兜底的国家码，取不到返回空串。
 //
-// 依据是省市位有没有实际内容，而不是国家位：ip2region 收录国外记录时返回形如
-// "美国|0|0|0|0"，省市位恒为占位符 "0"。用省市位判断，国外记录自然被排除，
-// 不需要解析中文国名。
-func regionImpliesCN(regionStr string) bool {
-	prov, city, _ := parseRegion(regionStr)
-	return (prov != "" && prov != "0") || (city != "" && city != "0")
+// 用最后一段的 ISO 国家码，不是国名也不是省市位：
+//   - 国名中英混用（"中国" / "China" / "United States"），比对要维护映射表；
+//   - 省市位不能当判据 —— 国外记录同样带省市，1.1.1.1 返回的是
+//     "Australia|Queensland|Brisbane|0|AU"。早期按「有省市就算中国」写，
+//     结果 Cloudflare 的澳洲节点被标成 CN，「只放行中国」的白名单形同虚设。
+func (r regionRecord) fallbackCountry() string {
+	if isPlaceholder(r.code) {
+		return ""
+	}
+	return strings.ToUpper(r.code)
 }
 
 func containsStr(list []string, s string) bool {
