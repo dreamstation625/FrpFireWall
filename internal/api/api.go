@@ -175,6 +175,10 @@ func (s *Server) Routes() http.Handler {
 		auth.POST("/geoip/upload", s.handleGeoUpload)
 		auth.GET("/geoip/countries", s.handleGeoCountries)
 		auth.GET("/geoip/provinces", s.handleGeoProvinces)
+		// 从上游直接拉库（P3TERX/GeoLite.mmdb、lionsoul2014/ip2region），
+		// 走国内可用的加速源，免去手动下载再上传。
+		auth.GET("/geoip/sources", s.handleGeoSources)
+		auth.POST("/geoip/download", s.handleGeoDownload)
 
 		// ---- 事件 ----
 		auth.GET("/events", s.handleListEvents)
