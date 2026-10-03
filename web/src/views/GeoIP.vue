@@ -3,11 +3,22 @@
     <div class="page-card panel">
       <div class="panel-head">
         <span class="section-title">属地数据库状态</span>
-        <el-button size="small" @click="load">刷新</el-button>
+        <div class="head-actions">
+          <el-select v-model="mirrorId" size="small" style="width: 210px">
+            <el-option label="自动选择（依次尝试）" :value="autoId" />
+            <el-option v-for="m in mirrors" :key="m.id" :label="m.name" :value="m.id" />
+          </el-select>
+          <el-button size="small" @click="load">刷新</el-button>
+        </div>
       </div>
 
       <div v-if="stale" class="alert-note" style="margin-bottom: 14px">
         {{ status?.reason || '数据库可能需要更新。' }}
+      </div>
+
+      <div v-if="downloading" class="alert-note" style="margin-bottom: 14px">
+        正在下载 <strong>{{ downloadingName }}</strong>，请勿关闭页面。
+        选中的源不通时会自动切换下一个，可能要等一会儿。
       </div>
 
       <el-descriptions :column="1" border size="small">
@@ -36,6 +47,22 @@
               {{ db.time && !isZero(db.time) ? fmt(db.time) : '—' }}
             </el-descriptions-item>
           </el-descriptions>
+
+          <div class="db-actions">
+            <el-button
+              size="small"
+              type="primary"
+              plain
+              :loading="downloading === db.key"
+              :disabled="!!downloading"
+              @click="doDownload(db)"
+            >
+              下载更新
+            </el-button>
+            <span class="hint" :title="db.src ? '上游：' + db.src.from : ''">
+              {{ db.src?.note || '没有可用的下载源' }}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -47,6 +74,9 @@
         · <strong>GeoLite2-City</strong>：含省/市，排障时看得更细。
         <br />
         · <strong>ip2region.xdb</strong>：国内解析更细，不依赖 MaxMind 账号。
+        <br />
+        下载会先校验文件头，通过才替换旧库并立即生效；校验不通过旧库原样在用。
+        下载失败时会依次换源重试，全部失败会把每个源的原因列出来。
       </div>
     </div>
 
@@ -192,7 +222,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
 
@@ -200,10 +230,22 @@ const FILE_COUNTRY = 'GeoLite2-Country.mmdb'
 const FILE_CITY = 'GeoLite2-City.mmdb'
 const FILE_REGION = 'ip2region.xdb'
 
+// 加速源选择记住上次用的。公共加速源随时可能挂，用户往往会固定用一个能通的，
+// 每次进来都要重选很烦。
+const MIRROR_KEY = 'frpfirewall.geoip.mirror'
+
 const loading = ref(false)
 const status = ref<any>(null)
 const stale = ref(false)
 const threshold = ref(10)
+
+const sources = ref<any[]>([])
+const mirrors = ref<any[]>([])
+const autoId = ref('auto')
+const mirrorId = ref(localStorage.getItem(MIRROR_KEY) || 'auto')
+const downloading = ref<string | null>(null)
+
+watch(mirrorId, (v) => localStorage.setItem(MIRROR_KEY, v || 'auto'))
 
 const uploadName = ref(FILE_COUNTRY)
 const picked = ref<File | null>(null)
@@ -216,12 +258,16 @@ const result = ref<any>(null)
 
 const state = computed(() => result.value?.state || null)
 
+// 下载源按落地文件名和状态卡片对上，后端换源时前端不用跟着改。
+const srcOf = (file: string) => sources.value.find((s) => s.name === file)
+
 const dbCards = computed(() => [
   {
     key: 'country',
     title: '国家级 mmdb',
     desc: '用于地域封禁与国家级归属展示。',
     file: FILE_COUNTRY,
+    src: srcOf(FILE_COUNTRY),
     loaded: !!status.value?.country_loaded,
     size: status.value?.country_size || 0,
     time: status.value?.country_time,
@@ -229,8 +275,9 @@ const dbCards = computed(() => [
   {
     key: 'city',
     title: '城市级 mmdb',
-    desc: '提供省 / 市 / 运营商信息。',
+    desc: '补省 / 市（不含运营商）。',
     file: FILE_CITY,
+    src: srcOf(FILE_CITY),
     loaded: !!status.value?.city_loaded,
     size: status.value?.city_size || 0,
     time: status.value?.city_time,
@@ -241,11 +288,17 @@ const dbCards = computed(() => [
     desc: '国内属地细化的补充来源；当前为 ' +
       (status.value?.region_is_v4 ? 'IPv4' : '未知') + ' 版本。',
     file: FILE_REGION,
+    src: srcOf(FILE_REGION),
     loaded: !!status.value?.region_loaded,
     size: status.value?.region_size || 0,
     time: status.value?.region_time,
   },
 ])
+
+const downloadingName = computed(() => {
+  const c = dbCards.value.find((d) => d.key === downloading.value)
+  return c ? c.file : ''
+})
 
 function fmt(t?: string) {
   if (!t) return '—'
@@ -263,6 +316,10 @@ function fmtSize(n: number) {
   return `${n} B`
 }
 
+function mirrorName(id: string) {
+  return mirrors.value.find((m) => m.id === id)?.name || id
+}
+
 function fmtRemain(sec?: number) {
   if (sec == null || sec < 0) return '永久'
   const h = Math.floor(sec / 3600)
@@ -275,12 +332,42 @@ function fmtRemain(sec?: number) {
 async function load() {
   loading.value = true
   try {
-    const [s, p] = await Promise.all([api.geoStatus() as any, api.getPolicy() as any])
+    const [s, p, src] = await Promise.all([
+      api.geoStatus() as any,
+      api.getPolicy() as any,
+      api.geoSources() as any,
+    ])
     status.value = s
     stale.value = !!s?.stale
     threshold.value = p?.threshold ?? 10
+    sources.value = src?.sources || []
+    mirrors.value = src?.mirrors || []
+    autoId.value = src?.auto || 'auto'
   } finally {
     loading.value = false
+  }
+}
+
+async function doDownload(db: any) {
+  if (!db?.src) {
+    ElMessage.warning('这一项没有可用的下载源，请手动上传')
+    return
+  }
+  downloading.value = db.key
+  try {
+    const r: any = await api.geoDownload(db.src.name, mirrorId.value)
+    status.value = r?.status || status.value
+    stale.value = !!status.value?.stale
+    const res = r?.result || {}
+    const ver = res.version ? `，上游版本 ${res.version}` : ''
+    // 回显用的是加速源的名字而不是 ID，用户在下拉里看到的就是这个名字。
+    const via =
+      res.mirror && res.mirror !== 'direct' ? `（经 ${mirrorName(res.mirror)}）` : ''
+    ElMessage.success(
+      `${res.name || db.file} 已更新并热加载${ver}${via}，${fmtSize(res.size || 0)}`,
+    )
+  } finally {
+    downloading.value = null
   }
 }
 
@@ -343,6 +430,12 @@ onMounted(load)
   margin: 0;
 }
 
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .mt {
   margin-top: 12px;
 }
@@ -375,6 +468,14 @@ onMounted(load)
 
 .db-desc {
   margin-bottom: 10px;
+}
+
+.db-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
 }
 
 .upload-inner {

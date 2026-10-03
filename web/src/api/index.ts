@@ -124,6 +124,13 @@ export const api = {
       timeout: 120000,
     })
   },
+  // 可下载的库清单 + 可选加速源。加速源列表由后端给，前端不自己存一份。
+  geoSources: () => http.get('/geoip/sources'),
+  // 同步下载：GeoLite2-City 有 64MB，走不到加速源时还要依次切源重试，
+  // 可能拖几分钟。这里不设超时，把节奏交给后端 —— 前端抢在后端前面断开，
+  // 用户只会看到一个没头没尾的错误，还以为是网络问题。
+  geoDownload: (name: string, mirror: string) =>
+    http.post('/geoip/download', { name, mirror }, { timeout: 0 }),
 
   // ---- 事件 ----
   listEvents: (params: Record<string, unknown>) =>
