@@ -335,16 +335,17 @@ func (p *Policy) DurationSteps() []int64 {
 
 // Event 事件审计。登录失败、封禁、解封、规则变更全量留痕。
 type Event struct {
-	ID       uint      `gorm:"primaryKey" json:"id"`
-	Ts       time.Time `gorm:"index:idx_event_ts;not null" json:"ts"`
-	Category string    `gorm:"index;size:32;not null" json:"category"`
-	IP       string    `gorm:"index;size:64" json:"ip"`
-	Country  string    `gorm:"size:64" json:"country"`
-	Province string    `gorm:"size:64" json:"province"`
-	User     string    `gorm:"size:64" json:"user"`
-	Op       string    `gorm:"size:32" json:"op"`
-	Detail   string    `gorm:"size:1024" json:"detail"`
-	Actor    string    `gorm:"size:64" json:"actor"`
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Ts        time.Time `gorm:"index:idx_event_ts;not null" json:"ts"`
+	Category  string    `gorm:"index;size:32;not null" json:"category"`
+	IP        string    `gorm:"index;size:64" json:"ip"`
+	Country   string    `gorm:"size:64" json:"country"`
+	Province  string    `gorm:"size:64" json:"province"`
+	User      string    `gorm:"size:64" json:"user"`
+	ProxyName string    `gorm:"size:128;index" json:"proxy_name"`
+	Op        string    `gorm:"size:32" json:"op"`
+	Detail    string    `gorm:"size:1024" json:"detail"`
+	Actor     string    `gorm:"size:64" json:"actor"`
 }
 
 // CounterSample 一次采样里某条受管规则的丢包计数快照。

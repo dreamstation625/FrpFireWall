@@ -24,7 +24,7 @@ func (m *Manager) Apply() { m.scheduleApply() }
 // 由它封掉的地址要一起解封 —— 否则"删掉了那条名单，被它封的地址还是进不来"，
 // 而界面上已经看不到那条名单了，用户只能去封禁列表里一个个手点。
 func (m *Manager) triggerBan(
-	addr netip.Addr, source, reason, user string,
+	addr netip.Addr, source, reason, user, proxy string,
 	geo *geoip.Info, steps []int64, sourceRef string,
 ) {
 	addr = addr.Unmap()
@@ -53,13 +53,14 @@ func (m *Manager) triggerBan(
 	if observe {
 		m.log.Info("观察模式：记录封禁决策但不下发", "target", target, "reason", reason)
 		m.pushEvent(&model.Event{
-			Category: model.EvtBan,
-			IP:       target,
-			User:     user,
-			Country:  country,
-			Province: province,
-			Detail:   "【观察模式】" + reason,
-			Actor:    "system",
+			Category:  model.EvtBan,
+			IP:        target,
+			User:      user,
+			ProxyName: proxy,
+			Country:   country,
+			Province:  province,
+			Detail:    "【观察模式】" + reason,
+			Actor:     "system",
 		})
 		return
 	}
@@ -126,13 +127,14 @@ func (m *Manager) triggerBan(
 	m.log.Warn("执行封禁", "target", target, "source", source, "reason", reason)
 
 	m.pushEvent(&model.Event{
-		Category: model.EvtBan,
-		IP:       target,
-		User:     user,
-		Country:  country,
-		Province: province,
-		Detail:   detail,
-		Actor:    "system",
+		Category:  model.EvtBan,
+		IP:        target,
+		User:      user,
+		ProxyName: proxy,
+		Country:   country,
+		Province:  province,
+		Detail:    detail,
+		Actor:     "system",
 	})
 
 	m.scheduleApply()

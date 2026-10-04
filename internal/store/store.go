@@ -537,7 +537,10 @@ func (s *Store) ListEventsPage(category, keyword string, since *time.Time, page,
 	}
 	if kw := strings.TrimSpace(keyword); kw != "" {
 		like := "%" + kw + "%"
-		q = q.Where("ip LIKE ? OR user LIKE ? OR detail LIKE ? OR country LIKE ?", like, like, like, like)
+		// proxy_name 也在搜索范围内：代理名是"哪个隧道在被撞"的唯一线索，
+		// 搜不到就等于这列只在肉眼扫的时候有用。
+		q = q.Where("ip LIKE ? OR user LIKE ? OR detail LIKE ? OR country LIKE ? OR proxy_name LIKE ?",
+			like, like, like, like, like)
 	}
 
 	var total int64

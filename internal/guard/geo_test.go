@@ -256,7 +256,7 @@ func TestGeoBanSourceRefPointsAtEntry(t *testing.T) {
 
 	ref := model.BanSourceRef(model.BanRefACL, hit.id)
 	m.triggerBan(netip.MustParseAddr("203.0.113.77"), model.SourceGeoIP,
-		"来源属地命中黑名单条目", "u", &geoip.Info{Country: "CN"}, nil, ref)
+		"来源属地命中黑名单条目", "u", "web-ssh", &geoip.Info{Country: "CN"}, nil, ref)
 
 	bans := m.Bans()
 	if len(bans) != 1 {
@@ -379,7 +379,7 @@ func TestGeoEntryBanDurationFollowsEntry(t *testing.T) {
 	// 走真实接线（banGeoBlackHit），不是自己拼参数：这条用例要钉住的正是
 	// "judge 那一步把条目有效期传下去"这件事。直接调 triggerBan 的话，
 	// 有人把接线改回 nil，用例照样绿。
-	m.banGeoBlackHit(addr, &geoip.Info{Country: "CN"}, "u", hit, time.Now())
+	m.banGeoBlackHit(addr, &geoip.Info{Country: "CN"}, "u", "", hit, time.Now())
 
 	bans := m.Bans()
 	if len(bans) != 1 {
@@ -400,7 +400,7 @@ func TestGeoEntryBanDurationFollowsEntry(t *testing.T) {
 		t.Fatal("应当命中永久国家条目")
 	}
 	m.banGeoBlackHit(netip.MustParseAddr("203.0.113.88"), &geoip.Info{Country: "US"},
-		"u", hitPerm, time.Now())
+		"u", "", hitPerm, time.Now())
 
 	for _, b := range m.Bans() {
 		if b.Target == "203.0.113.88/32" {
@@ -437,7 +437,7 @@ func TestDisabledGeoEntryStopsMatchingAndReleasesBans(t *testing.T) {
 	}
 	ref := model.BanSourceRef(model.BanRefACL, hit.id)
 	m.banGeoBlackHit(netip.MustParseAddr("203.0.113.77"), &geoip.Info{Country: "CN"},
-		"u", hit, time.Now())
+		"u", "", hit, time.Now())
 	if bans := m.Bans(); len(bans) != 1 {
 		t.Fatalf("应当产生 1 条封禁，实际 %d 条", len(bans))
 	}

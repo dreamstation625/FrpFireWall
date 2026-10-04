@@ -438,3 +438,42 @@ func TestCountActiveBansOfRef(t *testing.T) {
 		t.Fatalf("空引用不该匹配到任何东西，实际 %d 条", empty)
 	}
 }
+
+// 关键词要能搜到代理名。
+//
+// 独立列的价值全落在"搜得到"上：只能看不能搜的话，几十万条事件里想找
+// "某个代理上的连接"就只能靠人眼扫。这条用例钉住的是 LIKE 列表里有没有
+// 把 proxy_name 列进去 —— 漏掉它，界面上的搜索框对这个字段是哑的。
+func TestListEventsPageSearchesProxyName(t *testing.T) {
+	s := openTemp(t)
+
+	rows := []model.Event{
+		{Category: "user_conn", IP: "203.0.113.1", ProxyName: "web-ssh", Detail: "放行"},
+		{Category: "user_conn", IP: "203.0.113.2", ProxyName: "web-1", Detail: "放行"},
+		{Category: "login_blocked", IP: "203.0.113.3", Detail: "命中手动黑名单"},
+	}
+	for i := range rows {
+		if err := s.AddEvent(&rows[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	p, err := s.ListEventsPage("", "web-ssh", nil, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Total != 1 {
+		t.Fatalf("按代理名搜到 %d 条，期望 1", p.Total)
+	}
+	if p.Items[0].ProxyName != "web-ssh" {
+		t.Errorf("搜到的这条 proxy_name = %q，期望 web-ssh", p.Items[0].ProxyName)
+	}
+
+	// 前缀不该把别的代理一起捞出来：web-1 是 web-10 的前缀，子串匹配
+	// 做不到这点，但"能搜到具体名字"已经比搜不到强得多。
+	if p2, err := s.ListEventsPage("", "web-", nil, 1, 20); err != nil {
+		t.Fatal(err)
+	} else if p2.Total != 2 {
+		t.Errorf("前缀 web- 搜到 %d 条，期望 2", p2.Total)
+	}
+}

@@ -15,6 +15,8 @@ import (
 // 所以本引擎统计的是**登录尝试频次**，不是"登录失败次数"。
 // 对暴力破解场景结论一致（攻击者每次尝试都会触发一次回调），
 // 正常客户端断线重连的频次远低于默认阈值，不会误伤。
+// Login 回调不带 proxy_name —— frps 在建立隧道之前调它，那时候还不知道
+// 要连哪个代理。第三个参数因此恒为空，事件里的 proxy_name 也为空。
 func (m *Manager) JudgeLogin(addr netip.Addr, user, _ string) Verdict {
 	return m.judge(addr, user, model.EvtLoginAttempt, "login", "")
 }
@@ -43,17 +45,20 @@ func (m *Manager) JudgeUserConn(clientAddr netip.Addr, remoteAddr, user, proxy s
 // 升级，同一个条目能封出 10 分钟和 1 小时两种时长，而条目上那个「有效期」
 // 完全不参与（见 banStepsForEntry 的说明）。
 func (m *Manager) banGeoBlackHit(
-	addr netip.Addr, geoInfo *geoip.Info, user string, hit *geoEntry, now time.Time,
+	addr netip.Addr, geoInfo *geoip.Info, user, proxy string, hit *geoEntry, now time.Time,
 ) string {
 	reason := fmt.Sprintf("来源属地命中黑名单条目：%s %s",
 		model.GeoTargetLabel(hit.kind), geoip.DisplayList(hit.kind, hit.list))
-	m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo,
+	m.triggerBan(addr, model.SourceGeoIP, reason, user, proxy, geoInfo,
 		banStepsForEntry(hit.expiresAt, now),
 		model.BanSourceRef(model.BanRefACL, hit.id))
 	return reason
 }
 
-func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdict {
+// proxy 是 frps 回调带过来的代理名（连的是哪个隧道）。Login 回调没有它，只有
+// NewUserConn 有。它单独占一列而不是塞进 detail —— 塞进 detail 里既搜不准
+// 也没法排序，而"哪个代理在被撞"恰恰是最常问的那个问题。
+func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdict {
 	if !addr.IsValid() {
 		return Verdict{Allow: true, Reason: "invalid-address"}
 	}
@@ -81,15 +86,18 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	ban, banned := m.findBanLocked(addr, policy, now)
 	m.mu.RUnlock()
 
+	// 判定链上产生的每一条事件都带上代理名。逐个写一次比"最后统一补"可靠：
+	// 分支里 return 得早，漏一个就是那类事件永远查不到是哪个代理。
 	evt := func(detail string) {
 		m.pushEvent(&model.Event{
-			Category: category,
-			IP:       ip,
-			User:     user,
-			Op:       op,
-			Detail:   detail,
-			Country:  geoInfo.Country,
-			Province: geoInfo.Province,
+			Category:  category,
+			IP:        ip,
+			User:      user,
+			ProxyName: proxy,
+			Op:        op,
+			Detail:    detail,
+			Country:   geoInfo.Country,
+			Province:  geoInfo.Province,
 		})
 	}
 
@@ -110,7 +118,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	if isBlack {
 		evt("命中手动黑名单，拒绝")
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
 			Detail: "命中手动黑名单",
 		})
@@ -128,9 +136,9 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	// "来连 frp"这件事，挡不住别人直接扫其它端口（见 DESIGN D22）。
 	// 封多久由 banGeoBlackHit 定 —— 取条目自己的剩余有效期。
 	if geoBlackHit != nil {
-		reason := m.banGeoBlackHit(addr, geoInfo, user, geoBlackHit, now)
+		reason := m.banGeoBlackHit(addr, geoInfo, user, proxy, geoBlackHit, now)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
 			Detail: reason,
 		})
@@ -141,7 +149,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	if banned {
 		remaining := ban.Remaining(now)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
 			Detail: "IP 处于封禁中：" + ban.Reason,
 		})
@@ -173,9 +181,9 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 			if policy.GeoIPMode == "whitelist" {
 				reason = fmt.Sprintf("来源国家/地区 %s 不在放行名单内", geoInfo.CountryName)
 			}
-			m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo, nil, "")
+			m.triggerBan(addr, model.SourceGeoIP, reason, user, proxy, geoInfo, nil, "")
 			m.pushEvent(&model.Event{
-				Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+				Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
 				Detail: reason,
 			})
@@ -201,9 +209,9 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	// 封掉的地址要一起解封。
 	if rule != nil && rule.block {
 		reason := "规则「" + rule.name + "」命中，来源被直接拦截"
-		m.triggerBan(addr, model.SourceRule, reason, user, geoInfo, nil, rule.ref)
+		m.triggerBan(addr, model.SourceRule, reason, user, proxy, geoInfo, nil, rule.ref)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
 			Detail: reason,
 		})
@@ -241,7 +249,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	if rule != nil && rule.perSec > 0 && !rule.bucket.allow(ip, now) {
 		detail := fmt.Sprintf("规则「%s」：单个来源 IP 每秒最多 %d 个连接，已超限", rule.name, rule.perSec)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
 			Detail: detail,
 		})
@@ -255,31 +263,25 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 
 		if !policy.AutoBanEnabled {
 			m.pushEvent(&model.Event{
-				Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+				Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
 				Detail: detail + "（自动封禁已关闭，仅记录）",
 			})
 			return Verdict{Allow: true, Reason: "threshold-hit-no-autoban"}
 		}
 
-		m.triggerBan(addr, model.SourceAuto, detail, user, geoInfo, steps, "")
+		m.triggerBan(addr, model.SourceAuto, detail, user, proxy, geoInfo, steps, "")
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
 			Detail: detail,
 		})
 		return Verdict{Allow: false, Reason: "rate-exceeded", Detail: detail}
 	}
 
-	evt("放行" + extraSuffix(extra))
+	// 代理名不再拼进详情：它自己有一列，拼进来只是把同一件事说两遍。
+	evt("放行")
 	return Verdict{Allow: true, Reason: "ok"}
-}
-
-func extraSuffix(extra string) string {
-	if extra == "" {
-		return ""
-	}
-	return "（" + extra + "）"
 }
 
 func banDetail(ban *banState, remaining time.Duration) string {

@@ -18,7 +18,7 @@
           <el-input
             v-model="keyword"
             size="small"
-            placeholder="搜索 IP / 账号 / 详情"
+            placeholder="搜索 IP / 账号 / 代理 / 详情"
             clearable
             style="width: 220px"
             @keyup.enter="reload"
@@ -60,6 +60,17 @@
           <el-table-column prop="user" label="账号" v-bind="cwEvents.col('账号', { width: 110 })">
             <template #default="{ row }">
               <span v-if="row.user">{{ row.user }}</span>
+              <span v-else class="hint">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column
+            prop="proxy_name"
+            label="代理"
+            v-bind="cwEvents.col('代理', { width: 140 })"
+            show-overflow-tooltip
+          >
+            <template #default="{ row }">
+              <span v-if="row.proxy_name" class="mono">{{ row.proxy_name }}</span>
               <span v-else class="hint">—</span>
             </template>
           </el-table-column>
