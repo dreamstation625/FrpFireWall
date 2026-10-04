@@ -565,3 +565,107 @@ func TestACLSearchMatchesChineseGeoName(t *testing.T) {
 		t.Fatalf("按国家码 HK 搜应命中 1 条，实际 total=%v", got)
 	}
 }
+
+// aclPath 拼一个条目详情地址。
+func aclPath(kind string, id uint) string {
+	return "/api/v1/acl/" + kind + "/" + strconv.FormatUint(uint64(id), 10)
+}
+
+// 创建一条带有效期的条目，返回 id。
+func createACLWithExpiry(t *testing.T, h *harness, kind, target string, sec int64) uint {
+	t.Helper()
+	code, r := h.call(http.MethodPost, "/api/v1/acl/"+kind, map[string]any{
+		"target":         target,
+		"expires_in_sec": sec,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("创建条目应 200，得到 %d %s", code, r.Error)
+	}
+	return entryID(t, h, r)
+}
+
+// 编辑条目时"没提有效期"必须等于"不改动有效期"。
+//
+// 这个字段上前后踩过两次坑，所以契约值得钉死：
+//
+//  1. 最早 update 用普通 int64，"没传"绑定出来就是 0、而 0 表示永久 ——
+//     于是"进来改个备注"这个最普通的操作，会把一条「1 小时」的条目悄悄改成
+//     永久生效，而请求里根本没提有效期。
+//  2. 改成"前端回填精确剩余秒数硬扛"之后，结果是对的，但界面上多出的一档
+//     与预设档撞名（3597 秒被说成"剩余 60 分钟"，和「1 小时」字面一样），
+//     反而更让人看不懂该选哪个。
+//
+// 现在改成显式区分：字段缺席 = 不动，传 0 = 改成永久，正数 = 从现在起 N 秒。
+func TestUpdateACLKeepsExpiryWhenOmitted(t *testing.T) {
+	h := newHarness(t)
+	id := createACLWithExpiry(t, h, "black", "203.0.113.9", 3600)
+
+	before, err := h.srv.store.GetACL(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.ExpiresAt == nil {
+		t.Fatal("条目应当有到期时刻")
+	}
+
+	code, r := h.call(http.MethodPut, aclPath("black", id), map[string]any{
+		"remark": "改过的备注",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("PUT 应 200，得到 %d %s", code, r.Error)
+	}
+
+	after, err := h.srv.store.GetACL(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ExpiresAt == nil {
+		t.Fatal("只改备注就把到期时刻清掉了 —— 这正是「有效期选 1 小时、保存后变永久」那个 bug")
+	}
+	if after.ExpiresAt.Unix() != before.ExpiresAt.Unix() {
+		t.Fatalf("请求里没提有效期，它却被改了：%v → %v", before.ExpiresAt, after.ExpiresAt)
+	}
+	if after.Remark != "改过的备注" {
+		t.Fatalf("备注没更新：%q", after.Remark)
+	}
+}
+
+// 显式传值时的两种语义：0 = 改成永久，正数 = 从现在起重新计时。
+func TestUpdateACLExpiryExplicitValues(t *testing.T) {
+	h := newHarness(t)
+	id := createACLWithExpiry(t, h, "black", "203.0.113.10", 3600)
+
+	// 传 0 → 永久
+	code, r := h.call(http.MethodPut, aclPath("black", id), map[string]any{
+		"expires_in_sec": 0,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("PUT 应 200，得到 %d %s", code, r.Error)
+	}
+	row, err := h.srv.store.GetACL(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ExpiresAt != nil {
+		t.Fatalf("显式传 0 应改成永久，实际仍有到期时刻 %v", row.ExpiresAt)
+	}
+
+	// 传正数 → 从现在起重新计时（而不是在原到期时刻上叠加）
+	code, r = h.call(http.MethodPut, aclPath("black", id), map[string]any{
+		"expires_in_sec": 86400,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("PUT 应 200，得到 %d %s", code, r.Error)
+	}
+	row, err = h.srv.store.GetACL(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ExpiresAt == nil {
+		t.Fatal("显式传正数却没有设置到期时刻")
+	}
+	want := time.Now().Add(86400 * time.Second).Unix()
+	if d := row.ExpiresAt.Unix() - want; d > 10 || d < -10 {
+		t.Fatalf("到期时刻应约等于 now+86400s，偏差 %d 秒（%v）", d, row.ExpiresAt)
+	}
+}

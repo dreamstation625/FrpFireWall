@@ -104,9 +104,13 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 		// 猜错的后果是"配了一条永远不命中或莫名其妙命中的条目"。
 		TargetType string `json:"target_type"`
 		Remark     string `json:"remark"`
-		ExpiresIn  int64  `json:"expires_in_sec"` // <=0 表示永久
-		Scope      string `json:"scope"`          // all | frp | custom，留空按 all
-		Ports      string `json:"ports"`          // 仅 scope=custom 时有意义
+		// ExpiresIn 用指针是为了区分"没传"和"传了 0"：两者在创建时都是永久，
+		// 但在编辑时含义完全不同（不改动 vs 改成永久），见 handleUpdateACL。
+		// 这里一并收指针，是为了让两个接口的字段类型一致 —— 同一个字段在
+		// 创建和编辑上语义不同，迟早有人照着一边写另一边。
+		ExpiresIn *int64 `json:"expires_in_sec"` // <=0 表示永久
+		Scope     string `json:"scope"`          // all | frp | custom，留空按 all
+		Ports     string `json:"ports"`          // 仅 scope=custom 时有意义
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		badRequest(c, "请求格式不正确")
@@ -137,8 +141,9 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 		UpdatedAt:  time.Now(),
 	}
 
-	if req.ExpiresIn > 0 {
-		t := time.Now().Add(time.Duration(req.ExpiresIn) * time.Second)
+	// 创建时"没传"与"传 0"都是永久，不必区分。
+	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
+		t := time.Now().Add(time.Duration(*req.ExpiresIn) * time.Second)
 		entry.ExpiresAt = &t
 	}
 
@@ -176,8 +181,14 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 	}
 
 	var req struct {
-		Remark    string `json:"remark"`
-		ExpiresIn int64  `json:"expires_in_sec"`
+		Remark string `json:"remark"`
+		// ExpiresIn 用指针的理由同下面的 Scope：区分"没传"与"传了 0"。
+		//
+		// 这个字段踩过的坑比 Scope 还隐蔽：老写法用普通 int64，绑定时"没传"
+		// 就是 0、而 0 表示永久，于是"进来改个备注"这个最普通的操作，会把一条
+		// 「1 小时」的条目悄悄改成永久生效 —— 请求里根本没提有效期。
+		// nil = 保持原值，0 = 改成永久，正数 = 从现在起 N 秒。
+		ExpiresIn *int64 `json:"expires_in_sec"`
 		// Scope 用指针是为了区分"没传"和"传了空串"。
 		//
 		// 用普通 string 会有个很隐蔽的坑：只改备注的请求不带 scope 字段，
@@ -242,10 +253,14 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 	}
 
 	entry.Remark = req.Remark
-	if req.ExpiresIn > 0 {
-		t := time.Now().Add(time.Duration(req.ExpiresIn) * time.Second)
+	switch {
+	case req.ExpiresIn == nil:
+		// 没传就不动 —— 这是"只改备注"的形状，条目该怎么到期还怎么到期。
+	case *req.ExpiresIn > 0:
+		t := time.Now().Add(time.Duration(*req.ExpiresIn) * time.Second)
 		entry.ExpiresAt = &t
-	} else {
+	default:
+		// 显式传 0 才是"改成永久"。
 		entry.ExpiresAt = nil
 	}
 

@@ -126,9 +126,14 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="到期" v-bind="cw.col('到期', { width: 160 })">
+      <el-table-column label="到期" v-bind="cw.col('到期', { width: 180 })">
         <template #default="{ row }">
-          <span v-if="row.expires_at">{{ fmt(row.expires_at) }}</span>
+          <template v-if="row.expires_at">
+            <span :class="{ 'text-expired': isExpired(row.expires_at) }">{{ fmt(row.expires_at) }}</span>
+            <el-tag v-if="isExpired(row.expires_at)" size="small" type="danger" style="margin-left: 6px">
+              已过期
+            </el-tag>
+          </template>
           <span v-else class="hint">永久</span>
         </template>
       </el-table-column>
@@ -261,6 +266,9 @@
           <el-select v-model="form.expires" style="width: 100%">
             <el-option v-for="o in expireOptions" :key="o.value" :label="o.label" :value="o.value" />
           </el-select>
+          <div v-if="editing && origExpiresAt" class="hint" style="margin-top: 6px">
+            选「保持不变」不会改动这条的到期时刻；选具体档位才会从现在起重新计时。
+          </div>
           <div v-if="isGeo" class="hint" style="margin-top: 6px">
             地区条目上这个有效期还有第二层含义：它同时是<strong>命中之后封多久</strong>。
             命中即封，封到条目到期为止；选「永久」就是封永久。
@@ -408,19 +416,35 @@ const EXPIRE_OPTIONS = [
   { label: '30 天', value: 2592000 },
 ]
 
-// 把"从现在到某个到期时刻"折算成秒。已经到期或没填都按 0（永久）处理 ——
-// 这里的 0 只是"编辑框里选永久"，条目本身是不是已过期由列表的到期列去说。
+// 「保持不变」的哨兵值。只在编辑态出现，负数保证不会与任何真实档位撞上，
+// 保存时据此决定**整个字段不发出去**（后端把"没传"理解成"不改动"）。
+const KEEP_EXPIRES = -1
+
+// 把一个到期时刻折算成剩余秒数。已经到期与没填都返回 0。
 function remainSeconds(iso?: string | null) {
   if (!iso) return 0
-  const left = Math.round((new Date(iso).getTime() - Date.now()) / 1000)
+  const left = Math.floor((new Date(iso).getTime() - Date.now()) / 1000)
   return left > 0 ? left : 0
 }
 
-// 把剩余秒数说成人话，给"剩余 42 分钟"这一项用。
+// 条目是否已过期（到期时刻已经过去）。
+const isExpired = (iso?: string | null) => !!iso && new Date(iso).getTime() <= Date.now()
+
+// 把剩余秒数说成人话，给「保持不变（还剩 …）」这一项用。
+//
+// 必须精确到**两级**，不能四舍五入成单个单位：原来的写法是 Math.round(sec/60)，
+// 于是 3597 秒被说成"剩余 60 分钟"—— 和预设档「1 小时」字面完全一样。下拉里
+// 并排出现两个看起来一模一样的选项，用户根本不知道该选哪个；而它们的值其实
+// 不同，一个是"从现在起重算 3600 秒"，一个是"保持原有的到期时刻"。
 function humanRemain(sec: number) {
-  if (sec >= 86400) return `剩余 ${Math.round(sec / 86400)} 天`
-  if (sec >= 3600) return `剩余 ${Math.round(sec / 3600)} 小时`
-  return `剩余 ${Math.max(1, Math.round(sec / 60))} 分钟`
+  const d = Math.floor(sec / 86400)
+  const h = Math.floor((sec % 86400) / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = sec % 60
+  if (d > 0) return h > 0 ? `${d} 天 ${h} 小时` : `${d} 天`
+  if (h > 0) return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`
+  if (m > 0) return s > 0 ? `${m} 分 ${s} 秒` : `${m} 分`
+  return `${s} 秒`
 }
 
 const editVisible = ref(false)
@@ -438,15 +462,30 @@ const form = reactive({
 // 地区条目的多值单独存一份数组：多选组件的 v-model 必须是数组，
 // 而入库形态是逗号分隔的一串。打开弹窗时拆开、保存时拼回去，只在这两处转换。
 const geoValues = ref<string[]>([])
+// 打开编辑框时条目的原始到期时刻。用来渲染「保持不变」那一项——
+// 它必须来自**打开时**的原值，而不是 form.expires：后者一旦被用户改成别的档，
+// 就再也算不出"原来的到期时刻"了，这一项也就跟着消失、想反悔都回不去。
+const origExpiresAt = ref<string | null>(null)
 
-// 有效期的下拉项。编辑已有条目时，库里的到期时刻几乎不会正好落在某个预设档上
-// （比如还剩 3540 秒），只列预设的话 el-select 找不到匹配项就显示成裸数字 ——
-// 用户既看不懂、一保存还容易顺手把它改成别的档。所以缺哪项补哪项，
-// 保留精确的剩余秒数，保存时写回去基本等于"没动过"。
+// 有效期的下拉项。
+//
+// 编辑一条有到期时刻的条目时，最前面恒定挂一项「保持不变」：选它就等于这次
+// 不动有效期（保存请求里根本不带 expires_in_sec）。这是最常见的意图——
+// 进来改个备注不该重置有效期起点，更不该（像老版本那样）把它改成永久。
+//
+// 老版本的做法是"把剩余秒数做成一档补进列表"，本意也是不动，但那一档的文案
+// 是四舍五入出来的，会与预设档撞名，反而制造了更大的困惑。另外它在用户选了
+// 别的档之后就会消失，想切回来只能关掉重开。
+//
+// 永久条目不给这一项：「永久」本身就是它当前的状态，没有"原值"要保。
 const expireOptions = computed(() => {
   const opts = [...EXPIRE_OPTIONS]
-  if (form.expires > 0 && !opts.some((o) => o.value === form.expires)) {
-    opts.push({ label: humanRemain(form.expires), value: form.expires })
+  if (editing.value && origExpiresAt.value) {
+    const left = remainSeconds(origExpiresAt.value)
+    opts.unshift({
+      label: left > 0 ? `保持不变（还剩 ${humanRemain(left)}）` : '保持不变（该条目已过期，仍不生效）',
+      value: KEEP_EXPIRES,
+    })
   }
   return opts
 })
@@ -542,6 +581,7 @@ function openCreate() {
     ports: '',
   })
   geoValues.value = []
+  origExpiresAt.value = null
   editVisible.value = true
 }
 
@@ -554,14 +594,16 @@ function openEdit(row: any) {
     // 那一档 —— 选项里没有 ipv4 这一项，直接塞进去会让整个单选组一个都不选中。
     targetType: isGeoTarget(row.target_type) ? row.target_type : 'ip',
     remark: row.remark || '',
-    // 必须按到期时刻回填，不能写死 0（永久）。写死的话，每次打开编辑框看到的
-    // 都是「永久」，而"保存"会把 expires_in_sec=0 发出去、后端把 expires_at
-    // 清成 NULL —— 用户只是进来改个备注，条目却从"1 小时"变成了永久生效。
-    expires: remainSeconds(row.expires_at),
+    // 默认选「保持不变」—— 编辑备注不该重置有效期起点。老版本这里写死 0
+    // （永久），一保存就把 expires_at 清成 NULL；后来改成"精确回填剩余秒数"，
+    // 虽然结果是对的，但那多出来的一档与预设档撞名，反而更费解。
+    // 现在统一成"不发这个字段"，语义由后端保证。
+    expires: row.expires_at ? KEEP_EXPIRES : 0,
     // 老条目可能是空串，回显成全端口而不是留空，避免用户以为没设置过
     scope: row.scope === 'frp' || row.scope === 'custom' ? row.scope : 'all',
     ports: row.ports || '',
   })
+  origExpiresAt.value = row.expires_at || null
   geoValues.value = isGeoTarget(row.target_type) ? splitList(row.target) : []
   editVisible.value = true
 }
@@ -597,12 +639,15 @@ async function save() {
     // 白名单的 scope 由后端忽略，这里不用特判。
     // 类型与匹配值不可改，所以更新请求里不带 target / target_type。
     if (editing.value) {
-      await api.updateACL(kind.value, form.id, {
+      const body: Record<string, unknown> = {
         remark: form.remark,
-        expires_in_sec: form.expires,
         scope: form.scope,
         ports,
-      })
+      }
+      // KEEP_EXPIRES 是负数：这整个字段**不发出去**，后端才收得到"这次没提有效期"，
+      // 从而保持原有的到期时刻。发 0 会被后端理解成"改成永久"。
+      if (form.expires >= 0) body.expires_in_sec = form.expires
+      await api.updateACL(kind.value, form.id, body)
     } else {
       await api.createACL(kind.value, {
         target,
@@ -724,5 +769,10 @@ onMounted(() => {
   float: right;
   color: #8a919f;
   font-size: 12px;
+}
+
+/* 已经到期的时刻压暗一档：与右侧的「已过期」标签一起表示这条当前不生效。 */
+.text-expired {
+  color: var(--el-text-color-placeholder);
 }
 </style>

@@ -418,6 +418,13 @@ func parseScopePorts(scope, ports string) (portrange.Set, bool) {
 }
 
 // rebuildBans 从数据库恢复活跃封禁。程序重启后靠它自愈。
+//
+// 注意"自愈"包含两层，且它们分别由不同的机制完成：
+//   - **内核**：这里只把未到期的放进内存，随后的 Reconcile 全量重建受管链
+//     （iptables 先 -F 再写、nftables 先删受管 handle 再写），于是"程序没运行
+//     期间就已经到期"的那些封禁，即便还留在内核里也会被这轮重建清掉。
+//   - **库**：由 expireBans 的 ReleaseExpired 兜底 —— 那一步扫的是库，
+//     不依赖这里是否把过期的行放进内存。
 func (m *Manager) rebuildBans() error {
 	rows, err := m.store.ActiveBans()
 	if err != nil {
@@ -431,7 +438,8 @@ func (m *Manager) rebuildBans() error {
 		if err != nil {
 			continue
 		}
-		// 已到期的不恢复，交给 expireBans 走正常过期流程。
+		// 已到期的不恢复：既不占内存，也不该被"恢复"进内核规则。
+		// 库里的 status 不由这里负责（见函数头的两层说明）。
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
 			continue
 		}
@@ -960,21 +968,46 @@ func (m *Manager) expireBans() {
 	}
 	m.mu.Unlock()
 
-	if len(expired) == 0 {
+	// 落库这一步**不能**放到下面的早退之后。
+	//
+	// ReleaseExpired 扫的是库、不是内存，两者并不等价：程序没运行的那段时间里
+	// 到期的封禁不会进内存（rebuildBans 会把它们跳过），所以完全可能出现
+	// "内存里一条到期项都没有、库里却堆着若干已过期行"。早退挡在它前面的话，
+	// 这些行会永远卡在 status=active —— 封禁记录页一直显示"封禁中"，
+	// 内核里其实早已没有对应规则，变成"界面说封着、实际没封"。
+	// 它本身是全局 + 幂等的，多跑一次的代价只是一次带索引的查询。
+	retired, err := m.store.ReleaseExpired(now)
+	if err != nil {
+		m.log.Warn("更新过期封禁状态失败", "err", err)
+		retired = nil
+	}
+
+	if len(expired) == 0 && len(retired) == 0 {
 		return
 	}
 
-	// 落库状态由 store 批量处理，这里只负责内存与事件。
-	if _, err := m.store.ReleaseExpired(now); err != nil {
-		m.log.Warn("更新过期封禁状态失败", "err", err)
-	}
-
+	seen := make(map[uint]bool, len(expired))
 	for _, b := range expired {
+		seen[b.RecordID] = true
 		m.log.Info("封禁到期自动解封", "target", b.Target, "reason", b.Reason)
 		m.pushEvent(&model.Event{
 			Category: model.EvtUnban,
 			IP:       b.Target,
 			Detail:   "封禁到期，自动解封：" + b.Reason,
+			Actor:    "system",
+		})
+	}
+	// 库里那批中不在内存里的（重启时被跳过的），也要留一条痕：否则它们在
+	// 事件日志里彻底消失 —— 封禁记录显示已过期，却查不到是什么时候解的。
+	for _, b := range retired {
+		if seen[b.ID] {
+			continue
+		}
+		m.log.Info("清理程序未运行期间到期的封禁", "target", b.Target, "reason", b.Reason)
+		m.pushEvent(&model.Event{
+			Category: model.EvtUnban,
+			IP:       b.Target,
+			Detail:   "封禁到期，自动解封（程序未运行期间到期）：" + b.Reason,
 			Actor:    "system",
 		})
 	}
