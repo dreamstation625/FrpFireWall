@@ -313,7 +313,7 @@ func (s *Store) UpsertACL(e *model.ACLEntry) error {
 		// 重新添加同一个地址后端口没变，而接口返回的却是新值 —— 界面刷新一下
 		// 就变回旧的，中间完全看不出是哪一步丢了。
 		DoUpdates: clause.AssignmentColumns(
-			[]string{"scope", "ports", "remark", "expires_at", "updated_at", "country", "province"}),
+			[]string{"scope", "ports", "remark", "enabled", "expires_at", "updated_at", "country", "province"}),
 	}).Create(e).Error
 }
 
@@ -331,6 +331,7 @@ func (s *Store) UpdateACL(e *model.ACLEntry) error {
 			"scope":      e.Scope,
 			"ports":      e.Ports,
 			"remark":     e.Remark,
+			"enabled":    e.Enabled,
 			"expires_at": e.ExpiresAt,
 			"updated_at": time.Now(),
 		}).Error

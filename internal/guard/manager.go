@@ -315,7 +315,7 @@ func (m *Manager) Refresh() error {
 	return nil
 }
 
-// toPrefixes 把名单行转成前缀，跳过已过期和解析失败的条目。
+// toPrefixes 把名单行转成前缀，跳过停用、已过期和解析失败的条目。
 func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 	out := make([]netip.Prefix, 0, len(rows))
 	for _, r := range rows {
@@ -323,6 +323,11 @@ func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 		// 显式判类型而不是等 parsePrefixOrAddr 失败：依赖"恰好解析不出来"
 		// 太脆，将来 TargetType 再多一种形态就会悄悄漏进来。
 		if model.IsGeoTargetType(r.TargetType) {
+			continue
+		}
+		// 停用的条目与"不在名单里"等价。判在过期之前：它连"生效中"都算不上，
+		// 更轮不到讨论过没过期。
+		if !r.Enabled {
 			continue
 		}
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
@@ -340,12 +345,15 @@ func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 // toGeoEntries 挑出名单里的地区条目（国家 / 省份 / 城市）。
 //
 // 与 toPrefixes 是**互补**的两拨：地区条目的 Target 不是 IP，压根进不了
-// toPrefixes（解析会失败被跳过），所以这里单独收一遍。两条路径都跳过已过期
-// 的条目，规则一致。
+// toPrefixes（解析会失败被跳过），所以这里单独收一遍。两条路径都跳过停用与
+// 已过期的条目，规则一致。
 func toGeoEntries(rows []model.ACLEntry, now time.Time) []geoEntry {
 	out := make([]geoEntry, 0, 4)
 	for _, r := range rows {
 		if !model.IsGeoTargetType(r.TargetType) {
+			continue
+		}
+		if !r.Enabled {
 			continue
 		}
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
@@ -367,7 +375,7 @@ func toGeoEntries(rows []model.ACLEntry, now time.Time) []geoEntry {
 	return out
 }
 
-// toBlockTargets 把黑名单行转成带范围的条目，跳过已过期和解析失败的。
+// toBlockTargets 把黑名单行转成带范围的条目，跳过停用、已过期和解析失败的。
 //
 // 范围缺失或非法一律按 all 处理。空值是真会出现的：AutoMigrate 加列前写入的
 // 老行、以及手工改过数据库的行。兜底方向必须是"更严"的那一侧 —— 把本该全端口
@@ -378,6 +386,9 @@ func toBlockTargets(rows []model.ACLEntry, now time.Time) []blockTarget {
 		// 地区条目一条内核规则都不产生 —— 内核认不出属地（见 geoEntry 的注释）。
 		// 它命中的落地方式是"把这个具体 IP 封掉"，由判定链做，不在这里。
 		if model.IsGeoTargetType(r.TargetType) {
+			continue
+		}
+		if !r.Enabled {
 			continue
 		}
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {

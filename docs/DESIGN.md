@@ -953,19 +953,46 @@ udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_p_xxxxxxxx drop comm
    （一个是"从现在起重算 3600 秒"，一个是"保持原到期时刻"）；用户选了别的档之后
    这一项还会消失，想反悔只能关掉重开。
 
-现在回到契约本身：前端在编辑态把「有效期」默认成哨兵值「保持不变」（负数，
-保证不与任何真实档位撞上），保存时**整个字段不发出去**。这个哨兵还有个附带好处 ——
-它是个"可回退的选项"：用户先选了「1 小时」又反悔，切回「保持不变」即可，
-因为在编辑态这个选项**恒定存在**（它的剩余时间来自打开时记下的原始到期时刻，
-而不是 `form.expires`，后者一被改动就再也算不出原值）。
+现在回到契约本身：前端在编辑态把「有效期」下拉**留空**（placeholder 提示
+"保持原有效期"），保存时**整个字段不发出去**。留空对用户始终成立 ——
+界面上不出现"剩余 xx 时间"这类随时间变化的文案（那曾是多出一条与预设档
+撞名选项的根源），有效期就是封多久。
 
 顺带修掉一个同源的隐患：已过期的条目过去回填出 `0`，编辑框显示「永久」，
-一保存就**原地复活**。现在"保持不变"对已过期条目同样成立（不发字段 → 保持过期），
+一保存就**原地复活**。现在留空对已过期条目同样成立（不发字段 → 保持过期），
 列表的到期列上也加了 `已过期` 标记，不会出现"改个备注它就生效了"。
 
 **测试**：`api/handlers_acl_http_test.go` 的 `TestUpdateACLKeepsExpiryWhenOmitted`
 （只改备注时到期时刻原封不动）、`TestUpdateACLExpiryExplicitValues`
 （显式传 0 = 改成永久、传正数 = 从现在起重算）。
+
+
+### D26. 名单条目可停用，停用与删除同等待遇
+
+`ACLEntry.Enabled`（`default:true`）控制条目是否参与判定：guard 的三条装载
+路径（`toPrefixes` / `toGeoEntries` / `toBlockTargets`）都跳过停用条目，于是
+停用 = 立即从内核名单与地区匹配里消失。条目本身保留，随时可再启用。
+
+两个配套决定：
+
+- **从启用切到停用时，由这条条目产生的活跃封禁一起解禁**（`ReleaseBansByRef`，
+  与删除同一个机制）。不停的话，名单页那条条目已经"停用"了，被它封的地址却
+  还进不来 —— 与"停用 = 不再生效"的直觉矛盾，且界面上看不到任何还封着的依据。
+  启用方向不做事：解禁过的地址下次命中会重新封。
+- **模型列必须带 `default:true`**：AutoMigrate 给存量行补列时，SQLite 的
+  NOT NULL 列没有默认值加不上去，而存量行必须是"启用"（升级不能悄悄放行原本
+  封死的地址）。代价是 GORM 零值坑反向咬：插入 `Enabled=false` 会被省略、
+  落库成 `true`（RateRule.Enabled 不加 default 正是这个原因）。这里接受代价，
+  并约定**所有创建路径显式写 `Enabled=true`** —— 停用只能事后切换，没有
+  "建出来就是停用"的入口。
+
+接口上 `enabled` 与 `remark` 都用指针收（D24 的延伸）：开关请求只发
+`enabled`，值类型的 `remark` 绑定出来是空串，会把原备注清掉。
+
+**测试**：`guard/geo_test.go` 的 `TestDisabledEntriesSkippedEverywhere`、
+`TestDisabledGeoEntryStopsMatchingAndReleasesBans`（停用不再命中 + 按引用解禁）、
+`api/handlers_acl_http_test.go` 的 `TestUpdateACLToggleEnabled`
+（开关落库、备注不被清空、响应带 `released_bans`）。
 
 
 ### D25. 封禁状态只以数据库为准，重启靠全量重建自愈

@@ -11,7 +11,7 @@
       :closable="false"
       show-icon
       style="margin-bottom: 12px"
-      title="白名单地址不受本程序封禁（含自动封禁与地域封禁），但也不会额外放行端口。"
+      title="白名单地址不被封禁，但不会额外放行端口。"
     />
     <el-alert
       v-else
@@ -20,17 +20,13 @@
       show-icon
       style="margin-bottom: 12px"
     >
-      <template #title>黑名单地址会被立即拒绝登录，并同步写入内核防火墙。</template>
+      <template #title>黑名单地址会被立即拒绝登录，并写入内核防火墙。</template>
       <template #default>
-        封禁范围按条目单独设置：<b>全端口</b>会把该地址访问本机的所有端口一起拒绝（含 SSH、
-        面板），挡得彻底，但误伤时代价也大；<b>仅 frp 端口</b>只拒绝 frp 服务端口上的连接，
-        影响面小，代价是对方仍能扫到本机其它端口；<b>自定义端口</b>只封指定的那几个端口。
-        范围只决定内核层丢哪些端口上的包，不影响判定本身 —— 插件回调拿不到端口，
-        自定义端口只用来精确控制内核封哪里。
+        封禁范围：<b>全端口</b> / <b>仅 frp 端口</b> / <b>自定义端口</b>。
+        范围只决定内核封哪些端口，不影响判定 —— 插件回调拿不到端口。
         <div style="margin-top: 6px">
-          <b>地区条目</b>（国家 / 省份 / 城市）按属地匹配，命中的来源会被立即拒绝并封进内核。
-          属地库是查询型库、没法反向列出某个国家的网段，所以地区条件本身不产生内核规则 ——
-          <b>没来访过的地址在内核里没有痕迹</b>，扫别的端口不受这条约束。
+          <b>地区条目</b>按属地匹配，命中即把该来源 IP 封进内核。
+          地区条件不产生内核规则，没来访过的地址在内核里没有痕迹。
         </div>
       </template>
     </el-alert>
@@ -58,6 +54,7 @@
       size="small"
       border
       empty-text="暂无数据"
+      :row-class-name="rowClass"
       @header-dragend="cw.onDragend"
     >
       <el-table-column prop="target" label="地址" v-bind="cw.col('地址', { minWidth: 170 })">
@@ -75,6 +72,13 @@
           <el-tag size="small" :type="isGeoTarget(row.target_type) ? 'warning' : 'info'">
             {{ typeLabel(row.target_type) }}
           </el-tag>
+        </template>
+      </el-table-column>
+      <!-- 启用/禁用直接在列表上切。停用的条目不参与判定，由它封掉的地址会被
+           一并解禁（与删除同待遇），后端在响应里带回 released_bans。 -->
+      <el-table-column label="启用/禁用" v-bind="cw.col('启用/禁用', { width: 90 })" align="center">
+        <template #default="{ row }">
+          <el-switch v-model="row.enabled" size="small" @change="toggleEnabled(row)" />
         </template>
       </el-table-column>
       <!-- 范围只对黑名单有意义，白名单不显示这一列 -->
@@ -156,7 +160,7 @@
             </el-radio-button>
           </el-radio-group>
           <div v-if="editing" class="hint" style="margin-top: 6px">
-            类型与匹配值建好之后不能改，要换类型请删掉重建。
+            保存后类型与匹配值不能改。
           </div>
         </el-form-item>
 
@@ -263,15 +267,19 @@
           </div>
         </el-form-item>
         <el-form-item label="有效期">
-          <el-select v-model="form.expires" style="width: 100%">
-            <el-option v-for="o in expireOptions" :key="o.value" :label="o.label" :value="o.value" />
+          <el-select
+            v-model="form.expires"
+            style="width: 100%"
+            clearable
+            :placeholder="editing ? '保持原有效期' : ''"
+          >
+            <el-option v-for="o in EXPIRE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
           </el-select>
-          <div v-if="editing && origExpiresAt" class="hint" style="margin-top: 6px">
-            选「保持不变」不会改动这条的到期时刻；选具体档位才会从现在起重新计时。
-          </div>
-          <div v-if="isGeo" class="hint" style="margin-top: 6px">
-            地区条目上这个有效期还有第二层含义：它同时是<strong>命中之后封多久</strong>。
-            命中即封，封到条目到期为止；选「永久」就是封永久。
+          <div class="hint" style="margin-top: 6px">
+            <template v-if="editing">不选则保持原有效期；选档位后从现在重新计时。</template>
+            <template v-if="isGeo">
+              地区条目命中后按有效期封禁：还有多久到期就封多久，永久条目封永久。
+            </template>
           </div>
         </el-form-item>
       </el-form>
@@ -293,14 +301,12 @@
         （<span class="mono">province:广东;福建</span>）。不加前缀的一律按地址解析。
       </div>
       <div v-if="kind === 'black'" class="hint" style="margin-bottom: 10px">
-        黑名单还可以在第二列写范围 <span class="mono">all</span> /
+        第二列可写范围 <span class="mono">all</span> /
         <span class="mono">frp</span> / <span class="mono">custom:端口</span>：
-        <span class="mono">1.2.3.4,frp,备注</span>、
+        <span class="mono">1.2.3.4,frp</span>、
         <span class="mono">1.2.3.4,custom:8080;9000-9100</span>。
-        第二列只有恰好是这几种写法时才当作范围，否则整体按备注处理，所以旧文件可以直接导入。
-        <br />
-        注意端口列表在<strong>文件里要用分号</strong>分隔 —— 逗号是列分隔符，
-        写逗号会把备注列切走；上面那个输入框是单独一个字段，用逗号即可。
+        不是这些写法时整段按备注，旧文件可直接导入。
+        端口在<strong>文件里用分号</strong>分隔（逗号是列分隔符）；上面输入框是独立字段，用逗号。
       </div>
       <el-form v-if="kind === 'black'" label-width="90px" style="margin-bottom: 10px">
         <el-form-item label="默认范围">
@@ -314,16 +320,12 @@
             </el-radio-button>
           </el-radio-group>
           <div class="hint" style="margin-top: 6px">
-            未写范围的行按此处理。地区条目（<span class="mono">country:</span> /
-            <span class="mono">province:</span> / <span class="mono">city:</span> 开头的行）
-            不受此项影响，恒为全端口。
+            未写范围的行按此处理；地区条目（<span class="mono">country:</span> 等前缀开头）恒为全端口。
           </div>
         </el-form-item>
         <el-form-item v-if="importScope === 'custom'" label="默认端口">
           <el-input v-model="importPorts" placeholder="8080,9000-9100" />
-          <div class="hint" style="margin-top: 6px">
-            未写范围的行用这一份端口。某一行自己写了范围，端口就跟着那一行走。
-          </div>
+          <div class="hint" style="margin-top: 6px">未写范围的行用这一份端口。</div>
         </el-form-item>
       </el-form>
       <!-- 占位符里的换行必须用 \n 转义：写 &#10; 会被解析成真实换行，
@@ -416,36 +418,8 @@ const EXPIRE_OPTIONS = [
   { label: '30 天', value: 2592000 },
 ]
 
-// 「保持不变」的哨兵值。只在编辑态出现，负数保证不会与任何真实档位撞上，
-// 保存时据此决定**整个字段不发出去**（后端把"没传"理解成"不改动"）。
-const KEEP_EXPIRES = -1
-
-// 把一个到期时刻折算成剩余秒数。已经到期与没填都返回 0。
-function remainSeconds(iso?: string | null) {
-  if (!iso) return 0
-  const left = Math.floor((new Date(iso).getTime() - Date.now()) / 1000)
-  return left > 0 ? left : 0
-}
-
 // 条目是否已过期（到期时刻已经过去）。
 const isExpired = (iso?: string | null) => !!iso && new Date(iso).getTime() <= Date.now()
-
-// 把剩余秒数说成人话，给「保持不变（还剩 …）」这一项用。
-//
-// 必须精确到**两级**，不能四舍五入成单个单位：原来的写法是 Math.round(sec/60)，
-// 于是 3597 秒被说成"剩余 60 分钟"—— 和预设档「1 小时」字面完全一样。下拉里
-// 并排出现两个看起来一模一样的选项，用户根本不知道该选哪个；而它们的值其实
-// 不同，一个是"从现在起重算 3600 秒"，一个是"保持原有的到期时刻"。
-function humanRemain(sec: number) {
-  const d = Math.floor(sec / 86400)
-  const h = Math.floor((sec % 86400) / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = sec % 60
-  if (d > 0) return h > 0 ? `${d} 天 ${h} 小时` : `${d} 天`
-  if (h > 0) return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`
-  if (m > 0) return s > 0 ? `${m} 分 ${s} 秒` : `${m} 分`
-  return `${s} 秒`
-}
 
 const editVisible = ref(false)
 const editing = ref(false)
@@ -455,40 +429,15 @@ const form = reactive({
   target: '',
   targetType: 'ip',
   remark: '',
-  expires: 0,
+  // null = 不改有效期（编辑时下拉留空、提交时不发这个字段）。
+  // 数字 = 从现在起多少秒，0 是永久。
+  expires: null as number | null,
   scope: 'all',
   ports: '',
 })
 // 地区条目的多值单独存一份数组：多选组件的 v-model 必须是数组，
 // 而入库形态是逗号分隔的一串。打开弹窗时拆开、保存时拼回去，只在这两处转换。
 const geoValues = ref<string[]>([])
-// 打开编辑框时条目的原始到期时刻。用来渲染「保持不变」那一项——
-// 它必须来自**打开时**的原值，而不是 form.expires：后者一旦被用户改成别的档，
-// 就再也算不出"原来的到期时刻"了，这一项也就跟着消失、想反悔都回不去。
-const origExpiresAt = ref<string | null>(null)
-
-// 有效期的下拉项。
-//
-// 编辑一条有到期时刻的条目时，最前面恒定挂一项「保持不变」：选它就等于这次
-// 不动有效期（保存请求里根本不带 expires_in_sec）。这是最常见的意图——
-// 进来改个备注不该重置有效期起点，更不该（像老版本那样）把它改成永久。
-//
-// 老版本的做法是"把剩余秒数做成一档补进列表"，本意也是不动，但那一档的文案
-// 是四舍五入出来的，会与预设档撞名，反而制造了更大的困惑。另外它在用户选了
-// 别的档之后就会消失，想切回来只能关掉重开。
-//
-// 永久条目不给这一项：「永久」本身就是它当前的状态，没有"原值"要保。
-const expireOptions = computed(() => {
-  const opts = [...EXPIRE_OPTIONS]
-  if (editing.value && origExpiresAt.value) {
-    const left = remainSeconds(origExpiresAt.value)
-    opts.unshift({
-      label: left > 0 ? `保持不变（还剩 ${humanRemain(left)}）` : '保持不变（该条目已过期，仍不生效）',
-      value: KEEP_EXPIRES,
-    })
-  }
-  return opts
-})
 
 const countries = ref<any[]>([])
 const provinces = ref<any[]>([])
@@ -505,11 +454,11 @@ const targetLabel = computed(() => {
 const targetHint = computed(() => {
   switch (form.targetType) {
     case 'geo_country':
-      return '命中所选任一国家/地区的来源会被拒绝。多选是「或」的关系。下拉里只收了常见来源地，没收录的国家直接敲两位代码（如 CU）即可回车添加。'
+      return '命中任一所选地区即拦截。下拉只收常见来源地，其他直接输入两位国家码（如 CU）。'
     case 'geo_province':
-      return '省份取值与属地库返回的一致（已去掉「省 / 自治区」这类后缀）。多选是「或」。'
+      return '与属地库一致（不带「省 / 自治区」后缀）。'
     case 'geo_city':
-      return '城市没有候选列表，写错不会报错、只会永远不命中。写「深圳」或「深圳市」都行（后缀会被去掉），拿不准先用「属地查询」核对。'
+      return '写错不报错、只是不命中。「深圳」「深圳市」均可。'
     default:
       return '单个 IP（1.2.3.4）或网段（1.2.3.0/24）。'
   }
@@ -581,7 +530,6 @@ function openCreate() {
     ports: '',
   })
   geoValues.value = []
-  origExpiresAt.value = null
   editVisible.value = true
 }
 
@@ -594,16 +542,13 @@ function openEdit(row: any) {
     // 那一档 —— 选项里没有 ipv4 这一项，直接塞进去会让整个单选组一个都不选中。
     targetType: isGeoTarget(row.target_type) ? row.target_type : 'ip',
     remark: row.remark || '',
-    // 默认选「保持不变」—— 编辑备注不该重置有效期起点。老版本这里写死 0
-    // （永久），一保存就把 expires_at 清成 NULL；后来改成"精确回填剩余秒数"，
-    // 虽然结果是对的，但那多出来的一档与预设档撞名，反而更费解。
-    // 现在统一成"不发这个字段"，语义由后端保证。
-    expires: row.expires_at ? KEEP_EXPIRES : 0,
+    // 编辑态默认留空 = 不改有效期（提交时不发这个字段）。展示剩余秒数的老做法
+    // 已去掉：那会多出一条与预设档撞名的选项，用户分不清选哪个。
+    expires: row.expires_at ? null : 0,
     // 老条目可能是空串，回显成全端口而不是留空，避免用户以为没设置过
     scope: row.scope === 'frp' || row.scope === 'custom' ? row.scope : 'all',
     ports: row.ports || '',
   })
-  origExpiresAt.value = row.expires_at || null
   geoValues.value = isGeoTarget(row.target_type) ? splitList(row.target) : []
   editVisible.value = true
 }
@@ -644,16 +589,16 @@ async function save() {
         scope: form.scope,
         ports,
       }
-      // KEEP_EXPIRES 是负数：这整个字段**不发出去**，后端才收得到"这次没提有效期"，
-      // 从而保持原有的到期时刻。发 0 会被后端理解成"改成永久"。
-      if (form.expires >= 0) body.expires_in_sec = form.expires
+      // KEEP_EXPIRES 已删除：编辑态 expires 为 null 表示不改，整个字段不发出去
+      //（后端把"没传"理解成"不改动"）。发 0 会被后端理解成"改成永久"。
+      if (form.expires !== null) body.expires_in_sec = form.expires
       await api.updateACL(kind.value, form.id, body)
     } else {
       await api.createACL(kind.value, {
         target,
         target_type: targetType,
         remark: form.remark,
-        expires_in_sec: form.expires,
+        expires_in_sec: form.expires ?? 0,
         scope: form.scope,
         ports,
       })
@@ -663,6 +608,27 @@ async function save() {
     reload()
   } finally {
     saving.value = false
+  }
+}
+
+// 停用的行整行压暗：不参与判定的事实要在列表上一眼可见，
+// 否则"名单里有它却没生效"只能靠猜。
+function rowClass({ row }: { row: any }) {
+  return row.enabled ? '' : 'row-disabled'
+}
+
+// 列表上的启用开关。失败时把开关翻回去，别让界面停在没保存成功的状态。
+async function toggleEnabled(row: any) {
+  const want = row.enabled
+  try {
+    const r: any = await api.updateACL(kind.value, row.id, { enabled: want })
+    const n = r?.released_bans ?? 0
+    if (!want && n > 0) {
+      ElMessage.success(`已停用，并解禁了 ${n} 条由它产生的封禁`)
+    }
+  } catch {
+    row.enabled = !want
+    reload()
   }
 }
 
@@ -774,5 +740,10 @@ onMounted(() => {
 /* 已经到期的时刻压暗一档：与右侧的「已过期」标签一起表示这条当前不生效。 */
 .text-expired {
   color: var(--el-text-color-placeholder);
+}
+
+/* 停用条目整行压暗。 */
+:deep(.row-disabled) {
+  opacity: 0.55;
 }
 </style>

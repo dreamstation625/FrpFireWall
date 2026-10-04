@@ -669,3 +669,66 @@ func TestUpdateACLExpiryExplicitValues(t *testing.T) {
 		t.Fatalf("到期时刻应约等于 now+86400s，偏差 %d 秒（%v）", d, row.ExpiresAt)
 	}
 }
+
+// 启用/禁用开关的接口契约：
+//
+//   - enabled 用指针收：没传 = 不改动。开关请求只发 enabled，备注、有效期
+//     一个字节都不能动（Remark 因此也改成了指针 —— 开关请求不带备注，
+//     值类型绑定出来是空串，会把原备注清掉）。
+//   - 从启用切到停用必须报告 released_bans：停用要和删除一个待遇，由这条
+//     条目封掉的地址一起放开（本用例没有由它产生的封禁，值应为 0 且字段必须在）。
+func TestUpdateACLToggleEnabled(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+		"target": "203.0.113.11",
+		"remark": "扫描源",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("POST 应 200，得到 %d %s", code, r.Error)
+	}
+	id := entryID(t, h, r)
+
+	// 停用：只发 enabled，不带备注
+	code, r = h.call(http.MethodPut, aclPath("black", id), map[string]any{"enabled": false})
+	if code != http.StatusOK {
+		t.Fatalf("PUT 应 200，得到 %d %s", code, r.Error)
+	}
+	if _, ok := h.data(r)["released_bans"]; !ok {
+		t.Fatalf("停用响应里应当带 released_bans 字段：%v", h.data(r))
+	}
+	row, err := h.srv.store.GetACL(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Enabled {
+		t.Fatal("enabled=false 应当落库")
+	}
+	if row.Remark != "扫描源" {
+		t.Fatalf("开关请求不该动备注，实际 %q —— Remark 没用指针的话这里会被清成空串", row.Remark)
+	}
+
+	// 再只改备注：enabled 不传 = 保持停用
+	code, r = h.call(http.MethodPut, aclPath("black", id), map[string]any{"remark": "新备注"})
+	if code != http.StatusOK {
+		t.Fatalf("PUT 应 200，得到 %d %s", code, r.Error)
+	}
+	if row, err = h.srv.store.GetACL(id); err != nil {
+		t.Fatal(err)
+	}
+	if row.Enabled || row.Remark != "新备注" {
+		t.Fatalf("只改备注后 = (enabled=%v, remark=%q)，期望 (false, 新备注)", row.Enabled, row.Remark)
+	}
+
+	// 重新启用
+	code, r = h.call(http.MethodPut, aclPath("black", id), map[string]any{"enabled": true})
+	if code != http.StatusOK {
+		t.Fatalf("PUT 应 200，得到 %d %s", code, r.Error)
+	}
+	if row, err = h.srv.store.GetACL(id); err != nil {
+		t.Fatal(err)
+	}
+	if !row.Enabled {
+		t.Fatal("enabled=true 应当落库")
+	}
+}

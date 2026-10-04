@@ -137,8 +137,11 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 		Ports:      ports,
 		Remark:     req.Remark,
 		Source:     model.SourceManual,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		// 创建路径必须显式写 true：模型列带 default:true，GORM 会把零值 false
+		// 省略掉、落库成 true。这里写 true 与库的默认一致，纯属把约定钉在明面上。
+		Enabled:   true,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 
 	// 创建时"没传"与"传 0"都是永久，不必区分。
@@ -181,7 +184,8 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 	}
 
 	var req struct {
-		Remark string `json:"remark"`
+		// Remark 用指针：开关请求（只发 enabled）不带备注，不能把它清空。
+		Remark *string `json:"remark"`
 		// ExpiresIn 用指针的理由同下面的 Scope：区分"没传"与"传了 0"。
 		//
 		// 这个字段踩过的坑比 Scope 还隐蔽：老写法用普通 int64，绑定时"没传"
@@ -189,6 +193,9 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 		// 「1 小时」的条目悄悄改成永久生效 —— 请求里根本没提有效期。
 		// nil = 保持原值，0 = 改成永久，正数 = 从现在起 N 秒。
 		ExpiresIn *int64 `json:"expires_in_sec"`
+		// Enabled 用指针区分"没传"与"传 false"：nil = 不改动。
+		// 由启用切到停用时会联动解禁由这条条目产生的封禁（见下方）。
+		Enabled *bool `json:"enabled"`
 		// Scope 用指针是为了区分"没传"和"传了空串"。
 		//
 		// 用普通 string 会有个很隐蔽的坑：只改备注的请求不带 scope 字段，
@@ -252,7 +259,13 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 		}
 	}
 
-	entry.Remark = req.Remark
+	if req.Remark != nil {
+		entry.Remark = *req.Remark
+	}
+	wasEnabled := entry.Enabled
+	if req.Enabled != nil {
+		entry.Enabled = *req.Enabled
+	}
 	switch {
 	case req.ExpiresIn == nil:
 		// 没传就不动 —— 这是"只改备注"的形状，条目该怎么到期还怎么到期。
@@ -269,7 +282,31 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 		return
 	}
 	s.refreshGuard()
-	ok(c, entry)
+
+	// 停用要和删除一个待遇：由这条条目封掉的地址一起放开。不停的话，界面上
+	// 那条条目已经"停用"了，被它封的地址却还进不来 —— 与"停用 = 不再生效"
+	// 的直觉矛盾，而且用户在名单页看不到任何还封着的依据。
+	// 启用方向不用做事：之前被解禁的地址，下次命中会重新封。
+	released := 0
+	if wasEnabled && !entry.Enabled {
+		released = s.releaseBansOfACL(c, entry.ID, "名单条目已停用")
+	}
+
+	// 开关本身留痕：解禁那半边 ReleaseBansByRef 会记事件，这里补上动作本身。
+	if wasEnabled != entry.Enabled {
+		action := "启用"
+		if !entry.Enabled {
+			action = "停用"
+		}
+		_ = s.store.AddEvent(&model.Event{
+			Category: model.EvtConfig,
+			IP:       c.ClientIP(),
+			Detail:   fmt.Sprintf("%s%s条目 %s", action, kindLabel(entry.Kind), entry.Target),
+			Actor:    s.currentUser(c),
+		})
+	}
+
+	ok(c, gin.H{"entry": aclViewOf(*entry), "released_bans": released})
 }
 
 func (s *Server) handleDeleteACL(c *gin.Context) {
@@ -377,6 +414,7 @@ func (s *Server) handleBatchACL(c *gin.Context) {
 				Scope:      scope,
 				Ports:      ports,
 				Source:     model.SourceManual,
+				Enabled:    true,
 				CreatedAt:  time.Now(),
 				UpdatedAt:  time.Now(),
 			}
@@ -499,6 +537,7 @@ func (s *Server) handleImportACL(c *gin.Context) {
 			Ports:      linePorts,
 			Remark:     remark,
 			Source:     model.SourceManual,
+			Enabled:    true,
 			CreatedAt:  time.Now(),
 			UpdatedAt:  time.Now(),
 		}

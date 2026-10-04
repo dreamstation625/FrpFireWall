@@ -121,8 +121,18 @@ type ACLEntry struct {
 	// 只在 scope=custom 时有值：换成别的范围时接口层会把它清空。留一个不参与
 	// 生效的值在库里，等于制造"配置里写着、实际不生效"的陷阱 —— 这种错在界面上
 	// 完全看不出来，只有去数内核规则条数才会发现。
-	Ports     string     `gorm:"size:512;not null;default:''" json:"ports"`
-	Remark    string     `gorm:"size:255" json:"remark"`
+	Ports  string `gorm:"size:512;not null;default:''" json:"ports"`
+	Remark string `gorm:"size:255" json:"remark"`
+	// Enabled 条目是否启用。停用的条目不参与判定、不产生内核规则，但保留在
+	// 名单里（列表可见、可再启用）。
+	//
+	// 必须带 default:true：AutoMigrate 给存量行补这一列时，SQLite 的 NOT NULL
+	// 列没有默认值加不上去，而存量行必须是"启用"（升级不能悄悄放行原本封死的
+	// 地址）。代价是 GORM 的零值坑反过来咬——插入 Enabled=false 的结构体时该列
+	// 会被省略、落库成 true（RateRule.Enabled 不加 default 就是这个原因）。
+	// 这里接受这个代价，因为约定**所有创建路径都写 Enabled=true**：界面新建、
+	// 导入、批量添加都没有"建出来就是停用"的入口，停用只能事后切换。
+	Enabled   bool       `gorm:"not null;default:true" json:"enabled"`
 	Source    string     `gorm:"size:16;not null;default:manual" json:"source"`
 	Country   string     `gorm:"size:64" json:"country"`
 	Province  string     `gorm:"size:64" json:"province"`

@@ -25,7 +25,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="启用" v-bind="cw.col('启用', { width: 66 })" align="center">
+        <el-table-column label="启用/禁用" v-bind="cw.col('启用/禁用', { width: 90 })" align="center">
           <template #default="{ row }">
             <el-switch v-model="row.enabled" size="small" />
           </template>

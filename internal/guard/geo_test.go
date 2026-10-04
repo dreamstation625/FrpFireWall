@@ -67,12 +67,14 @@ func TestToGeoEntriesSkipsExpiredAndEmpty(t *testing.T) {
 	future := now.Add(time.Hour)
 
 	rows := []model.ACLEntry{
-		{ID: 1, Target: "CN", TargetType: model.TargetGeoCountry},
-		{ID: 2, Target: "US", TargetType: model.TargetGeoCountry, ExpiresAt: &past},
-		{ID: 3, Target: "JP", TargetType: model.TargetGeoCountry, ExpiresAt: &future},
-		{ID: 4, Target: "   ", TargetType: model.TargetGeoCountry},
+		{ID: 1, Target: "CN", TargetType: model.TargetGeoCountry, Enabled: true},
+		{ID: 2, Target: "US", TargetType: model.TargetGeoCountry, ExpiresAt: &past, Enabled: true},
+		{ID: 3, Target: "JP", TargetType: model.TargetGeoCountry, ExpiresAt: &future, Enabled: true},
+		{ID: 4, Target: "   ", TargetType: model.TargetGeoCountry, Enabled: true},
 		// 手工改坏的库：类型是地区、值是地址。筛不掉的话判定时只会白比一遍。
-		{ID: 5, Target: "203.0.113.9", TargetType: "ipv4"},
+		{ID: 5, Target: "203.0.113.9", TargetType: "ipv4", Enabled: true},
+		// 停用的条目与"不在名单里"等价，哪怕还没到期也不参与判定。
+		{ID: 6, Target: "DE", TargetType: model.TargetGeoCountry, ExpiresAt: &future},
 	}
 	got := toGeoEntries(rows, now)
 	if len(got) != 2 {
@@ -83,6 +85,23 @@ func TestToGeoEntriesSkipsExpiredAndEmpty(t *testing.T) {
 	}
 	if got[0].kind != model.TargetGeoCountry || got[0].list != "CN" {
 		t.Errorf("条目内容被改动了：%+v", got[0])
+	}
+}
+
+// 停用的地址条目在三条装载路径上都等于"不在名单里"：不进内核白名单、
+// 不进内核黑名单，也没有端口分组可留。
+func TestDisabledEntriesSkippedEverywhere(t *testing.T) {
+	now := time.Now()
+	rows := []model.ACLEntry{
+		{ID: 1, Kind: model.KindBlack, Target: "203.0.113.9", TargetType: "ipv4", Scope: model.ScopeAll, Enabled: true},
+		{ID: 2, Kind: model.KindBlack, Target: "203.0.113.10", TargetType: "ipv4", Scope: model.ScopeAll},
+	}
+	if got := toPrefixes(rows, now); len(got) != 1 || got[0].String() != "203.0.113.9/32" {
+		t.Fatalf("toPrefixes 应当只留启用的那条，实际 %v", got)
+	}
+	got := toBlockTargets(rows, now)
+	if len(got) != 1 || got[0].Prefix.String() != "203.0.113.9/32" {
+		t.Fatalf("toBlockTargets 应当只留启用的那条，实际 %+v", got)
 	}
 }
 
@@ -392,4 +411,60 @@ func TestGeoEntryBanDurationFollowsEntry(t *testing.T) {
 		}
 	}
 	t.Fatal("永久条目命中后没有产生封禁")
+}
+
+// 停用地区条目 = 立即不再拦 + 由它封掉的地址能按来源引用解禁。
+//
+// API 层"停用联动解禁"走的正是 ReleaseBansByRef(ref)（与删除同一个机制），
+// 这里把两半都钉住：Refresh 之后停用条目不再出现在 geoBlack，按引用解禁恰好
+// 解掉停用前产生的那一条封禁。
+func TestDisabledGeoEntryStopsMatchingAndReleasesBans(t *testing.T) {
+	m := newTestManager(t)
+
+	if err := m.store.UpsertACL(&model.ACLEntry{
+		Kind: model.KindBlack, Target: "CN", TargetType: model.TargetGeoCountry,
+		Scope: model.ScopeAll, Source: model.SourceManual,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+
+	hit := m.matchGeoLocked(m.geoBlack, &geoip.Info{Country: "CN", Found: true})
+	if hit == nil {
+		t.Fatal("启用的条目应当命中")
+	}
+	ref := model.BanSourceRef(model.BanRefACL, hit.id)
+	m.banGeoBlackHit(netip.MustParseAddr("203.0.113.77"), &geoip.Info{Country: "CN"},
+		"u", hit, time.Now())
+	if bans := m.Bans(); len(bans) != 1 {
+		t.Fatalf("应当产生 1 条封禁，实际 %d 条", len(bans))
+	}
+
+	// 停用：落库 + 重载（与接口层开关做的事一致）
+	entry, err := m.store.GetACL(hit.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.Enabled = false
+	if err := m.store.UpdateACL(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+
+	if hit := m.matchGeoLocked(m.geoBlack, &geoip.Info{Country: "CN", Found: true}); hit != nil {
+		t.Fatalf("停用的条目不该再命中：%+v", m.geoBlack)
+	}
+
+	// 停用前产生的封禁，按引用应当能一次性解掉（API 层开关调用的同一入口）。
+	n, err := m.ReleaseBansByRef(ref, "tester", "名单条目已停用")
+	if err != nil || n != 1 {
+		t.Fatalf("应当解禁 1 条（err=%v），实际 %d 条", err, n)
+	}
+	if bans := m.Bans(); len(bans) != 0 {
+		t.Fatalf("解禁后不该还有活跃封禁，实际 %+v", bans)
+	}
 }
