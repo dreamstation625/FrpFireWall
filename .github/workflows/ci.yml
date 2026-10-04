@@ -1,7 +1,18 @@
 name: CI
 
-# 日常提交的守门人：编译、静态检查、单元测试、前端构建。
+# 日常提交的守门人：静态检查、单元测试，以及发版时的完整构建。
 # 发布流程在 release.yml，由 tag 触发。
+#
+# 分两档跑，避免每次提交都等一遍完整构建：
+#
+#   日常提交 —— go vet + 单元测试。几十秒出结果，挡的是「编译器看不见」的那类
+#               问题：改了 JSON tag 而按字符串 key 取值的引用点没跟着改、
+#               往 ip 家族的链里写 ip6 表达式之类。
+#   发版提交 —— VERSION 文件有变化时，追加前端构建、安装脚本测试、版本脚本测试
+#               与交叉编译。这几步慢（npm ci 是大头），只有真要出包时才有意义。
+#
+# 前端构建是唯一的例外：它额外跟随 web/ 目录。前端产物只在改前端时会变，
+# 没必要等到发版才验一遍 —— 那会让前端错误一直积压到发版当天。
 on:
   push:
     branches: [main]
@@ -17,12 +28,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 后面几个 job 跑哪些步骤取决于变更范围，所以先单独算出来。
+  # 判断逻辑集中在这里而不是分散到各 job，是为了只有一份、不会两边漂移。
+  changes:
+    name: 变更范围
+    runs-on: ubuntu-latest
+    outputs:
+      version_changed: ${{ steps.detect.outputs.version_changed }}
+      web_changed: ${{ steps.detect.outputs.web_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 要和基准提交做 diff，浅克隆拿不到它
+          fetch-depth: 0
+
+      - name: 检测变更范围
+        id: detect
+        env:
+          # push 用事件里的 before；PR 没有 before，退到 base。
+          # workflow_dispatch 两者都空，走下面的兜底分支。
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # 拿不到可靠基准时（首次推送、强制推送、手动触发）按「都变了」处理：
+          # 多跑一遍只是慢几十秒，漏跑则会让没人构建过的提交悄悄进 main。
+          if [ -z "$BASE_SHA" ] \
+             || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            version_changed=true
+            web_changed=true
+            note="拿不到比较基准，按全部变更处理"
+          else
+            files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+            echo "变更文件："
+            echo "${files:-（无）}"
+
+            version_changed=false
+            web_changed=false
+            if grep -qx VERSION <<<"$files"; then version_changed=true; fi
+            if grep -q '^web/' <<<"$files"; then web_changed=true; fi
+            note="基准 ${BASE_SHA:0:7}"
+          fi
+
+          echo "version_changed=$version_changed" >> "$GITHUB_OUTPUT"
+          echo "web_changed=$web_changed" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 变更范围"
+            echo
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| VERSION 变更 | \`$version_changed\` |"
+            echo "| 前端变更 | \`$web_changed\` |"
+            echo "| 说明 | $note |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   backend:
     name: 后端
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # 版本号格式非法会让 Release 工作流在同一个位置失败，而且失败前不产出
+      # 任何资产。校验本身是毫秒级的，所以日常提交也跑。
       - name: 校验 VERSION 文件格式
         run: |
           set -euo pipefail
@@ -69,8 +140,13 @@ jobs:
       # 语法、只会点头，而像"往 ip 家族的链里写 ip6 表达式"这种错，nft 会拒绝
       # 整份脚本（真实故障：预检失败 → 那条链上一个规则都没下发，IPv4 封禁跟着
       # 一起失效）。规则文本层面的错误只能靠断言脚本文本来防。
+      #
+      # 这一步（连同上面的 vet）是日常提交唯一跑的东西，所以它不能慢：
+      # 它挡住的正是本次改动引入的那类错，等发版才发现代价太大。
       - name: 单元测试
         run: go test ./... -count=1
+
+      # ---- 以下三步只和「要出包」有关，日常提交跳过 ----
 
       # 一键脚本是用户装机的第一道门，它自己的回归必须固化下来。
       # 覆盖：版本比较与 Go 侧（internal/version）逐条一致、
@@ -78,6 +154,7 @@ jobs:
       #       校验和不匹配必须中止、降级拦截、--purge 护栏。
       # 全程用桩命令，不碰真实的 systemd / iptables / /usr/local。
       - name: 安装脚本测试
+        if: needs.changes.outputs.version_changed == 'true'
         run: bash testdata/test-install.sh
 
       # 版本号散落在四处（VERSION / version.go / package.json / package-lock.json），
@@ -85,13 +162,18 @@ jobs:
       # Release 工作流在同一个位置失败，失败前不产出任何资产。手动改过两次
       # 两次都漏，所以把 "四处都改到了" 固化下来。
       - name: 版本脚本测试
+        if: needs.changes.outputs.version_changed == 'true'
         run: bash testdata/test-version-bump.sh
 
       - name: 编译
+        if: needs.changes.outputs.version_changed == 'true'
         run: CGO_ENABLED=0 go build -trimpath ./...
 
   frontend:
     name: 前端
+    needs: changes
+    # 发版要打包前端产物，改了前端代码也得验一遍；两条都不满足就没必要跑。
+    if: needs.changes.outputs.version_changed == 'true' || needs.changes.outputs.web_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,9 +184,10 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      # 平台专用的二进制包（esbuild / rollup / swc 等）只能作为传递的 optional 依赖存在。
-      # 一旦被显式写进 dependencies，在别的平台上 npm ci 会直接 EBADPLATFORM 失败 —— 
-      # 而且报错只出现在 CI 上，本地（写它的那个平台）永远复现不了。
+      # 平台专用的二进制包（esbuild / rollup / swc 等）只能作为传递的 optional
+      # 依赖存在。一旦被显式写进 dependencies，在别的平台上 npm ci 会直接
+      # EBADPLATFORM 失败 —— 而且报错只出现在 CI 上，本地（写它的那个平台）
+      # 永远复现不了。
       - name: 检查是否显式声明了平台专用包
         working-directory: web
         run: |
