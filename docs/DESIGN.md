@@ -845,11 +845,39 @@ udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_p_xxxxxxxx drop comm
 （同 D14 的端口列表）。反过来，**没有前缀的一律按地址解析**：
 老版本导出的文件里全是裸地址，不改一个字节就要能导入。
 
+**命中的封禁时长取条目自己的剩余有效期，不走全局阶梯**（`banStepsForEntry`）。
+全局阶梯（`policy.DurationSteps()`）会按**该地址自己的封禁历史**升级
+（`LastBanOfTarget().HitCount` + `EscalateWindowHours` 窗口），所以同一个条目的多次命中
+能封出 10 分钟 / 1 小时两种时长，而条目上那个「有效期」完全不参与 —— 用户看到的就是
+"设了 1 小时不管用，同一批地址时长还各不相同"。阶梯是给频次自动封禁设计的
+（"这个人屡教不改"），一条人工写下的地区条目本来就带着明确的存续期，
+不该再受该地址历史的影响。地址条目没有这个问题：它靠常驻内核规则，条目在就封着。
+两个边界：条目永久（`ExpiresAt == nil`）⇒ 封永久（阶梯里的 `0`）；条目在快照加载后
+立刻到期 ⇒ 封 1 秒（等价于不封，比回落全局阶梯去封 10 分钟忠实）。
+**封禁时长在命中那一刻定死**，之后改短条目有效期不会缩短已经封进去的 IP。
+
+**展示用中文名，存储 / 匹配 / 导出一律是国家码。** 列表里 `HK,JP` 显示成
+「中国香港、日本」，但这份中文名只存在于响应的 `target_label` 字段里
+（`geoip.DisplayList`），`Target` 仍原样带出。别把它存回库里的诱惑要挡住：
+匹配走 `MatchGeo` 的归一化、导出走前缀解析，两边都只认国家码，
+真写进去的表现是"导出文件再也导不回来"。
+
+**搜索必须跟着吃中文名**（`aclSearchTerms`）：展示了中文名而搜索不认，用户照着界面上的字
+搜一条都搜不到，比不显示中文名更让人困惑。做法是把搜索词反查回国家码一起匹配
+（依据 `geoip.Countries()` 那份**封闭**表，查不到就只按原词匹配）。
+多个搜索词在 SQL 里必须**各自带括号**再或起来 —— `kind = ? AND A OR B` 会因 AND 优先级
+高于 OR 把 kind 条件整个绕过去，在**白名单页搜出黑名单的条目**。
+`api/handlers_acl_http_test.go` 里专门用"白名单放地区条目、黑名单放无关地址条目"的形状
+钉住这条（去掉括号即失败）。
+
 **测试**：`model/geo_test.go`（三种粒度的归一化与校验强度、`MatchGeo` 的查询侧
 归一化与空属地不命中）、`geoip/geoip_test.go` 的 `TestMergeRegion` /
-`TestPreferRegionDB`、`guard/geo_test.go`（地区条目不产生内核规则、过期与空值被筛掉、
-命中来源引用指向具体条目）、`api/handlers_acl_test.go` 的导出导入闭环与报错文案、
-`api/handlers_acl_http_test.go` 的端到端（含"国家码只校验格式"这条边界）。
+`TestPreferRegionDB` / `TestDisplayList`、`guard/geo_test.go`（地区条目不产生内核规则、
+过期与空值被筛掉、命中来源引用指向具体条目、`TestBanStepsForEntry` 与
+`TestGeoEntryBanDurationFollowsEntry` 钉住封禁时长跟随条目有效期，后者在接线被改回
+`nil` 时会失败）、`api/handlers_acl_test.go` 的导出导入闭环与报错文案、
+`api/handlers_acl_http_test.go` 的端到端（含"国家码只校验格式"、列表中文名与
+`Target` 仍是国家码、按中文名搜索且不越 kind 边界）。
 
 
 ### D23. 封禁记录带来源引用，来源消失或手工解封时按它反向清理

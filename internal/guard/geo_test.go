@@ -256,3 +256,140 @@ func TestGeoBanSourceRefPointsAtEntry(t *testing.T) {
 		t.Fatalf("解禁后不该还有活跃封禁，实际 %+v", bans)
 	}
 }
+
+func timePtr(t time.Time) *time.Time { return &t }
+
+// banStepsForEntry 把"条目的到期时刻"翻译成 triggerBan 要的阶梯表。
+//
+// 它必须是**单元素**的：多一个元素就等于开了升级，而升级正是"同一个条目封出
+// 两种时长"的来源（见下一个用例）。
+func TestBanStepsForEntry(t *testing.T) {
+	now := time.Now()
+
+	cases := []struct {
+		name string
+		exp  *time.Time
+		want int64
+	}{
+		{"永久条目 → 永久封（0 就是阶梯里的永久）", nil, 0},
+		{"还有 30 分钟 → 封 30 分钟", timePtr(now.Add(30 * time.Minute)), 1800},
+		{"还有 1 天 → 封 1 天", timePtr(now.Add(24 * time.Hour)), 86400},
+	}
+	for _, tc := range cases {
+		got := banStepsForEntry(tc.exp, now)
+		if len(got) != 1 {
+			t.Errorf("%s：应当只有一个阶梯元素（不升级），实际 %v", tc.name, got)
+			continue
+		}
+		// 允许几秒误差：剩余期是拿 now 与绝对到期时刻相减算出来的。
+		if d := got[0] - tc.want; d > 2 || d < -2 {
+			t.Errorf("%s：期望 %d 秒，实际 %d 秒", tc.name, tc.want, got[0])
+		}
+	}
+
+	// 已过期（并发下快照刚加载完、条目正好在这一瞬间到期）：封 1 秒，
+	// 也就是立刻解除。回落全局阶梯会封 10 分钟，那是实打实的误伤。
+	got := banStepsForEntry(timePtr(now.Add(-time.Minute)), now)
+	if len(got) != 1 || got[0] != 1 {
+		t.Errorf("已过期条目应当落到 1 秒，实际 %v", got)
+	}
+}
+
+// 地区条目命中后封多久 = **条目自己的剩余有效期**，且不受该地址封禁历史的影响。
+//
+// 曾经的写法是给 triggerBan 传 nil，让 nextDuration 回落全局阶梯。于是同一个
+// 条目的命中会封出两种时长：阶梯本身 10 分钟起步，而"24 小时内再次触发"会把
+// 序号顶到第二级、变成 1 小时。用户看到的就是"条目上明明选了有效期，一批地址
+// 里有的封 10 分钟、有的封 1 小时，怎么都对不上那条设置"。
+func TestGeoEntryBanDurationFollowsEntry(t *testing.T) {
+	m := newTestManager(t)
+	setPolicy(t, m, func(p *model.Policy) {
+		p.AutoBanEnabled = true
+		p.ObserveOnly = false
+		// 与出厂默认一致：第一级 10 分钟、第二级 1 小时。
+		p.BanDurations = "600,3600"
+		p.EscalateWindowHours = 24
+	})
+
+	// 条目有效期取 30 分钟：与阶梯的两级都不相等，一旦回落阶梯就会被下面的
+	// 断言抓住（600 或 3600，都不是 1800）。
+	exp := time.Now().Add(30 * time.Minute)
+	entry := &model.ACLEntry{
+		Kind: model.KindBlack, Target: "CN", TargetType: model.TargetGeoCountry,
+		Scope: model.ScopeAll, Source: model.SourceManual, ExpiresAt: &exp,
+	}
+	if err := m.store.UpsertACL(entry); err != nil {
+		t.Fatal(err)
+	}
+	// 一条永久条目，用来验证"条目永久 ⇒ 封永久"这一侧。
+	perm := &model.ACLEntry{
+		Kind: model.KindBlack, Target: "US", TargetType: model.TargetGeoCountry,
+		Scope: model.ScopeAll, Source: model.SourceManual,
+	}
+	if err := m.store.UpsertACL(perm); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("203.0.113.77")
+	target := addr.String() + "/32"
+
+	// 给这个地址造一段"24 小时内已被封过一次"的历史，好让全局阶梯升到第二级。
+	//
+	// 用 released 而不是 active：active 会被 rebuildBans 装回内存，triggerBan
+	// 见到"已在封禁中"就直接返回、什么都测不到；而 LastBanOfTarget 不看状态，
+	// released 的记录一样会被 nextDuration 当成升级依据。
+	if err := m.store.CreateBan(&model.BanRecord{
+		Target: target, TargetType: model.TargetTypeOf(target), Scope: model.ScopeAll,
+		Reason: "历史封禁", Source: model.SourceAuto, Status: model.BanReleased,
+		HitCount: 1, BannedAt: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hit := m.matchGeoLocked(m.geoBlack, &geoip.Info{Country: "CN", Found: true})
+	if hit == nil {
+		t.Fatal("应当命中刚写入的国家条目")
+	}
+	if hit.expiresAt == nil {
+		t.Fatal("geoEntry 丢掉了条目的到期时刻 —— 封禁时长就没得可依了")
+	}
+
+	// 走真实接线（banGeoBlackHit），不是自己拼参数：这条用例要钉住的正是
+	// "judge 那一步把条目有效期传下去"这件事。直接调 triggerBan 的话，
+	// 有人把接线改回 nil，用例照样绿。
+	m.banGeoBlackHit(addr, &geoip.Info{Country: "CN"}, "u", hit, time.Now())
+
+	bans := m.Bans()
+	if len(bans) != 1 {
+		t.Fatalf("应当产生 1 条封禁，实际 %d 条", len(bans))
+	}
+	if bans[0].Permanent {
+		t.Fatal("30 分钟的条目不该封成永久")
+	}
+	if got := bans[0].RemainingSec; got < 1740 || got > 1800 {
+		t.Fatalf("封禁时长应当跟条目走（约 1800 秒），实际 %d 秒 —— "+
+			"600 是阶梯第一级、3600 是按历史升级后的第二级，两者都说明没看条目", got)
+	}
+
+	// 条目永久 ⇒ 封永久。与地址黑名单条目一致：那种条目在内核里也是
+	// "条目在就封着、条目删掉才放行"，没有第二种存续期。
+	hitPerm := m.matchGeoLocked(m.geoBlack, &geoip.Info{Country: "US", Found: true})
+	if hitPerm == nil {
+		t.Fatal("应当命中永久国家条目")
+	}
+	m.banGeoBlackHit(netip.MustParseAddr("203.0.113.88"), &geoip.Info{Country: "US"},
+		"u", hitPerm, time.Now())
+
+	for _, b := range m.Bans() {
+		if b.Target == "203.0.113.88/32" {
+			if !b.Permanent {
+				t.Fatalf("永久条目应当封永久，实际剩余 %d 秒", b.RemainingSec)
+			}
+			return
+		}
+	}
+	t.Fatal("永久条目命中后没有产生封禁")
+}

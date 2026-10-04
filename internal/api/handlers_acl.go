@@ -15,12 +15,58 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/guard"
 	"github.com/dreamstation625/FrpFireWall/internal/model"
 	"github.com/dreamstation625/FrpFireWall/internal/portrange"
+	"github.com/dreamstation625/FrpFireWall/internal/store"
 )
 
 // ---- 黑白名单 ----
 
 func validKind(kind string) bool {
 	return kind == model.KindWhite || kind == model.KindBlack
+}
+
+// aclView 是名单条目在接口上的形态：库里的字段原样带出，另补一个展示用的中文名。
+//
+// 地区条目的 Target 是**匹配值**（国家码 "HK,JP"、省份 "广东"），匹配、归一化与
+// 导出导入全都基于它，所以它必须保持原样 —— 列表里直接看到 "HK,JP,SG,TW,US"
+// 不好认，于是在响应里另给一个 target_label 只管展示。地址条目的 TargetLabel
+// 留空，前端回落去显示 Target。
+type aclView struct {
+	model.ACLEntry
+	TargetLabel string `json:"target_label"`
+}
+
+func aclViewOf(e model.ACLEntry) aclView {
+	v := aclView{ACLEntry: e}
+	if model.IsGeoTargetType(e.TargetType) {
+		v.TargetLabel = geoip.DisplayList(e.TargetType, e.Target)
+	}
+	return v
+}
+
+// aclSearchTerms 把一个搜索词展开成 SQL 要匹配的若干词。
+//
+// 列表里地区条目显示的是中文名（"中国香港"），库里存的却是国家码（"HK"）。
+// 只按库里那串 LIKE 的话，用户照着界面上的字去搜一条都搜不到 —— 展示与搜索对不上，
+// 比不显示中文名更让人困惑。所以把中文名反查回国家码一起匹配。
+//
+// 反查依据 geoip 那份**封闭**的常见来源地国家表：查得到就加，查不到就只按原词匹配
+// （未收录的国家本来也只能按码搜）。省份与城市库里存的就是中文，无需展开。
+func aclSearchTerms(keyword string) []string {
+	kw := strings.TrimSpace(keyword)
+	if kw == "" {
+		return nil
+	}
+	terms := []string{kw}
+	// seen 里预置大写原词：搜 "hk" 时不必再补一条 "HK"，LIKE 对 ASCII 本就不区分大小写。
+	seen := map[string]bool{strings.ToUpper(kw): true}
+	for _, c := range geoip.Countries() {
+		if !strings.Contains(c.Name, kw) || seen[c.Code] {
+			continue
+		}
+		seen[c.Code] = true
+		terms = append(terms, c.Code)
+	}
+	return terms
 }
 
 func (s *Server) handleListACL(c *gin.Context) {
@@ -31,12 +77,16 @@ func (s *Server) handleListACL(c *gin.Context) {
 	}
 	page, size := pageParams(c)
 
-	res, err := s.store.ListACL(kind, c.Query("keyword"), page, size)
+	res, err := s.store.ListACL(kind, aclSearchTerms(c.Query("keyword")), page, size)
 	if err != nil {
 		serverErr(c, err)
 		return
 	}
-	ok(c, res)
+	items := make([]aclView, 0, len(res.Items))
+	for _, e := range res.Items {
+		items = append(items, aclViewOf(e))
+	}
+	ok(c, store.Page[aclView]{Items: items, Total: res.Total, Page: res.Page, Size: res.Size})
 }
 
 func (s *Server) handleCreateACL(c *gin.Context) {

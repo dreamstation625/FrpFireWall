@@ -144,6 +144,13 @@ type geoEntry struct {
 	kind string // model.TargetGeoCountry / Province / City
 	// list 是已归一化的地区文本，可含多个值（逗号分隔，任一命中即算命中）。
 	list string
+	// expiresAt 是条目自己的到期时刻，nil 表示永久。
+	//
+	// 它决定命中之后封多久。不带它的话，地区条目命中的封禁时长只能回落到全局
+	// 阶梯，而全局阶梯还会按**该地址自己的封禁历史**升级 —— 结果是同一个条目
+	// 的命中会封出 10 分钟 / 1 小时两种时长，而界面上那条「有效期」压根不参与，
+	// 用户看到的就是"设了 1 小时不管用，同一批地址时长还各不相同"。
+	expiresAt *time.Time
 }
 
 type Manager struct {
@@ -350,7 +357,12 @@ func toGeoEntries(rows []model.ACLEntry, now time.Time) []geoEntry {
 		if list == "" {
 			continue
 		}
-		out = append(out, geoEntry{id: r.ID, kind: r.TargetType, list: list})
+		out = append(out, geoEntry{
+			id:        r.ID,
+			kind:      r.TargetType,
+			list:      list,
+			expiresAt: r.ExpiresAt,
+		})
 	}
 	return out
 }

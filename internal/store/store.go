@@ -262,11 +262,24 @@ func (s *Store) SaveFirewallProfile(p *model.FirewallProfile) error {
 
 // ---------- 黑白名单 ----------
 
-func (s *Store) ListACL(kind, keyword string, page, size int) (*Page[model.ACLEntry], error) {
+// ListACL 分页查询名单。keywords 之间是"或"的关系，任一命中即返回该条。
+//
+// 之所以收一组词而不是一个词：界面里地区条目显示的是中文名，而库里存的是国家码，
+// 照界面上的字搜索必须也能搜到（展开在 api 层做，见 aclSearchTerms）。
+//
+// 多个词必须**各自带括号**再或起来。直接 `q.Where(A).Or(B)` 会拼成
+// `kind = ? AND A OR B` —— AND 优先级高于 OR，于是 B 一旦命中就会把 kind 条件
+// 一起绕过去，白名单页搜出黑名单条目。
+func (s *Store) ListACL(kind string, keywords []string, page, size int) (*Page[model.ACLEntry], error) {
 	q := s.db.Model(&model.ACLEntry{}).Where("kind = ?", kind)
-	if kw := strings.TrimSpace(keyword); kw != "" {
-		like := "%" + kw + "%"
-		q = q.Where("target LIKE ? OR remark LIKE ? OR country LIKE ?", like, like, like)
+	if len(keywords) > 0 {
+		like := "%" + keywords[0] + "%"
+		cond := s.db.Where("target LIKE ? OR remark LIKE ? OR country LIKE ?", like, like, like)
+		for _, kw := range keywords[1:] {
+			l := "%" + kw + "%"
+			cond = cond.Or("target LIKE ? OR remark LIKE ? OR country LIKE ?", l, l, l)
+		}
+		q = q.Where(cond)
 	}
 
 	var total int64

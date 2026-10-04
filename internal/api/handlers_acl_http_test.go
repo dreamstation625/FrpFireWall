@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -440,5 +441,127 @@ func TestUnbanFromRuleLeavesRuleAlone(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("应当留一句「该地址由细分规则拦截」的提示，实际没有（事件 %d 条）", len(ev.Items))
+	}
+}
+
+// 地区条目的地址列要显示中文名，但这只是**展示层**的转换：
+// 库里、匹配时、导出文件里都必须仍是国家码（归一化与命中判定都基于它）。
+func TestACLListShowsGeoNameInChinese(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+		"target":      "hk, jp, sg",
+		"target_type": "geo_country",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("建地区条目应 200，得到 %d %s", code, r.Error)
+	}
+	// 再建一条地址条目：它不该带展示名，前端回落显示原值
+	code, r = h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+		"target": "203.0.113.7",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("建地址条目应 200，得到 %d %s", code, r.Error)
+	}
+
+	code, r = h.call(http.MethodGet, "/api/v1/acl/black?page=1&size=20", nil)
+	if code != http.StatusOK {
+		t.Fatalf("列表应 200，得到 %d %s", code, r.Error)
+	}
+	items, _ := h.data(r)["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("应当有 2 条，实际 %d", len(items))
+	}
+
+	var geo, addr map[string]any
+	for _, it := range items {
+		row, _ := it.(map[string]any)
+		if row["target_type"] == model.TargetGeoCountry {
+			geo = row
+		} else {
+			addr = row
+		}
+	}
+	if geo == nil || addr == nil {
+		t.Fatalf("没找到两条不同类型的条目：%+v", items)
+	}
+
+	if got := geo["target_label"]; got != "中国香港、日本、新加坡" {
+		t.Fatalf("地区条目的展示名 = %v，期望「中国香港、日本、新加坡」", got)
+	}
+	if got := geo["target"]; got != "HK,JP,SG" {
+		t.Fatalf("匹配值被改写了 = %v —— 归一化、命中判定、导出导入都基于它，"+
+			"必须保持国家码 HK,JP,SG", got)
+	}
+	if got := addr["target_label"]; got != "" {
+		t.Fatalf("地址条目不该有展示名，实际 %v", got)
+	}
+
+	// 导出文件也不能因为展示层改中文 —— 导出的行还要能原样导入回来
+	code, body := h.raw(http.MethodGet, "/api/v1/acl/black/export", nil)
+	if code != http.StatusOK {
+		t.Fatalf("导出应 200，得到 %d", code)
+	}
+	if !strings.Contains(body, "country:HK;JP;SG") {
+		t.Fatalf("导出内容里应当是国家码：\n%s", body)
+	}
+	if strings.Contains(body, "中国香港") {
+		t.Fatalf("导出内容里出现了中文名 —— 前缀解析只认国家码，导入会整个失败：\n%s", body)
+	}
+}
+
+// 列表显示中文名之后，搜索也必须能吃中文名。否则用户照着界面上的字搜一条都搜不到 ——
+// 展示与搜索对不上，比不显示中文名更让人困惑。
+//
+// 顺带钉住一个更隐蔽的点：多个搜索词必须**各自带括号**再或起来。写成
+// `kind = ? AND A OR B` 的话（AND 优先级高于 OR），B 命中会把 kind 条件整个绕过去 ——
+// 在黑名单页搜出白名单的条目。下面用"白名单放地区条目、黑名单放无关地址条目"来验它。
+func TestACLSearchMatchesChineseGeoName(t *testing.T) {
+	h := newHarness(t)
+
+	if code, r := h.call(http.MethodPost, "/api/v1/acl/white", map[string]any{
+		"target":      "hk",
+		"target_type": "geo_country",
+	}); code != http.StatusOK {
+		t.Fatalf("建白名单地区条目应 200，得到 %d %s", code, r.Error)
+	}
+	if code, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+		"target": "203.0.113.9",
+	}); code != http.StatusOK {
+		t.Fatalf("建黑名单地址条目应 200，得到 %d %s", code, r.Error)
+	}
+
+	// 白名单：按界面上的中文名搜得到，展示名也是中文
+	code, r := h.call(http.MethodGet, "/api/v1/acl/white?keyword="+url.QueryEscape("香港"), nil)
+	if code != http.StatusOK {
+		t.Fatalf("列表应 200，得到 %d %s", code, r.Error)
+	}
+	d := h.data(r)
+	if d["total"] != float64(1) {
+		t.Fatalf("按中文名「香港」搜白名单应命中 1 条，实际 total=%v", d["total"])
+	}
+	if items, _ := d["items"].([]any); len(items) == 1 {
+		if got := items[0].(map[string]any)["target_label"]; got != "中国香港" {
+			t.Fatalf("展示名 = %v，期望「中国香港」", got)
+		}
+	}
+
+	// 黑名单：同一个词不能把白名单的条目捞出来
+	code, r = h.call(http.MethodGet, "/api/v1/acl/black?keyword="+url.QueryEscape("香港"), nil)
+	if code != http.StatusOK {
+		t.Fatalf("列表应 200，得到 %d %s", code, r.Error)
+	}
+	if got := h.data(r)["total"]; got != float64(0) {
+		t.Fatalf("按「香港」搜黑名单应 0 条，实际 total=%v —— "+
+			"多词 OR 没加括号，kind 条件被绕过去了，白名单的条目被搜出来了", got)
+	}
+
+	// 按国家码本身搜同样要能命中（老习惯不该因为加了中文名而退化）
+	code, r = h.call(http.MethodGet, "/api/v1/acl/white?keyword=HK", nil)
+	if code != http.StatusOK {
+		t.Fatalf("列表应 200，得到 %d %s", code, r.Error)
+	}
+	if got := h.data(r)["total"]; got != float64(1) {
+		t.Fatalf("按国家码 HK 搜应命中 1 条，实际 total=%v", got)
 	}
 }

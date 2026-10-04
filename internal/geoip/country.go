@@ -3,6 +3,8 @@ package geoip
 import (
 	"sort"
 	"strings"
+
+	"github.com/dreamstation625/FrpFireWall/internal/model"
 )
 
 // countryNames 是 ISO 3166-1 alpha-2 → 中文名 的映射。
@@ -63,6 +65,30 @@ func CountryName(code string) string {
 		return n
 	}
 	return code
+}
+
+// DisplayList 把逗号分隔的地区值渲染成中文展示文本，用「、」连接。
+//
+// 只有国家 / 地区码需要翻译（"HK" → "中国香港"）：省份与城市入库时存的就是
+// 归一化后的中文名，这里只去掉多余空白。
+//
+// 这是**纯展示**函数，给列表与事件文案用。入库值、匹配值与导出文件都必须保持
+// 原值（国家码）—— 换成中文名会让 MatchGeo 的归一化、导出导入的前缀解析全部
+// 失配，所以别拿它的返回值去覆盖 Target。
+func DisplayList(targetType, list string) string {
+	values := strings.Split(list, ",")
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if targetType == model.TargetGeoCountry {
+			v = CountryName(v)
+		}
+		out = append(out, v)
+	}
+	return strings.Join(out, "、")
 }
 
 // Country 是国家选项，供前端下拉多选。

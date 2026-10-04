@@ -272,3 +272,30 @@ func TestMergeRegion(t *testing.T) {
 		t.Errorf("两边都没数据时应为空，实际 %q/%q", gotP, gotC)
 	}
 }
+
+// DisplayList 是纯展示转换：只有国家/地区码需要翻中文，省市入库时就是中文。
+//
+// 它绝不能反过来覆写 Target —— 匹配与导出导入用的都是国家码，
+// 表现成"界面上是中国香港、导出出来却匹配不上"。
+func TestDisplayList(t *testing.T) {
+	cases := []struct {
+		name       string
+		targetType string
+		list       string
+		want       string
+	}{
+		{"国家码翻成中文名", model.TargetGeoCountry, "HK,JP", "中国香港、日本"},
+		{"顺带去掉多余空白与大小写差异", model.TargetGeoCountry, " hk , jp ", "中国香港、日本"},
+		{"未收录的国家码原样保留", model.TargetGeoCountry, "ZZ", "ZZ"},
+		{"省份本来就是中文，不翻译", model.TargetGeoProvince, "广东,福建", "广东、福建"},
+		{"城市同理", model.TargetGeoCity, "深圳", "深圳"},
+		{"空串不产出分隔符", model.TargetGeoCountry, "", ""},
+		{"空值被跳过，不留出连续分隔符", model.TargetGeoCountry, "HK,,JP", "中国香港、日本"},
+	}
+	for _, c := range cases {
+		if got := DisplayList(c.targetType, c.list); got != c.want {
+			t.Errorf("%s：DisplayList(%q, %q) = %q，期望 %q",
+				c.name, c.targetType, c.list, got, c.want)
+		}
+	}
+}

@@ -33,6 +33,26 @@ func (m *Manager) JudgeUserConn(clientAddr netip.Addr, remoteAddr, user, proxy s
 	return m.judge(addr, user, model.EvtUserConn, "user-conn", proxy)
 }
 
+// banGeoBlackHit 把"命中地区黑名单条目"落成一次封禁，返回事件文案。
+//
+// 单独抽出来是为了让**封多久**这个决定点能被测到：属地查询依赖真实的
+// mmdb / xdb 文件（仓库里不放这两类库），judge 那条链整个跑不起来，
+// 而地区条目"封多久"恰好是在这里定的。
+//
+// 时长取**条目自己的剩余有效期**，不走全局阶梯 —— 阶梯会按该地址的封禁历史
+// 升级，同一个条目能封出 10 分钟和 1 小时两种时长，而条目上那个「有效期」
+// 完全不参与（见 banStepsForEntry 的说明）。
+func (m *Manager) banGeoBlackHit(
+	addr netip.Addr, geoInfo *geoip.Info, user string, hit *geoEntry, now time.Time,
+) string {
+	reason := fmt.Sprintf("来源属地命中黑名单条目：%s %s",
+		model.GeoTargetLabel(hit.kind), geoip.DisplayList(hit.kind, hit.list))
+	m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo,
+		banStepsForEntry(hit.expiresAt, now),
+		model.BanSourceRef(model.BanRefACL, hit.id))
+	return reason
+}
+
 func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdict {
 	if !addr.IsValid() {
 		return Verdict{Allow: true, Reason: "invalid-address"}
@@ -79,7 +99,8 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 		detail := "命中白名单，放行"
 		if geoWhiteHit != nil && !isWhite {
 			detail = fmt.Sprintf("命中白名单地区条目（%s %s），放行",
-				model.GeoTargetLabel(geoWhiteHit.kind), geoWhiteHit.list)
+				model.GeoTargetLabel(geoWhiteHit.kind),
+				geoip.DisplayList(geoWhiteHit.kind, geoWhiteHit.list))
 		}
 		evt(detail)
 		return Verdict{Allow: true, Reason: "whitelist"}
@@ -105,11 +126,9 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	//
 	// 已知边界：没被命中过的地址在内核里没有任何痕迹，所以地区条目挡的是
 	// "来连 frp"这件事，挡不住别人直接扫其它端口（见 DESIGN D22）。
+	// 封多久由 banGeoBlackHit 定 —— 取条目自己的剩余有效期。
 	if geoBlackHit != nil {
-		reason := fmt.Sprintf("来源属地命中黑名单条目：%s %s",
-			model.GeoTargetLabel(geoBlackHit.kind), geoBlackHit.list)
-		m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo, nil,
-			model.BanSourceRef(model.BanRefACL, geoBlackHit.id))
+		reason := m.banGeoBlackHit(addr, geoInfo, user, geoBlackHit, now)
 		m.pushEvent(&model.Event{
 			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,

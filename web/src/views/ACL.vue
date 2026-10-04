@@ -62,7 +62,12 @@
     >
       <el-table-column prop="target" label="地址" v-bind="cw.col('地址', { minWidth: 170 })">
         <template #default="{ row }">
-          <span class="mono">{{ row.target }}</span>
+          <!-- 地区条目在响应里带 target_label（国家码已翻成中文名）。库里存的仍是
+               国家码，所以 hover 时把原始匹配值露出来，排查时好对照。 -->
+          <el-tooltip v-if="row.target_label" :content="`匹配值：${row.target}`" placement="top">
+            <span>{{ row.target_label }}</span>
+          </el-tooltip>
+          <span v-else class="mono">{{ row.target }}</span>
         </template>
       </el-table-column>
       <el-table-column prop="target_type" label="类型" v-bind="cw.col('类型', { width: 92 })">
@@ -254,12 +259,12 @@
         </el-form-item>
         <el-form-item label="有效期">
           <el-select v-model="form.expires" style="width: 100%">
-            <el-option label="永久" :value="0" />
-            <el-option label="1 小时" :value="3600" />
-            <el-option label="1 天" :value="86400" />
-            <el-option label="7 天" :value="604800" />
-            <el-option label="30 天" :value="2592000" />
+            <el-option v-for="o in expireOptions" :key="o.value" :label="o.label" :value="o.value" />
           </el-select>
+          <div v-if="isGeo" class="hint" style="margin-top: 6px">
+            地区条目上这个有效期还有第二层含义：它同时是<strong>命中之后封多久</strong>。
+            命中即封，封到条目到期为止；选「永久」就是封永久。
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -372,6 +377,16 @@ const TYPE_LABEL: Record<string, string> = {
 const isGeoTarget = (t?: string) => !!t && t.startsWith('geo_')
 const typeLabel = (t?: string) => (t ? TYPE_LABEL[t] || t : '')
 
+// 列表里一行"地址"该显示什么。地区条目用后端给的中文名（target_label），
+// 地址条目就用原值。
+//
+// 换算放在后端而不是这里：国家码到中文名的表在 geoip 包里，同一份表还兼着
+// 搜索时的中文名反查（见 aclSearchTerms）。前端抄一份的话，两边迟早对不上 ——
+// 表现成"列表写着中国香港，搜中国香港却搜不到"。
+function displayTarget(row: any) {
+  return row.target_label || row.target
+}
+
 const kind = ref('white')
 const rows = ref<any[]>([])
 const loading = ref(false)
@@ -379,6 +394,34 @@ const keyword = ref('')
 const page = ref(1)
 const size = ref(20)
 const total = ref(0)
+
+// 有效期的预设档。值就是"从现在起多少秒"，后端按 expires_in_sec 收。
+//
+// 地区条目上这个字段还有第二层含义：它同时是**命中之后封多久**（见后端
+// banStepsForEntry）。地址条目是常驻内核规则，条目在就封着；地区条目没有
+// 内核对象可依赖，所以"封到条目到期为止"要显式落成封禁时长。
+const EXPIRE_OPTIONS = [
+  { label: '永久', value: 0 },
+  { label: '1 小时', value: 3600 },
+  { label: '1 天', value: 86400 },
+  { label: '7 天', value: 604800 },
+  { label: '30 天', value: 2592000 },
+]
+
+// 把"从现在到某个到期时刻"折算成秒。已经到期或没填都按 0（永久）处理 ——
+// 这里的 0 只是"编辑框里选永久"，条目本身是不是已过期由列表的到期列去说。
+function remainSeconds(iso?: string | null) {
+  if (!iso) return 0
+  const left = Math.round((new Date(iso).getTime() - Date.now()) / 1000)
+  return left > 0 ? left : 0
+}
+
+// 把剩余秒数说成人话，给"剩余 42 分钟"这一项用。
+function humanRemain(sec: number) {
+  if (sec >= 86400) return `剩余 ${Math.round(sec / 86400)} 天`
+  if (sec >= 3600) return `剩余 ${Math.round(sec / 3600)} 小时`
+  return `剩余 ${Math.max(1, Math.round(sec / 60))} 分钟`
+}
 
 const editVisible = ref(false)
 const editing = ref(false)
@@ -395,6 +438,18 @@ const form = reactive({
 // 地区条目的多值单独存一份数组：多选组件的 v-model 必须是数组，
 // 而入库形态是逗号分隔的一串。打开弹窗时拆开、保存时拼回去，只在这两处转换。
 const geoValues = ref<string[]>([])
+
+// 有效期的下拉项。编辑已有条目时，库里的到期时刻几乎不会正好落在某个预设档上
+// （比如还剩 3540 秒），只列预设的话 el-select 找不到匹配项就显示成裸数字 ——
+// 用户既看不懂、一保存还容易顺手把它改成别的档。所以缺哪项补哪项，
+// 保留精确的剩余秒数，保存时写回去基本等于"没动过"。
+const expireOptions = computed(() => {
+  const opts = [...EXPIRE_OPTIONS]
+  if (form.expires > 0 && !opts.some((o) => o.value === form.expires)) {
+    opts.push({ label: humanRemain(form.expires), value: form.expires })
+  }
+  return opts
+})
 
 const countries = ref<any[]>([])
 const provinces = ref<any[]>([])
@@ -499,7 +554,10 @@ function openEdit(row: any) {
     // 那一档 —— 选项里没有 ipv4 这一项，直接塞进去会让整个单选组一个都不选中。
     targetType: isGeoTarget(row.target_type) ? row.target_type : 'ip',
     remark: row.remark || '',
-    expires: 0,
+    // 必须按到期时刻回填，不能写死 0（永久）。写死的话，每次打开编辑框看到的
+    // 都是「永久」，而"保存"会把 expires_in_sec=0 发出去、后端把 expires_at
+    // 清成 NULL —— 用户只是进来改个备注，条目却从"1 小时"变成了永久生效。
+    expires: remainSeconds(row.expires_at),
     // 老条目可能是空串，回显成全端口而不是留空，避免用户以为没设置过
     scope: row.scope === 'frp' || row.scope === 'custom' ? row.scope : 'all',
     ports: row.ports || '',
@@ -565,7 +623,7 @@ async function save() {
 
 async function remove(row: any) {
   try {
-    await ElMessageBox.confirm(`确定从${kind.value === 'white' ? '白' : '黑'}名单删除 ${row.target} 吗？`, '确认删除', {
+    await ElMessageBox.confirm(`确定从${kind.value === 'white' ? '白' : '黑'}名单删除 ${displayTarget(row)} 吗？`, '确认删除', {
       type: 'warning',
     })
   } catch {

@@ -422,6 +422,40 @@ func (m *Manager) nextDuration(target string, policy *model.Policy, steps []int6
 	return time.Duration(sec) * time.Second, step + 1
 }
 
+// banStepsForEntry 把"名单条目的到期时刻"翻译成 triggerBan 要的阶梯表。
+//
+// 为什么要单独给地区条目算时长，而不是沿用全局阶梯：那个「有效期」就是用户对
+// "这条拦截持续多久"的声明，无视它会出现两个说不通的现象 ——
+//
+//   - 设成 1 小时的条目，命中后却封 10 分钟（全局阶梯的第一级）；
+//   - 同一个条目的多次命中时长还不一样，因为 nextDuration 会按**该地址自己的
+//     封禁历史**往上升级（默认阶梯 600,3600,86400,0、升级窗口 24 小时）。
+//     一批地址同时被测，有的封 10 分钟有的封 1 小时，看起来毫无规律。
+//
+// 升级阶梯是给频次自动封禁设计的（"这个人屡教不改"）；一条人工写下的地区条目
+// 本来就带着明确的存续期，不该再受该地址历史的影响。
+//
+// 传单元素阶梯等价于"固定时长、不升级"：nextDuration 会把序号夹到 0，
+// 剩下的元素取不到。这与它"返回第几级"的语义不冲突。
+//
+// 与地址黑名单条目也正好对齐 —— 那种条目是常驻内核规则，条目在就封着、
+// 条目删掉或过期就自动放行；地区条目没有内核对象可依赖，所以在这里把
+// "封到条目到期为止"显式写出来，两者的存续期语义才一致。
+func banStepsForEntry(expiresAt *time.Time, now time.Time) []int64 {
+	if expiresAt == nil {
+		// 永久条目 ⇒ 封永久（阶梯里的 0 就是永久），与"永久地址条目"一致。
+		return []int64{0}
+	}
+	sec := int64(expiresAt.Sub(now) / time.Second)
+	if sec < 1 {
+		// 理论上到不了这里：过期条目在 toGeoEntries 就被筛掉了。
+		// 万一撞上（快照刚加载完、条目在这一瞬间到期），封 1 秒 ——
+		// 立刻到期等价于"不封"，比回落全局阶梯封 10 分钟忠实得多。
+		sec = 1
+	}
+	return []int64{sec}
+}
+
 // banPrefix 根据策略决定封禁粒度：单 IP 还是 /24 网段。
 func (m *Manager) banPrefix(addr netip.Addr, policy *model.Policy) netip.Prefix {
 	if policy != nil && policy.BanGranularity == "cidr24" && addr.Is4() {
