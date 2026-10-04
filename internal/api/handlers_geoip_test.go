@@ -35,11 +35,20 @@ func TestGeoSourcesEndpoint(t *testing.T) {
 			t.Fatalf("下载源不是对象：%v", s)
 		}
 		names = append(names, strOf(m, "name"))
-		if strOf(m, "url") == "" || strOf(m, "from") == "" {
-			t.Errorf("下载源缺少 url / from：%v", m)
+		if strOf(m, "url") == "" || strOf(m, "repo") == "" {
+			t.Errorf("下载源缺少 url / repo：%v", m)
 		}
 		if !strings.HasPrefix(strOf(m, "url"), "https://") {
 			t.Errorf("下载源地址必须是 https：%v", m)
+		}
+		// repo 是界面上「前往下载源仓库」的跳转目标，前端直接拿来用。
+		// 退化成 owner/repo 前端就会跳到一个坏链接，而这种错在界面上看不出来。
+		if !strings.HasPrefix(strOf(m, "repo"), "https://") {
+			t.Errorf("下载源 repo 必须是完整 https 地址：%v", m)
+		}
+		// 预估大小显示在下载按钮旁，空着用户就没法预估耗时。
+		if strOf(m, "size") == "" {
+			t.Errorf("下载源缺少预估大小 size：%v", m)
 		}
 	}
 	for i, want := range []string{"GeoLite2-Country.mmdb", "GeoLite2-City.mmdb", "ip2region.xdb"} {
