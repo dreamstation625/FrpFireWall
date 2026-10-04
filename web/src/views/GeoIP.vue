@@ -59,9 +59,22 @@
             >
               下载更新
             </el-button>
-            <span class="hint" :title="db.src ? '上游：' + db.src.from : ''">
-              {{ db.src?.note || '没有可用的下载源' }}
-            </span>
+
+            <template v-if="db.src">
+              <span v-if="db.src.size" class="hint">{{ db.src.size }}</span>
+              <el-link
+                v-if="db.src.repo"
+                type="primary"
+                :href="db.src.repo"
+                target="_blank"
+                rel="noopener noreferrer"
+                :underline="false"
+                class="repo-link"
+              >
+                前往下载源仓库
+              </el-link>
+            </template>
+            <span v-else class="hint">没有可用的下载源</span>
           </div>
         </div>
       </div>
@@ -476,6 +489,10 @@ onMounted(load)
   gap: 10px;
   margin-top: 10px;
   flex-wrap: wrap;
+}
+
+.repo-link {
+  font-size: 13px;
 }
 
 .upload-inner {

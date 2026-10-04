@@ -21,8 +21,13 @@ type Source struct {
 	Name  string `json:"name"`  // 落地文件名，同时也是接口的请求参数
 	Title string `json:"title"` // 界面上显示的名字
 	URL   string `json:"url"`   // 上游原始地址（未加速）
-	From  string `json:"from"`  // 上游仓库，出问题时好去对
-	Note  string `json:"note"`  // 大小、版本之类的提示
+	// Repo 是上游仓库地址，界面上「前往下载源仓库」直接跳它。
+	// 给完整 URL 而不是 owner/repo：跳转目标由后端说了算，前端不去拼域名，
+	// 以后换到非 GitHub 的托管也不用改前端。
+	Repo string `json:"repo"`
+	// Size 是预估大小（带「约」），下载前让用户对耗时有个预期 ——
+	// City 库有 64MB，点下去才发现要等半分钟体验很差。
+	Size string `json:"size"`
 }
 
 var sources = []Source{
@@ -30,22 +35,22 @@ var sources = []Source{
 		Name:  FileCountry,
 		Title: "GeoLite2-Country（国家级）",
 		URL:   "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb",
-		From:  "P3TERX/GeoLite.mmdb",
-		Note:  "约 8MB；地域封禁的基础，没有它国家类规则全部不生效",
+		Repo:  "https://github.com/P3TERX/GeoLite.mmdb",
+		Size:  "约 8MB",
 	},
 	{
 		Name:  FileCity,
 		Title: "GeoLite2-City（城市级）",
 		URL:   "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb",
-		From:  "P3TERX/GeoLite.mmdb",
-		Note:  "约 64MB；补省 / 市，排障时看得更细",
+		Repo:  "https://github.com/P3TERX/GeoLite.mmdb",
+		Size:  "约 64MB",
 	},
 	{
 		Name:  FileRegion,
 		Title: "ip2region（国内细化）",
 		URL:   "https://raw.githubusercontent.com/lionsoul2014/ip2region/refs/heads/master/data/ip2region_v4.xdb",
-		From:  "lionsoul2014/ip2region",
-		Note:  "约 11MB；IPv4 专用（上游文件名 ip2region_v4.xdb），不依赖 MaxMind 账号",
+		Repo:  "https://github.com/lionsoul2014/ip2region",
+		Size:  "约 11MB",
 	},
 }
 

@@ -362,6 +362,11 @@ check "第 3 个落地名" "$(printf '%s' "$GSRC" | jqf data.sources.2.name)" "i
 # 上游文件名和落地名不一样（ip2region_v4.xdb → ip2region.xdb），写错就下不回来
 check_err "ip2region 上游是 v4 文件" "$(printf '%s' "$GSRC" | jqf data.sources.2.url)" "ip2region_v4.xdb"
 check_err "mmdb 取 P3TERX 的 release" "$(printf '%s' "$GSRC" | jqf data.sources.0.url)" "P3TERX/GeoLite.mmdb"
+# 界面上的「前往下载源仓库」直接用 repo，必须是完整 URL（不能是 owner/repo 让前端拼）
+check_err "第 1 个仓库完整地址" "$(printf '%s' "$GSRC" | jqf data.sources.0.repo)" "https://github.com/P3TERX/GeoLite.mmdb"
+check_err "ip2region 仓库地址" "$(printf '%s' "$GSRC" | jqf data.sources.2.repo)" "https://github.com/lionsoul2014/ip2region"
+# 预估大小是下载前唯一的大小提示，界面直接显示
+check "第 1 个带预估大小" "$(printf '%s' "$GSRC" | jqf data.sources.0.size)" "约 8MB"
 check "自动模式的保留值" "$(printf '%s' "$GSRC" | jqf data.auto)" "auto"
 check_list_nonempty "加速源列表非空" "$(printf '%s' "$GSRC" | jqf data.mirrors)"
 check_ok "加速源带 ID" "$(printf '%s' "$GSRC" | jqf data.mirrors.0.id)"

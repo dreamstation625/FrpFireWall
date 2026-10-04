@@ -129,8 +129,17 @@ func TestSourcesAreInstallable(t *testing.T) {
 		if !strings.HasPrefix(s.URL, "https://") {
 			t.Errorf("下载源 %q 的地址必须是 https，得到 %q", s.Name, s.URL)
 		}
-		if s.Title == "" || s.From == "" {
-			t.Errorf("下载源 %q 缺少 Title 或 From: %+v", s.Name, s)
+		if s.Title == "" {
+			t.Errorf("下载源 %q 缺少 Title: %+v", s.Name, s)
+		}
+		// Repo 是界面上「前往下载源仓库」的跳转目标，前端直接拿来用，
+		// 所以必须是完整 URL（不能是 owner/repo 这种让前端去拼的形式）。
+		if !strings.HasPrefix(s.Repo, "https://") {
+			t.Errorf("下载源 %q 的 Repo 必须是完整 https 地址，得到 %q", s.Name, s.Repo)
+		}
+		// Size 是下载前唯一的大小提示，空着用户就没法预估耗时。
+		if s.Size == "" {
+			t.Errorf("下载源 %q 缺少预估大小 Size: %+v", s.Name, s)
 		}
 	}
 }
