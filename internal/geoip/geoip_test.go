@@ -206,3 +206,69 @@ func TestSaveUploadRejectsUnknownName(t *testing.T) {
 		}
 	}
 }
+
+// 省市取哪一个库，判据是"这个国家是不是中文地区"。
+//
+// 这个函数决定的是 Lookup 里那段分流的走向，写错的后果很具体：
+//   - 把国外也算进来 → 国外 IP 的省市被 xdb 的粗粒度英文名（"Queensland"）
+//     盖掉 MaxMind 更准的中文名；
+//   - 把 CN 漏掉 → 国内 IP 的城市退到只到省，而国内恰恰是主要使用场景。
+func TestPreferRegionDB(t *testing.T) {
+	for _, c := range []string{"CN", "HK", "MO", "TW", "cn", " hk "} {
+		if !preferRegionDB(c) {
+			t.Errorf("%q 应当优先用 ip2region 的省市", c)
+		}
+	}
+	// 注意这里判的是"是不是中文地区"，不是政治实体 —— 香港、澳门、台湾
+	// 是中国的一部分，把它们与大陆一起算进来是因为 xdb 对它们同样返回中文名。
+	for _, c := range []string{"", "  ", "US", "JP", "SG", "AU", "GB", "C", "CHN"} {
+		if preferRegionDB(c) {
+			t.Errorf("%q 不该优先用 ip2region 的省市", c)
+		}
+	}
+}
+
+// 省市到底取哪一个库，最终由 mergeRegion 决定。四个象限都要覆盖 ——
+// 这里错了的表现是"国内 IP 的城市退到只到省"或者"国外 IP 的省市被更粗的
+// 英文名盖掉"，两种在界面上都看不出是哪一处的毛病。
+//
+// 用构造出来的记录而不是真库文件：仓库里不放 xdb / mmdb，走集成测试的话
+// 这段分流就一直没被测过。
+func TestMergeRegion(t *testing.T) {
+	// 国内：xdb 给中文、粒度细（广东省/深圳市），MaxMind 只到省甚至给错城市。
+	cnMM := func(p, c string) string {
+		gotP, gotC := mergeRegion("CN", p, c, regionRecord{province: "广东省", city: "深圳市"})
+		return gotP + "/" + gotC
+	}
+	if got := cnMM("北京市", "北京市"); got != "广东省/深圳市" {
+		t.Errorf("国内应当以 xdb 为准，实际 %q", got)
+	}
+	// xdb 在这条记录上没数据（占位 "0"）→ 落回 MaxMind，而不是留空
+	gotP, gotC := mergeRegion("CN", "北京市", "北京市", regionRecord{province: "0", city: "0"})
+	if gotP != "北京市" || gotC != "北京市" {
+		t.Errorf("xdb 无数据时应落回 MaxMind，实际 %q/%q", gotP, gotC)
+	}
+	// 港澳台与大陆同一条路（都是中文地区）
+	for _, cc := range []string{"HK", "MO", "TW"} {
+		if p, _ := mergeRegion(cc, "x", "x", regionRecord{province: "香港", city: "香港"}); p != "香港" {
+			t.Errorf("%s 应当以 xdb 为准，实际 %q", cc, p)
+		}
+	}
+
+	// 国外：MaxMind 的分区数据更全，xdb 只给粗粒度的英文名。
+	gotP, gotC = mergeRegion("AU", "New South Wales", "Sydney",
+		regionRecord{province: "Queensland", city: "Brisbane"})
+	if gotP != "New South Wales" || gotC != "Sydney" {
+		t.Errorf("国外应当以 MaxMind 为准，实际 %q/%q", gotP, gotC)
+	}
+	// MaxMind 没有分区数据（只有国家库没城市库）→ 用 xdb 兜住，别留空
+	gotP, gotC = mergeRegion("AU", "", "", regionRecord{province: "Queensland", city: "Brisbane"})
+	if gotP != "Queensland" || gotC != "Brisbane" {
+		t.Errorf("MaxMind 无数据时应落回 xdb，实际 %q/%q", gotP, gotC)
+	}
+	// 全空就是空，不要凭空造出 "0"
+	gotP, gotC = mergeRegion("", "", "", regionRecord{province: "0", city: "Reserved"})
+	if gotP != "" || gotC != "" {
+		t.Errorf("两边都没数据时应为空，实际 %q/%q", gotP, gotC)
+	}
+}

@@ -367,3 +367,92 @@ func TestRateRuleCountryListIsUppercased(t *testing.T) {
 		}
 	}
 }
+
+// 城市要进 HasGeoCondition：漏掉它的表现是"只按城市匹配的规则"被判成
+// "没有任何匹配条件"，保存直接被拒。
+func TestRateRuleHasGeoConditionIncludesCities(t *testing.T) {
+	if (&RateRule{Cities: "深圳"}).HasGeoCondition() != true {
+		t.Error("只填城市也算有地区条件")
+	}
+	if (&RateRule{Cities: "深圳市"}).HasGeoCondition() != true {
+		t.Error("城市归一化不该影响「有没有条件」这个判断")
+	}
+	if (&RateRule{Cities: "0"}).HasGeoCondition() != true {
+		// 占位值在 Validate 里会被挡下（归一到空）。这里返回 true 只是说
+		// "字段上有东西"，不是"这条规则有效"—— 两件事不能混。
+		t.Error("字段上有内容就该算有地区条件，有效性由 Validate 判")
+	}
+	if (&RateRule{CIDRs: "1.2.3.4"}).HasGeoCondition() {
+		t.Error("网段条件不是地区条件")
+	}
+}
+
+// 拦截动作与限速/封禁互斥，且必须落在应用层（内核只能丢包）。
+func TestRateRuleValidateBlock(t *testing.T) {
+	// 只开拦截，别的都不配 —— 合法。
+	if err := (&RateRule{Name: "整段拉黑", Countries: "HK", Block: true}).Validate(); err != nil {
+		t.Errorf("只开直接拦截应当合法，实际：%v", err)
+	}
+
+	cases := []struct {
+		name string
+		rule RateRule
+		want string
+	}{
+		{
+			"拦截 + 限速",
+			RateRule{Name: "x", Countries: "HK", Block: true, PerSec: 5},
+			"只保留一个",
+		},
+		{
+			"拦截 + 封禁阈值",
+			RateRule{Name: "x", Countries: "HK", Block: true,
+				WindowSeconds: 60, Threshold: 10, BanDurations: "60"},
+			"只保留一个",
+		},
+		{
+			// 端口落内核，内核只能丢包、表达不出"拒绝"这一步
+			"拦截 + 端口",
+			RateRule{Name: "x", Ports: "443", Block: true},
+			"去掉端口条件",
+		},
+	}
+	for _, c := range cases {
+		err := c.rule.Validate()
+		if err == nil {
+			t.Errorf("%s：应当被拒绝", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s：错误信息里没有 %q：%v", c.name, c.want, err)
+		}
+	}
+}
+
+// 城市填了却一个有效值都不剩，不能存进去。
+//
+// 城市候选集开放、不查真实性（写错城市名不报错是刻意的取舍，见 CanonicalCity），
+// 但"整串都是占位值"必须挡 —— 那种规则会永远不命中，属于"配了等于没配"。
+//
+// 两条路径都要覆盖，因为它们的**报错文案不同**：
+//   - 结构化构造（或手工改过的库行）直接 Validate：Cities 还是原始值 "0"，
+//     由城市那条检查给出专门的提示；
+//   - 接口那条路先 Normalize 再 Validate：Cities 已经被归一成空串，
+//     城市检查看不见它了，最后由"没有任何匹配条件"兜住。
+//
+// 两条都必须拒绝，只是谁先开口的区别。
+func TestRateRuleValidateRejectsEmptyCity(t *testing.T) {
+	raw := RateRule{Name: "x", Cities: "0"}
+	if err := raw.Validate(); err == nil || !strings.Contains(err.Error(), "城市") {
+		t.Errorf("未经归一化的占位城市应当由城市检查直接拒绝，实际：%v", err)
+	}
+
+	normalized := RateRule{Name: "x", Cities: "0"}
+	normalized.Normalize()
+	if normalized.Cities != "" {
+		t.Fatalf("占位城市归一化后应为空串，实际 %q", normalized.Cities)
+	}
+	if err := normalized.Validate(); err == nil {
+		t.Error("归一化之后仍然必须被拒绝（此时由「没有任何匹配条件」兜住）")
+	}
+}

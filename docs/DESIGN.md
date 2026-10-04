@@ -783,6 +783,129 @@ udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_p_xxxxxxxx drop comm
 `guard/retention_test.go`（热更改小后立刻清、0 不清理、负数夹取、启动值取自配置）。
 
 
+### D22. 地区（国家/省份/城市）拦截落在应用层，命中之后封的是那个具体 IP
+
+**需求**：黑名单条目与细分规则都要能按国家 / 省份 / 城市直接拦截；
+"防火墙层面不好设置的话，可以做应用层"。
+
+**地区条件不可能下沉到内核**，这是 mmdb / ip2region 这类库的性质决定的：它们都是
+**查询型**库（给一个 IP 返回属地），没法反向枚举出"某个国家的 CIDR 列表"。
+不是"懒得做"，是做不出来 —— 想让内核按地区丢包，得先把地区展开成网段集合，
+而这个展开动作没有数据源。
+
+所以地区条件只有一条落地路径，而且这条路径**项目里早就有**：
+全局地域封禁（`policy.geoip_block_*`）走的就是"应用层认出属地 → 把这个具体 IP
+落进内核封禁"。地区条目与细分规则的「直接拦截」复用的是同一套（`triggerBan`），
+差别只在名单来源：那里是全局策略里的一串国家码，这里是人工条目 / 一条规则。
+
+**由此产生的边界必须写在界面上**（已写）：内核里没有"地区"这个对象，所以地区条目
+**一条内核规则都不产生**。挡的是"来连 frp"这件事 —— 地址第一次来访时被拒并封进内核，
+之后它连别的端口也进不来；但**从没来访过的地址在内核里没有任何痕迹**，
+直接扫其它端口不受这条约束。要"整段地区在内核层面挡住"是做不到的，
+只能靠全局地域封禁把命中的地址逐个封掉，同样是"先来访再封"。
+
+**粒度之间是互斥的，不是 OR。** 一条条目只装一个粒度：国家码、省份、城市三选一。
+"拒绝 CN 或 深圳"在语义上等价于"拒绝 CN"，混在一个字段里只会让"到底拒了什么"
+说不清。粒度**内部**可以填多个值（`CN,US` / `广东,福建` / `深圳`），逗号分隔，
+命中任意一个即算命中。
+
+**校验强度按候选集是否封闭来定，三种粒度刻意不同**：
+
+| 粒度 | 归一化 | 真实性校验 | 理由 |
+|---|---|---|---|
+| 国家码 | 大写、去重 | **不做**，只查两位字母 | 能查的只有 `geoip` 那份国家表，而它是刻意只收常见来源地的；拿它当白名单会把哈萨克斯坦、古巴、巴拿马这类真实国家一起拒掉 |
+| 省份 | 去「省 / 自治区 / 特别行政区」后缀、剥「中国」前缀 | **做**（34 个省级行政区，候选集完整封闭） | 写错的后果是静默不命中，而候选集是完整的 —— 报错是唯一合理的处理 |
+| 城市 | 去「市」后缀、剥「中国」前缀、`"0"` 视为空 | **不做**（候选集开放） | 全国几百个地级市加国外城市，列不全 |
+
+国家和城市因此共享同一个已知边界：**写错不会报错，只会永远不命中**。
+界面上的提示与「属地查询」工具是给这个边界兜底的最后一环；这也是
+`model.CanonicalCity` 只去「市」、不动「区 / City / -shi」的原因 —— 猜得越多，
+错得越隐蔽。补救措施是把两个国家的下拉都放开为可自由输入（`allow-create`），
+未收录的国家至少能配得出来。
+
+**查询侧必须过与名单侧同一套归一化**（`model.MatchGeo`）。名单侧在保存时已经归一化
+（存的是「广东」），而属地库返回的是「广东省」；查询侧不归一就永远对不上，
+而且是**静默不命中** —— 省份上踩过这个坑（见 `province.go` 的注释），城市同理。
+
+**属地查不到时算不命中**，不是"命中所有"。反过来做的话，"只封某国"会在属地库
+没加载的机器上变成"封住所有人"，而那台机器上恰好可能还没有库文件。
+
+**地区条目不进内核，但必须被内核相关的两条路径显式跳过**：
+`toPrefixes` / `toBlockTargets` 开头都判一次 `model.IsGeoTargetType` 并 `continue`。
+靠"它恰好解析不出来"太脆 —— `TargetType` 以后再多一种形态就会悄悄漏进来。
+
+**细分规则里的「直接拦截」是同一件事的一种写法**，因此共用同一条约束：
+拦截落在应用层 ⇒ 不能带端口条件（端口只有内核能判，内核只能丢包、表达不出"拒绝"
+这一步）、也不能同时配限速与封禁阈值（命中就被拒了，那些参数永远轮不到生效）。
+`Validate()` 直接拒绝这两种组合，前端也把对应控件置灰。
+
+**导出的地区条目必须带类型前缀**（`country:CN` / `province:广东` / `city:深圳`，
+多值用分号）。不带前缀的"CN"、"深圳"在导入端只能被当地址解析、报"非法的 IP 地址"，
+等于地区条目根本没法留档、没法换机器搬。用分号而不是逗号是因为逗号是列分隔符
+（同 D14 的端口列表）。反过来，**没有前缀的一律按地址解析**：
+老版本导出的文件里全是裸地址，不改一个字节就要能导入。
+
+**测试**：`model/geo_test.go`（三种粒度的归一化与校验强度、`MatchGeo` 的查询侧
+归一化与空属地不命中）、`geoip/geoip_test.go` 的 `TestMergeRegion` /
+`TestPreferRegionDB`、`guard/geo_test.go`（地区条目不产生内核规则、过期与空值被筛掉、
+命中来源引用指向具体条目）、`api/handlers_acl_test.go` 的导出导入闭环与报错文案、
+`api/handlers_acl_http_test.go` 的端到端（含"国家码只校验格式"这条边界）。
+
+
+### D23. 封禁记录带来源引用，来源消失或手工解封时按它反向清理
+
+**需求**："封禁 ip 后解禁了也需要关联去把该 ip 解禁"，确认覆盖两个场景：
+删/停用源条目时联动解禁、手动解禁时清掉背后的条目。
+
+两个场景都要"知道这条封禁是谁造成的"，所以 `BanRecord` 加了 `SourceRef`，
+形如 `acl:12` / `rule:466972c4`。
+
+**规则那一侧不能用规则 ID 做引用。** `rate_rules` 表是整体替换的
+（`replaceRateRulesTx` 先删全部再重插，见 store 的注释），**ID 每次保存都会变**。
+拿 ID 当引用的话，保存一次规则之后历史封禁里的 `rule:5` 就指向了另一条规则 ——
+删掉它会把不相干的地址一起解封。改用**内容签名**：`fnv32a` 哈希
+`Block|Countries|Provinces|Cities|CIDRs|Ports`，只取影响判定的字段。
+名字与备注**不在**签名里：改个名字不该让谁解封；而条件一改，旧的封禁依据就不成立了，
+旧签名随之消失、由它封的地址跟着解封，正是想要的。停用的规则直接返回空引用，
+于是"停用"天然落进"旧签名消失"那一类，不需要单独判一次。
+
+**ID 形态不同这件事必须显式处理，不然会静默失效。** 名单条目引用带自增主键
+（十进制），规则引用带十六进制哈希。曾经的写法是"先 `ParseBanSourceRef` 解析出
+(Type, ID)，再看 Type 分支" —— 而规则引用解析不出十进制 ID，第一步就 `ok=false`
+返回了，于是那句「该地址由细分规则拦截：解封后若规则仍启用，下次连接会再次命中」
+的提示**从来没出现过**。现在分工是：先用 `BanSourceRefKind`（只切类型、不碰标识）
+决定走哪条分支，需要 ID 的那一支再 `ParseBanSourceRef`。
+`ParseBanSourceRef` 对规则引用返回 `ok=false` 是**设计**，不是 bug ——
+让"取不到 ID"显式暴露，而不是塞一个 0 给调用方去 `GetACL(0)`。
+（顺带一提：十六进制签名有可能整串都是数字，那时 `ParseBanSourceRef` 会"成功"，
+所以类型判断**只能**信 `BanSourceRefKind`。）
+
+**`banState`（内存）才是权威，防火墙规则只是它的投影。** 所以联动解禁
+（`ReleaseBansByRef`）扫的是内存再按 `RecordID` 回写库：只扫库的话，
+"库里状态已经变了但内存还没刷新"的那些会漏掉，表现就是"删了条目、地址还是进不来"。
+空的 `ref` 直接返回 0 —— 不拦的话它会把所有"没有来源"的封禁（频次自动封禁、
+人工封禁）一网打尽。
+
+**手动解封时清理背后的条目有两道边界**：
+
+- **条目的 Target 必须精确等于被封的地址**。条目是网段（`1.2.3.0/24`）时，
+  删掉它等于顺手放行另外 255 个地址，那超出了用户点这一次解封的授权范围 ——
+  这种情况只解封、不动条目。比对必须把两边都归一成前缀形态（`sameTarget`）：
+  封禁记录的 Target 来自 `banPrefix`，按封禁粒度可能带掩码，而条目里存的是裸 IP，
+  直接比字符串会把"同一个地址"判成不同，于是该清的条目清不掉。
+- **只管名单条目**。规则是条件型的（"来自某地区的一律拦"），没法从中"移除一个地址"，
+  强行动作只会把整条规则改坏。这种情况只记一笔事件把话说清楚，让用户自己决定。
+
+**响应字段是计数，不是布尔。** `source_entry_removed` 在单条解封与批量解封两个接口
+上口径一致（0/1 与 N）：一个给布尔、另一个给数字的话，前端得为同一个字段写两种判断。
+
+**测试**：`model/banref_test.go`（引用格式、`BanSourceRefKind`、签名的敏感/不敏感字段、
+`RateRuleBanRefs` 跳过空引用）、`guard/geo_test.go`（规则命中即拦截 → 来源引用 →
+按引用解禁、无命中不算错误）、`store/store_test.go`（只解禁给定 ID、计数口径）、
+`api/handlers_acl_http_test.go`（手工解封清掉背后的条目、网段条目只解封不动、
+规则来源只留提示不动规则）。
+
+
 ## 3. 总体架构
 
 ```
@@ -1222,6 +1345,15 @@ Reserved|Reserved|Reserved|0|0          ← 保留地址段
 - **国家封禁只在应用层生效**（见 D8）：命中国家黑/白名单策略时拒绝这一次插件回调，
   不往内核写任何国家相关的规则或集合。所以内核里不存在 `frpfirewall_geo_*` 这类对象，
   `frpfirewall-panic.sh` 也不需要清理它们。
+- **省市的取值来源按国家分流**（`mergeRegion` / `preferRegionDB`，见 D22）：两个库的强项
+  正好互补 —— xdb 面向中文地区（中国大陆与港澳台返回中文省市名，精度高于 MaxMind，
+  后者在国内经常只到省、甚至给错城市），这些地区之外 xdb 只给英文名、粒度也更粗
+  （`1.1.1.1` → `Queensland` / `Brisbane`），而 MaxMind 有更完整的分区数据、
+  带 zh-CN 翻译时优先取中文。所以不是"哪个库为主"，而是**中文地区信 xdb、其余信 MaxMind，
+  两边互相兜底**（先取的那边是占位值就落到另一边）。国家与大陆始终取 MaxMind（xdb 的
+  ISO 码兜底），**ISP 始终取 xdb** —— MaxMind 的运营商数据在单独的付费库里。
+  一刀切"xdb 无条件覆盖"会让国外 IP 的省市被更粗的英文数据盖掉；一刀切"MaxMind 为主"
+  则会把国内城市降到只到省，而国内恰恰是主要使用场景。
 
 ### 4.7 数据模型（SQLite）
 
@@ -1230,8 +1362,9 @@ Reserved|Reserved|Reserved|0|0          ← 保留地址段
 CREATE TABLE acl_entries (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   kind         TEXT    NOT NULL,        -- 'white' | 'black'
-  target       TEXT    NOT NULL,        -- IP 或 CIDR
-  target_type  TEXT    NOT NULL,        -- 'ipv4' | 'ipv6' | 'cidr4' | 'cidr6'
+  target       TEXT    NOT NULL,        -- IP 或 CIDR；地区条目存归一化后的地名，逗号分隔
+  target_type  TEXT    NOT NULL,        -- 'ipv4'|'ipv6'|'cidr4'|'cidr6'
+                                        -- 地区条目另取 'geo_country'|'geo_province'|'geo_city'（见 D22）
   scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp' | 'custom'，只对黑名单有意义（见 D14）
   ports        TEXT    NOT NULL DEFAULT '',     -- 仅 scope=custom 时有意义，归一化后逗号分隔（见 D14）
   remark       TEXT,
@@ -1252,6 +1385,7 @@ CREATE TABLE ban_records (
   ports        TEXT    NOT NULL DEFAULT '',     -- 仅 scope=custom 时有意义（见 D14）
   reason       TEXT,
   source       TEXT    NOT NULL,        -- auto | manual | geoip
+  source_ref   TEXT    NOT NULL DEFAULT '', -- 因为谁被拉的：'acl:12' | 'rule:<内容签名>'（见 D23）
   trigger_user TEXT,                    -- 触发封禁的 frp user
   hit_count    INTEGER DEFAULT 1,       -- 阶梯次数
   country      TEXT,
@@ -1262,6 +1396,8 @@ CREATE TABLE ban_records (
   released_by  TEXT
 );
 CREATE INDEX idx_ban_active ON ban_records(status, expires_at);
+-- 按来源引用反查 / 计数（"这条名单项还压着几个地址" / "停用规则后要解禁哪些地址"）
+CREATE INDEX idx_ban_ref ON ban_records(source_ref, status);
 
 -- 策略（单行配置，或 key-value）
 CREATE TABLE policies (
@@ -1282,12 +1418,15 @@ CREATE TABLE policies (
 CREATE TABLE rate_rules (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   name           TEXT    NOT NULL,
-  -- 注意这里**没有** DEFAULT：GORM 对"带默认值的字段"会在 INSERT 时跳过零值，
-  -- 布尔字段的零值恰好是 false，加默认值会让显式写入的 false 被丢掉、存成 true
+  -- 注意 enabled 这里**没有** DEFAULT：GORM 对"带默认值的字段"会在 INSERT 时跳过零值，
+  -- 布尔字段的零值恰好是 false，**默认值为 true 时**会让显式写入的 false 被丢掉、
+  -- 存成 true（实测过）。所以要去掉 DEFAULT 的只有"默认值为 true"的布尔列；
+  -- 默认值本身是 false 的列（如下面的 block）省略与不省略结果一致，不受影响。
   enabled        INTEGER NOT NULL,
   priority       INTEGER NOT NULL DEFAULT 0,
   countries      TEXT    NOT NULL DEFAULT '',  -- ISO 码，逗号分隔
   provinces      TEXT    NOT NULL DEFAULT '',  -- 归一化后的省份名，逗号分隔
+  cities         TEXT    NOT NULL DEFAULT '',  -- 归一化后的城市名，逗号分隔（见 D22）
   cidrs          TEXT    NOT NULL DEFAULT '',  -- 来源 IP / 网段
   ports          TEXT    NOT NULL DEFAULT '',  -- 非空 ⇒ 落内核层
   per_sec        INTEGER NOT NULL DEFAULT 0,
@@ -1295,6 +1434,7 @@ CREATE TABLE rate_rules (
   window_seconds INTEGER NOT NULL DEFAULT 0,   -- 0 = 这条规则不封禁
   threshold      INTEGER NOT NULL DEFAULT 0,
   ban_durations  TEXT    NOT NULL DEFAULT '',  -- 本规则自己的阶梯，逗号分隔
+  block          INTEGER NOT NULL DEFAULT 0,   -- 命中即拒绝，不等频次也不封禁（见 D22）
   remark         TEXT,
   created_at     DATETIME NOT NULL,
   updated_at     DATETIME NOT NULL

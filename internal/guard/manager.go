@@ -26,13 +26,17 @@ type banState struct {
 	// Scope 封禁范围（all | frp | custom）。自动封禁固定 all，手动封禁可指定。
 	Scope string
 	// Ports 只在 Scope == custom 时有值（见 blockTarget 的同名字段）。
-	Ports    portrange.Set
-	Reason   string
-	Source   string
-	User     string
-	RecordID uint
-	HitCount int
-	BannedAt time.Time
+	Ports  portrange.Set
+	Reason string
+	Source string
+	// SourceRef 是触发这条封禁的来源引用（"acl:12" / "rule:5"），空表示
+	// 频次自动封禁、人工封禁或全局地域名单。解禁时要顺着它决定"要不要
+	// 连背后的名单条目一起清掉"（见 Manager.ReleaseBansByRef）。
+	SourceRef string
+	User      string
+	RecordID  uint
+	HitCount  int
+	BannedAt  time.Time
 	// Expires 为零值表示永久封禁。
 	Expires  time.Time
 	Country  string
@@ -60,9 +64,14 @@ type BanView struct {
 	Scope string `json:"scope"`
 	// Ports 是 scope=custom 时的端口文本，其余范围为空的。前端直接展示，
 	// 不做结构转换 —— 与 RateRule.Ports 的口径一致。
-	Ports        string     `json:"ports"`
-	Reason       string     `json:"reason"`
-	Source       string     `json:"source"`
+	Ports  string `json:"ports"`
+	Reason string `json:"reason"`
+	Source string `json:"source"`
+	// SourceRef 指向触发这条封禁的具体来源（"acl:12" / "rule:3a7f"），
+	// 频次自动封禁与全局地域名单为空。前端用它判断"手动解封时要不要连带
+	// 清掉背后那条名单条目"—— 只看 source 是不够的：同为名单来源的封禁里，
+	// 也必须知道是哪一条才能说得清后果。
+	SourceRef    string     `json:"source_ref"`
 	User         string     `json:"user"`
 	RecordID     uint       `json:"record_id"`
 	HitCount     int        `json:"hit_count"`
@@ -122,6 +131,21 @@ type blockTarget struct {
 	Ports portrange.Set
 }
 
+// geoEntry 是一条「地区条目」在运行时的形态（黑名单或白名单里的国家/省/市）。
+//
+// 它与 blockTarget 并列而不是混进去：blockTarget 是 netip.Prefix，要参与内核
+// 规则的编译；地区条目恰恰相反 —— 它**一条内核规则都不产生**，只在插件判定时
+// 拿属地库的查询结果做比较。混在一起会让"名单 → 内核规则"那条路径到处判类型。
+//
+// 落地的办法是命中之后把这个具体 IP 封掉（triggerBan），与全局地域封禁同一套
+// 手法 —— 内核认不出属地，那就让应用层认出来、再把结果落进内核。
+type geoEntry struct {
+	id   uint
+	kind string // model.TargetGeoCountry / Province / City
+	// list 是已归一化的地区文本，可含多个值（逗号分隔，任一命中即算命中）。
+	list string
+}
+
 type Manager struct {
 	cfg   *config.Config
 	store *store.Store
@@ -134,8 +158,12 @@ type Manager struct {
 	protect *protector
 	white   []netip.Prefix
 	black   []blockTarget
-	bans    map[string]*banState
-	windows map[string]*hitWindow
+	// geoWhite / geoBlack 是名单里的地区条目，与上面的 IP 名单并列。
+	// 判定时两者都看：命中任一即算命中白/黑名单。
+	geoWhite []geoEntry
+	geoBlack []geoEntry
+	bans     map[string]*banState
+	windows  map[string]*hitWindow
 
 	// appRules 是按优先级排好的细分规则（应用层那部分）。
 	// kernelRules 是细分规则里落在内核的那部分，交给驱动编译成限速规则。
@@ -257,12 +285,18 @@ func (m *Manager) Refresh() error {
 	now := time.Now()
 	white := toPrefixes(whiteRows, now)
 	black := toBlockTargets(blackRows, now)
+	// 同一批行再过一遍地区口径：一条行只会落进其中一边（类型互斥），
+	// 所以两份切片加起来正好覆盖整张名单。
+	geoWhite := toGeoEntries(whiteRows, now)
+	geoBlack := toGeoEntries(blackRows, now)
 
 	m.mu.Lock()
 	m.policy = policy
 	m.protect = prot
 	m.white = white
 	m.black = black
+	m.geoWhite = geoWhite
+	m.geoBlack = geoBlack
 	m.appRules = appRules
 	m.kernelRules = kernelRules
 	m.ruleProblems = skipped
@@ -278,6 +312,12 @@ func (m *Manager) Refresh() error {
 func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 	out := make([]netip.Prefix, 0, len(rows))
 	for _, r := range rows {
+		// 地区条目的是 ISO 码/地名，不是地址，走 toGeoEntries。
+		// 显式判类型而不是等 parsePrefixOrAddr 失败：依赖"恰好解析不出来"
+		// 太脆，将来 TargetType 再多一种形态就会悄悄漏进来。
+		if model.IsGeoTargetType(r.TargetType) {
+			continue
+		}
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
 			continue
 		}
@@ -290,6 +330,31 @@ func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 	return out
 }
 
+// toGeoEntries 挑出名单里的地区条目（国家 / 省份 / 城市）。
+//
+// 与 toPrefixes 是**互补**的两拨：地区条目的 Target 不是 IP，压根进不了
+// toPrefixes（解析会失败被跳过），所以这里单独收一遍。两条路径都跳过已过期
+// 的条目，规则一致。
+func toGeoEntries(rows []model.ACLEntry, now time.Time) []geoEntry {
+	out := make([]geoEntry, 0, 4)
+	for _, r := range rows {
+		if !model.IsGeoTargetType(r.TargetType) {
+			continue
+		}
+		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
+			continue
+		}
+		list := strings.TrimSpace(r.Target)
+		// 空值不该出现（接口层会拦），但库里可能有手工写坏的行。
+		// 放进去只会让每次判定白比一遍空串。
+		if list == "" {
+			continue
+		}
+		out = append(out, geoEntry{id: r.ID, kind: r.TargetType, list: list})
+	}
+	return out
+}
+
 // toBlockTargets 把黑名单行转成带范围的条目，跳过已过期和解析失败的。
 //
 // 范围缺失或非法一律按 all 处理。空值是真会出现的：AutoMigrate 加列前写入的
@@ -298,6 +363,11 @@ func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 func toBlockTargets(rows []model.ACLEntry, now time.Time) []blockTarget {
 	out := make([]blockTarget, 0, len(rows))
 	for _, r := range rows {
+		// 地区条目一条内核规则都不产生 —— 内核认不出属地（见 geoEntry 的注释）。
+		// 它命中的落地方式是"把这个具体 IP 封掉"，由判定链做，不在这里。
+		if model.IsGeoTargetType(r.TargetType) {
+			continue
+		}
 		if r.ExpiresAt != nil && !r.ExpiresAt.After(now) {
 			continue
 		}
@@ -362,18 +432,19 @@ func (m *Manager) rebuildBans() error {
 			scope, ports = model.ScopeAll, nil
 		}
 		st := &banState{
-			Prefix:   p,
-			Target:   r.Target,
-			Scope:    scope,
-			Ports:    ports,
-			Reason:   r.Reason,
-			Source:   r.Source,
-			User:     r.TriggerUser,
-			RecordID: r.ID,
-			HitCount: r.HitCount,
-			BannedAt: r.BannedAt,
-			Country:  r.Country,
-			Province: r.Province,
+			Prefix:    p,
+			Target:    r.Target,
+			Scope:     scope,
+			Ports:     ports,
+			Reason:    r.Reason,
+			Source:    r.Source,
+			SourceRef: r.SourceRef,
+			User:      r.TriggerUser,
+			RecordID:  r.ID,
+			HitCount:  r.HitCount,
+			BannedAt:  r.BannedAt,
+			Country:   r.Country,
+			Province:  r.Province,
 		}
 		if r.ExpiresAt != nil {
 			st.Expires = *r.ExpiresAt
@@ -703,6 +774,7 @@ func (m *Manager) Bans() []BanView {
 			Ports:     b.Ports.String(),
 			Reason:    b.Reason,
 			Source:    b.Source,
+			SourceRef: b.SourceRef,
 			User:      b.User,
 			RecordID:  b.RecordID,
 			HitCount:  b.HitCount,
@@ -1068,6 +1140,27 @@ func (m *Manager) matchAnyBlockLocked(list []blockTarget, addr netip.Addr) bool 
 		}
 	}
 	return false
+}
+
+// matchGeoLocked 判断属地是否命中地区名单，返回命中的那一条（未命中返回 nil）。
+// 调用方需持有锁。
+//
+// 传进去的是属地的三个**原始**字段，归一化由 model.MatchGeo 统一做 ——
+// 名单侧保存时已经归一化过，查询侧不过同一遍归一化就永远对不上，
+// 而且不报错（省份上踩过的坑，见 province.go）。
+//
+// 返回的是切片内元素的指针。名单是 Refresh 时整体换掉的（不是原地改），
+// 所以拿到指针之后在锁外继续用是安全的，与 matchAppRule 同一个理由。
+func (m *Manager) matchGeoLocked(list []geoEntry, geo *geoip.Info) *geoEntry {
+	if geo == nil {
+		return nil
+	}
+	for i := range list {
+		if model.MatchGeo(list[i].kind, list[i].list, geo.Country, geo.Province, geo.City) {
+			return &list[i]
+		}
+	}
+	return nil
 }
 
 // blockScopeLocked 返回地址命中的黑名单范围，未命中返回空串。调用方需持有锁。

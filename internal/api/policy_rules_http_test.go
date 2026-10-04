@@ -118,6 +118,42 @@ func (h *harness) data(r resp) map[string]any {
 	return m
 }
 
+// raw 取原始响应体。
+//
+// 专给出文件类接口用（导出名单、导出规则）：它们返回的是 text/plain 而不是
+// 那个 {ok,data} 信封，走 call 会被当成解析失败。导出内容的格式本身就是被测对象
+// ——前缀怎么写的、多值用什么分隔符 —— 所以必须看原文，不能先解析成结构。
+func (h *harness) raw(method, path string, body any) (int, string) {
+	h.t.Helper()
+
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequest(method, h.ts.URL+path, rdr)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	out, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(out)
+}
+
 // policyBody 取当前策略作为请求体模板。
 //
 // id / updated_at 要删掉：它们由服务端决定，带上只会让人以为客户端能改。

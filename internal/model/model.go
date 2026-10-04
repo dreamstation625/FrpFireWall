@@ -73,6 +73,12 @@ const (
 	SourceManual = "manual" // 人工封禁
 	SourceGeoIP  = "geoip"  // 命中国家/地区封禁
 	SourceSystem = "system" // 系统内置保护项
+	// SourceRule 细分规则的「命中即拦截」。
+	//
+	// 与 SourceAuto 分开：那一个说的是"次数攒够了"，这一个说的是"条件对上了"，
+	// 界面上要分别显示，排障时也要一眼看出是"他来得太频繁"还是"他就是那个
+	// 地区的人"。
+	SourceRule = "rule"
 )
 
 // 封禁状态
@@ -133,9 +139,22 @@ type BanRecord struct {
 	// Scope 封禁范围（all | frp | custom），与 ACLEntry 同义。默认 all。
 	Scope string `gorm:"size:8;not null;default:all" json:"scope"`
 	// Ports 是 ScopeCustom 下要封的目的端口，与 ACLEntry 同义。默认空。
-	Ports       string     `gorm:"size:512;not null;default:''" json:"ports"`
-	Reason      string     `gorm:"size:255" json:"reason"`
-	Source      string     `gorm:"index;size:16;not null" json:"source"`
+	Ports  string `gorm:"size:512;not null;default:''" json:"ports"`
+	Reason string `gorm:"size:255" json:"reason"`
+	Source string `gorm:"index;size:16;not null" json:"source"`
+	// SourceRef 是触发这条封禁的来源引用，形如 "acl:12" / "rule:5"。
+	// 按频次自动封禁、人工封禁、系统保护项都为空。
+	//
+	// 为什么需要它：来源条目被删除或停用时，由它封掉的地址应当一起解封 ——
+	// 否则"删掉了一条名单，被它封的地址还是进不来"，而界面上已经看不到那条
+	// 名单了，用户只能去封禁列表里一个个手点。反过来，手动解封一个地址时也要
+	// 能顺着它找到"是哪条条目把它挡在外面的"：找不到的话，解禁当场生效、
+	// 下次连接又被同一条条目挡回去，用户看到的是"解禁没起作用"。
+	//
+	// 用文本引用而不是两个可空外键列：来源目前只有"名单条目"和"细分规则"两种，
+	// 每加一种来源就要加一列的话，查询和迁移都会跟着长；而查它只需要一次等值
+	// 比较。解析与拼装集中在 BanSourceRef / ParseBanSourceRef。
+	SourceRef   string     `gorm:"index;size:32;not null;default:''" json:"source_ref"`
 	TriggerUser string     `gorm:"size:64" json:"trigger_user"`
 	HitCount    int        `gorm:"default:1" json:"hit_count"`
 	Country     string     `gorm:"size:64" json:"country"`
@@ -149,6 +168,68 @@ type BanRecord struct {
 
 // Permanent 表示永久封禁（ExpiresAt 为空）。
 func (b *BanRecord) Permanent() bool { return b.ExpiresAt == nil }
+
+// 封禁来源引用的类型前缀。
+const (
+	// BanRefACL 来源是黑白名单条目（地区条目命中即封禁走的就是这条路）。
+	BanRefACL = "acl"
+	// BanRefRule 来源是一条细分规则（命中即拦截）。
+	BanRefRule = "rule"
+)
+
+// BanSourceRef 拼一条来源引用。
+//
+// id 是**名单条目**的自增主键。细分规则那条路不走这里 —— 它的引用是内容签名
+// （见 RateRule.BanRef），所以用 BanRefRule 前缀自行拼接，形态上是同一个
+// "类型:标识"协议，标识的取值规则由类型决定。
+func BanSourceRef(kind string, id uint) string {
+	if kind == "" || id == 0 {
+		return ""
+	}
+	return kind + ":" + strconv.FormatUint(uint64(id), 10)
+}
+
+// ParseBanSourceRef 拆解来源引用，返回来源类型与 ID。
+// 空串、格式不对、ID 非正数一律返回 ok=false —— 调用方据此跳过联动处理，
+// 而不是拿一个零值 ID 去删东西。
+//
+// 只认十进制 ID，也就是**只适用于名单条目那类引用**。规则引用里的标识是
+// 十六进制内容签名，解析不出来，这里会返回 ok=false —— 想判断来源类型请用
+// BanSourceRefKind，别拿这个函数的成败去推。
+func ParseBanSourceRef(ref string) (kind string, id uint, ok bool) {
+	kind = BanSourceRefKind(ref)
+	if kind == "" {
+		return "", 0, false
+	}
+	n, err := strconv.ParseUint(ref[strings.LastIndex(ref, ":")+1:], 10, 64)
+	if err != nil || n == 0 {
+		return "", 0, false
+	}
+	return kind, uint(n), true
+}
+
+// BanSourceRefKind 取出引用里的来源类型（"acl" / "rule"），取不到返回空串。
+//
+// 单独一个函数、不并进 ParseBanSourceRef：两者的**标识形态不同** —— 名单条目
+// 是自增主键（十进制），细分规则是内容签名（十六进制哈希，见 RateRule.BanRef）。
+// 让 ParseBanSourceRef 也接受任意字符串的话，"acl:zzz" 这种明显坏掉的引用会被
+// 静默收下，调用方再去 GetACL(0) 查出一个不存在的条目。
+//
+// 所以分工是：先问 Kind 决定走哪条分支，需要 ID 的那一支再调 ParseBanSourceRef。
+// 这样"判断来源类型"就不会被"ID 能不能解析"绑架 —— 这个坑真踩过：规则引用
+// "rule:466972c4" 解析不出十进制 ID，于是调用方在第一步就返回了，那句
+// "该地址由细分规则拦截、解禁后还会被拦"的提示从来没出现过。
+//
+// 按**最后一个**冒号切：类型名里不会有冒号，但标识将来若要带自己的分隔符
+// （比如 "rule:2:abc"），切最后一个才不会把类型切出一截来。
+func BanSourceRefKind(ref string) string {
+	ref = strings.TrimSpace(ref)
+	i := strings.LastIndex(ref, ":")
+	if i <= 0 {
+		return ""
+	}
+	return ref[:i]
+}
 
 // TargetAddr 从 Target 里取出纯 IP 字符串。
 // 滑动窗口计数始终按单个来源 IP 统计，不跟随封禁粒度，

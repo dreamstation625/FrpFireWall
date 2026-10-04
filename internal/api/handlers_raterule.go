@@ -54,8 +54,10 @@ type rateRuleInput struct {
 	Enabled       *bool  `json:"enabled"`
 	Countries     string `json:"countries"`
 	Provinces     string `json:"provinces"`
+	Cities        string `json:"cities"`
 	Cidrs         string `json:"cidrs"`
 	Ports         string `json:"ports"`
+	Block         bool   `json:"block"`
 	PerSec        int    `json:"per_sec"`
 	Burst         int    `json:"burst"`
 	WindowSeconds int    `json:"window_seconds"`
@@ -75,8 +77,10 @@ func (in rateRuleInput) toModel() model.RateRule {
 		Enabled:       enabled,
 		Countries:     in.Countries,
 		Provinces:     in.Provinces,
+		Cities:        in.Cities,
 		CIDRs:         in.Cidrs,
 		Ports:         in.Ports,
+		Block:         in.Block,
 		PerSec:        in.PerSec,
 		Burst:         in.Burst,
 		WindowSeconds: in.WindowSeconds,

@@ -255,7 +255,11 @@ func (r *Resolver) Lookup(addr netip.Addr) *Info {
 
 	var sources []string
 
-	// ---- MaxMind：国家 / 大洲 / 城市 ----
+	// ---- MaxMind：国家 / 大洲 / 省市 ----
+	//
+	// 省市先存成候选（mmProvince / mmCity），不直接写进 info：
+	// 到底用谁，要看最终判定的国家是哪一个（见下面「按国家分流」那一段）。
+	mmProvince, mmCity := "", ""
 	if r.country != nil {
 		var rec maxmindCountry
 		if err := r.country.Lookup(net.IP(addr.AsSlice()), &rec); err == nil {
@@ -278,47 +282,65 @@ func (r *Resolver) Lookup(addr netip.Addr) *Info {
 				info.Continent = rec.Continent.Code
 				info.Found = true
 			}
-			if len(rec.Subdivisions) > 0 && info.Province == "" {
-				info.Province = pickName(rec.Subdivisions[0].Names)
+			if len(rec.Subdivisions) > 0 {
+				mmProvince = pickName(rec.Subdivisions[0].Names)
 			}
-			if info.City == "" {
-				info.City = pickName(rec.City.Names)
-			}
+			mmCity = pickName(rec.City.Names)
 			if !containsStr(sources, "maxmind") {
 				sources = append(sources, "maxmind")
 			}
 		}
 	}
 
-	// ---- ip2region：国内省市更准，覆盖上面的结果 ----
+	// ---- ip2region：先整条解析出来，同样做个候选 ----
+	var reg regionRecord
+	haveReg := false
 	if r.region != nil && (addr.Is4() || !r.regionIsV4) {
 		r.regionQueryMu.Lock()
 		regionStr, err := r.region.Search(addr.String())
 		r.regionQueryMu.Unlock()
 
 		if err == nil && regionStr != "" {
-			rec := parseRegion(regionStr)
-			if !isPlaceholder(rec.province) {
-				info.Province = rec.province
-			}
-			if !isPlaceholder(rec.city) {
-				info.City = rec.city
-			}
-			if !isPlaceholder(rec.isp) {
-				info.ISP = rec.isp
-			}
-			// MaxMind 没给出国家时，用 xdb 的国家码兜底。
-			// 用的是 ISO 码这个专门字段，不是「有没有省市」—— 国外记录同样带省市
-			// （1.1.1.1 是 Queensland / Brisbane），按那个判据会把它标成 CN。
-			if info.Country == "" {
-				if cc := rec.fallbackCountry(); cc != "" {
-					info.Country = cc
-					info.CountryName = CountryName(cc)
-					info.Found = true
-				}
-			}
+			reg = parseRegion(regionStr)
+			haveReg = true
 			sources = append(sources, "ip2region")
 		}
+	}
+
+	// ---- 国家码：MaxMind 优先，xdb 的 ISO 码兜底 ----
+	//
+	// 取的是 ISO 码这个专门字段（不是国名、也不是省市位），原因见
+	// regionRecord.fallbackCountry 的注释 —— 按「有没有省市」判定国家是
+	// 踩过的坑，会把国外 IP 标成 CN。
+	if info.Country == "" && haveReg {
+		if cc := reg.fallbackCountry(); cc != "" {
+			info.Country = cc
+			info.CountryName = CountryName(cc)
+			info.Found = true
+		}
+	}
+
+	// ---- 省市：按国家分流，两边各取所长 ----
+	//
+	// 两个库的强项正好互补：
+	//   - xdb 是面向中文地区做的：中国大陆与港澳台返回中文省市名，精度也高于
+	//     MaxMind（后者在国内经常只到省、甚至给错城市）；
+	//   - 这些地区之外的记录，xdb 只给英文名、粒度也更粗
+	//     （1.1.1.1 → Queensland / Brisbane），而 MaxMind 有更完整的分区数据，
+	//     带 zh-CN 翻译时还会优先取中文。
+	//
+	// 所以这里不是"哪个库为主"，而是**按国家决定谁先**：中文地区信 xdb、
+	// 其余信 MaxMind，两边都拿对方兜底。一刀切"xdb 无条件覆盖"的写法，代价是
+	// 国外 IP 的省市被更粗的英文数据盖掉；一刀切"MaxMind 为主"则会把国内城市
+	// 降到只到省的程度，而国内恰恰是这套东西的主要使用场景。
+	//
+	// 具体怎么取见 mergeRegion —— 抽成独立函数是为了能直接单测这段分流，
+	// 否则只能靠真库文件跑集成，而仓库里不放库文件。
+	info.Province, info.City = mergeRegion(info.Country, mmProvince, mmCity, reg)
+
+	// ISP 只有 xdb 有（MaxMind 的运营商数据在单独的付费库里），始终取它。
+	if haveReg && !isPlaceholder(reg.isp) {
+		info.ISP = reg.isp
 	}
 
 	info.Source = strings.Join(sources, "+")
@@ -551,6 +573,53 @@ func parseRegion(s string) regionRecord {
 func isPlaceholder(s string) bool {
 	s = strings.TrimSpace(s)
 	return s == "" || s == "0" || strings.EqualFold(s, "Reserved")
+}
+
+// mergeRegion 按国家决定省市的取值来源，两边互相兜底。
+//
+// 分流规则见 preferRegionDB：中文地区先取 xdb（中文名、粒度细），其余先取
+// MaxMind（分区数据更全、带 zh-CN 翻译时优先取中文）。先取的那一边若是占位值
+// （"0" / "Reserved" / 空），就落到另一边；不像 preferRegionDB 那样一刀切，
+// 是为了"某个库在这条记录上没数据"不至于把另一边的数据也丢掉。
+//
+// 国家码为空（两个库都没认出国家）时按"非中文地区"处理：这时候谁都说不准，
+// 而 MaxMind 的覆盖更广，选它出错概率更低。
+func mergeRegion(country, mmProvince, mmCity string, reg regionRecord) (province, city string) {
+	if preferRegionDB(country) {
+		province, city = mmProvince, mmCity
+		if !isPlaceholder(reg.province) {
+			province = reg.province
+		}
+		if !isPlaceholder(reg.city) {
+			city = reg.city
+		}
+		return province, city
+	}
+	province, city = mmProvince, mmCity
+	// 只补空，不覆盖：这一步是兜底，MaxMind 已经给了值就以它为准。
+	if province == "" && !isPlaceholder(reg.province) {
+		province = reg.province
+	}
+	if city == "" && !isPlaceholder(reg.city) {
+		city = reg.city
+	}
+	return province, city
+}
+
+// preferRegionDB 判断这个国家/地区的省市是否应当以 ip2region 为准。
+//
+// 判据是"xdb 在这个地区返回的是不是中文、粒度够不够细"，目前包括中国大陆与
+// 港澳台：xdb 对它们给中文省市名，精度高于 MaxMind（后者在国内经常只到省、
+// 甚至给错城市）。其余地区反过来 —— xdb 只给英文名、粒度更粗，MaxMind 更准。
+//
+// 香港、澳门、台湾一并算进来，是因为它们同属中文地区，xdb 的中文名称处理
+// 也更贴合界面上的写法（「中国香港」等），而不是按政治实体去分。
+func preferRegionDB(country string) bool {
+	switch strings.ToUpper(strings.TrimSpace(country)) {
+	case "CN", "HK", "MO", "TW":
+		return true
+	}
+	return false
 }
 
 // fallbackCountry 取出可用于兜底的国家码，取不到返回空串。

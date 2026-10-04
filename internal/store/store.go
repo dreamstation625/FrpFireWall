@@ -421,6 +421,36 @@ func (s *Store) ReleaseBan(id uint, by string, status string) error {
 		}).Error
 }
 
+// ReleaseBans 批量把一组封禁标记为已解除。
+//
+// 用于"来源条目被删除"这类联动解禁：一次可能解除几十上百条，逐条 update
+// 既慢又多开事务，而它们本来是同一件事。ids 为空直接返回，不发空 UPDATE。
+func (s *Store) ReleaseBans(ids []uint, by string, status string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	now := time.Now()
+	return s.db.Model(&model.BanRecord{}).Where("id IN ?", ids).
+		Updates(map[string]any{
+			"status":      status,
+			"released_at": &now,
+			"released_by": by,
+		}).Error
+}
+
+// CountActiveBansOfRef 数某条来源（名单条目 / 细分规则）当前还有多少条活跃封禁。
+//
+// 用在"删条目 / 改规则之后回头确认解禁做干净了没有"：一次联动解禁可能漏掉几条，
+// 而漏掉的表现是"界面上依据已经没了、地址却还进不来"。返回计数而不是布尔值，
+// 是因为调用方还要把它报给用户（"已解禁 N 个地址"）。
+func (s *Store) CountActiveBansOfRef(ref string) (int64, error) {
+	var n int64
+	err := s.db.Model(&model.BanRecord{}).
+		Where("status = ? AND source_ref = ?", model.BanActive, ref).
+		Count(&n).Error
+	return n, err
+}
+
 // ReleaseExpired 把所有已到期的封禁批量标记为 expired。
 func (s *Store) ReleaseExpired(now time.Time) ([]model.BanRecord, error) {
 	var expired []model.BanRecord

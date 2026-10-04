@@ -27,12 +27,14 @@
           v-model="countries"
           multiple
           filterable
+          allow-create
+          default-first-option
           clearable
           collapse-tags
           collapse-tags-tooltip
           :max-collapse-tags="6"
           :disabled="portsFilled"
-          placeholder="选择国家或地区（可多选）"
+          placeholder="选择或直接输入两位国家码（如 CN、CU）"
           style="width: 100%"
         >
           <el-option
@@ -45,7 +47,10 @@
             <span class="opt-code">{{ c.code }}</span>
           </el-option>
         </el-select>
-        <div class="hint">同一维度内多选是「或」，不同维度之间是「且」。</div>
+        <div class="hint">
+          同一维度内多选是「或」，不同维度之间是「且」。下拉里只收了常见来源地，
+          没收录的国家直接敲两位代码即可回车添加（国家码只校验格式，写错不报错、只会不命中）。
+        </div>
       </el-form-item>
 
       <el-form-item label="省份">
@@ -71,6 +76,29 @@
         <div class="hint">
           省份取值与属地库返回的一致（已经去掉「省 / 市 / 自治区」这类后缀，
           所以库里返回「广东省」也能命中这里的「广东」）。属地查不到时按不命中处理。
+        </div>
+      </el-form-item>
+
+      <el-form-item label="城市">
+        <el-select
+          v-model="cities"
+          multiple
+          filterable
+          allow-create
+          default-first-option
+          clearable
+          collapse-tags
+          collapse-tags-tooltip
+          :max-collapse-tags="6"
+          :disabled="portsFilled"
+          placeholder="直接输入城市名后回车（可多个），例如 深圳"
+          style="width: 100%"
+        >
+          <el-option v-for="c in cityOptions" :key="c" :label="c" :value="c" />
+        </el-select>
+        <div class="hint">
+          城市没有候选列表（全国几百个地级市，还有国外的），所以<strong>写错不会报错、只会永远不命中</strong>。
+          写「深圳」或「深圳市」都行（后缀会被去掉），不确定时先用「属地查询」核对一下。
         </div>
       </el-form-item>
 
@@ -102,8 +130,27 @@
 
       <el-divider content-position="left">动作</el-divider>
 
+      <el-form-item label="直接拦截">
+        <el-switch
+          v-model="form.block"
+          :disabled="portsFilled"
+          active-text="开启"
+          inactive-text="关闭"
+          inline-prompt
+        />
+        <div v-if="portsFilled" class="hint">
+          带端口条件的规则落在内核层。内核只能丢包，「拒绝」这一步在那里表达不出来 ——
+          需要直接拦截请去掉端口条件。
+        </div>
+        <div v-else-if="form.block" class="alert-note" style="margin-top: 6px; width: 100%">
+          命中即<strong>拒绝这次连接</strong>，同时把来源封进内核防火墙，后续它连别的端口也进不来。
+          按全局策略的封禁粒度与阶梯时长执行。与限速、封禁阈值互斥（命中就被拒了，后面那些参数轮不到生效）。
+        </div>
+        <div v-else class="hint">只判定，不直接拒绝。</div>
+      </el-form-item>
+
       <el-form-item label="限速">
-        <el-switch v-model="rateOn" active-text="开启" inactive-text="关闭" inline-prompt />
+        <el-switch v-model="rateOn" :disabled="form.block" active-text="开启" inactive-text="关闭" inline-prompt />
         <div v-if="rateOn" style="margin-top: 8px; width: 100%">
           <el-input-number v-model="form.per_sec" :min="1" :max="100000" size="small" />
           <span class="unit">次 / 秒（每个来源 IP 单独计数）</span>
@@ -112,15 +159,23 @@
             <span class="unit">突发额度，留 0 按速率的 2 倍自动补</span>
           </div>
         </div>
+        <div v-else-if="form.block" class="hint">已开启直接拦截，不再需要限速。</div>
         <div v-else class="hint">这条规则不限速。</div>
       </el-form-item>
 
       <el-form-item label="封禁">
-        <el-switch v-model="banOn" :disabled="portsFilled" active-text="开启" inactive-text="关闭" inline-prompt />
+        <el-switch
+          v-model="banOn"
+          :disabled="portsFilled || form.block"
+          active-text="开启"
+          inactive-text="关闭"
+          inline-prompt
+        />
         <div v-if="portsFilled" class="hint">
           带端口条件的规则落在内核层。内核只能丢包，超限的包到不了 frps，
           应用层无从知道它超限，所以内核规则不能封禁 —— 需要封禁请去掉端口条件。
         </div>
+        <div v-else-if="form.block" class="hint">已开启直接拦截，不再需要封禁阈值。</div>
         <div v-else-if="banOn" style="margin-top: 8px; width: 100%">
           <div>
             <span class="field-label">统计窗口</span>
@@ -195,6 +250,7 @@ const isEdit = computed(() => props.rule !== null)
 const form = reactive<RateRule>(emptyRule())
 const countries = ref<string[]>([])
 const provinces = ref<string[]>([])
+const cities = ref<string[]>([])
 const steps = ref<Step[]>([])
 
 // 限速/封禁用开关控制对应字段是否"算数"。
@@ -208,6 +264,10 @@ const portsFilled = computed(() => String(form.ports ?? '').trim() !== '')
 
 const countryOptions = computed(() => props.countries || [])
 const provinceOptions = computed(() => props.provinces || [])
+
+// 城市没有候选表（候选集开放，见后端 model.CanonicalCity 的说明），
+// 但把用户已经填过的城市回显成可选项，至少同一台机器上是同一套写法。
+const cityOptions = computed(() => cities.value)
 
 const splitList = (s?: string) =>
   String(s ?? '')
@@ -223,11 +283,15 @@ function build(): RateRule {
     ...form,
     countries: countries.value.join(','),
     provinces: provinces.value.join(','),
-    per_sec: rateOn.value ? Number(form.per_sec) || 0 : 0,
-    burst: rateOn.value ? Number(form.burst) || 0 : 0,
-    window_seconds: banOn.value ? Number(form.window_seconds) || 0 : 0,
-    threshold: banOn.value ? Number(form.threshold) || 0 : 0,
-    ban_durations: banOn.value ? stepsToCSV(steps.value) : '',
+    cities: cities.value.join(','),
+    // 开了拦截就不该带着限速/封禁值出门：界面上已经把它们禁掉了，
+    // 但库里回填的值还在（比如从"限速规则"改成"拦截规则"），
+    // 不清掉会被后端判成"两者只能保留一个"，而用户在界面上根本看不到那几个数。
+    per_sec: rateOn.value && !form.block ? Number(form.per_sec) || 0 : 0,
+    burst: rateOn.value && !form.block ? Number(form.burst) || 0 : 0,
+    window_seconds: banOn.value && !form.block ? Number(form.window_seconds) || 0 : 0,
+    threshold: banOn.value && !form.block ? Number(form.threshold) || 0 : 0,
+    ban_durations: banOn.value && !form.block ? stepsToCSV(steps.value) : '',
   }
 }
 
@@ -241,13 +305,31 @@ watch(
     if (!open) return
     const src = props.rule ? { ...props.rule } : emptyRule()
     Object.assign(form, emptyRule(), src)
+    form.block = !!src.block
     countries.value = splitList(src.countries).map((c) => c.toUpperCase())
     provinces.value = splitList(src.provinces)
+    cities.value = splitList(src.cities)
     steps.value = parseSteps(src.ban_durations)
     rateOn.value = (src.per_sec ?? 0) > 0
     banOn.value = (src.window_seconds ?? 0) > 0 || (src.threshold ?? 0) > 0
   },
   { immediate: true }
+)
+
+// 打开拦截时把限速/封禁关掉：它们在界面上已经变灰，留着勾选状态会让人以为
+// 还在生效（后端实际上会直接拒绝这样一条规则）。
+watch(
+  () => form.block,
+  (on) => {
+    if (!on) return
+    rateOn.value = false
+    banOn.value = false
+    form.per_sec = 0
+    form.burst = 0
+    form.window_seconds = 0
+    form.threshold = 0
+    steps.value = []
+  }
 )
 
 // 打开封禁时给一套默认值，免得用户面对三个空格子不知道填什么。

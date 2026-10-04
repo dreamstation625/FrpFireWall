@@ -18,7 +18,15 @@ func (m *Manager) Apply() { m.scheduleApply() }
 //
 // steps 是本次使用的阶梯封禁时长，由调用方给：细分规则自带自己的阶梯，
 // 全局策略用 Policy 里的那份。见 nextDuration 的说明。
-func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *geoip.Info, steps []int64) {
+//
+// sourceRef 指向触发这条封禁的**具体来源**（名单条目 / 细分规则），形如 "acl:12"；
+// 频次自动封禁、全局地域名单留空。它的用途是联动解禁：来源被删除或停用时，
+// 由它封掉的地址要一起解封 —— 否则"删掉了那条名单，被它封的地址还是进不来"，
+// 而界面上已经看不到那条名单了，用户只能去封禁列表里一个个手点。
+func (m *Manager) triggerBan(
+	addr netip.Addr, source, reason, user string,
+	geo *geoip.Info, steps []int64, sourceRef string,
+) {
 	addr = addr.Unmap()
 
 	m.mu.RLock()
@@ -68,6 +76,7 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 		Scope:       model.ScopeAll,
 		Reason:      reason,
 		Source:      source,
+		SourceRef:   sourceRef,
 		TriggerUser: user,
 		HitCount:    step,
 		Country:     country,
@@ -86,17 +95,18 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 	}
 
 	st := &banState{
-		Prefix:   prefix,
-		Target:   target,
-		Scope:    model.ScopeAll,
-		Reason:   reason,
-		Source:   source,
-		User:     user,
-		RecordID: rec.ID,
-		HitCount: step,
-		BannedAt: now,
-		Country:  country,
-		Province: province,
+		Prefix:    prefix,
+		Target:    target,
+		Scope:     model.ScopeAll,
+		Reason:    reason,
+		Source:    source,
+		SourceRef: sourceRef,
+		User:      user,
+		RecordID:  rec.ID,
+		HitCount:  step,
+		BannedAt:  now,
+		Country:   country,
+		Province:  province,
 	}
 	if rec.ExpiresAt != nil {
 		st.Expires = *rec.ExpiresAt
@@ -310,6 +320,62 @@ func (m *Manager) UnbanByRecordID(id uint, by string) error {
 		m.log.Info("解封的记录在内存中已不存在，仅更新了数据库状态", "target", rec.Target)
 	}
 	return nil
+}
+
+// ReleaseBansByRef 解除由某条来源（名单条目 / 细分规则）触发的活跃封禁。
+//
+// 用在"来源被删除或停用"的场景：删掉一条名单之后，被它封掉的地址还挂在封禁
+// 列表里，而界面上已经看不到那条名单了 —— 用户既不知道该点哪几条，
+// 也想不通"我明明删了，为什么它还进不来"。规则被停用/删除同理。
+//
+// 以**内存那份为准**扫（内存是权威，见 banState 的注释），再按记录 ID 批量
+// 回写数据库；只扫库的话，内存里"库里状态已经变了但还没刷新"的那些会漏掉。
+//
+// 没有匹配的封禁不算错误 —— 那条来源可能一个地址都没封过，这是正常情况。
+func (m *Manager) ReleaseBansByRef(ref, by, why string) (int, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return 0, nil
+	}
+
+	m.mu.Lock()
+	hits := make([]*banState, 0, 4)
+	for k, b := range m.bans {
+		if b.SourceRef != ref {
+			continue
+		}
+		hits = append(hits, b)
+		delete(m.bans, k)
+		m.resetWindowsForLocked(b.Prefix.Addr().String())
+	}
+	m.mu.Unlock()
+
+	if len(hits) == 0 {
+		return 0, nil
+	}
+
+	ids := make([]uint, 0, len(hits))
+	for _, b := range hits {
+		if b.RecordID > 0 {
+			ids = append(ids, b.RecordID)
+		}
+	}
+	if err := m.store.ReleaseBans(ids, by, model.BanReleased); err != nil {
+		return 0, fmt.Errorf("更新封禁记录状态失败: %w", err)
+	}
+
+	for _, b := range hits {
+		m.pushEvent(&model.Event{
+			Category: model.EvtUnban,
+			IP:       b.Target,
+			Detail:   "来源已移除，自动解封：" + why,
+			Actor:    by,
+		})
+	}
+	m.scheduleApply()
+
+	m.log.Info("来源移除，联动解封", "ref", ref, "count", len(hits), "reason", why)
+	return len(hits), nil
 }
 
 // nextDuration 按阶梯策略算出本次封禁时长与阶梯序号。

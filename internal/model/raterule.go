@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"hash/fnv"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -61,6 +62,12 @@ type RateRule struct {
 	// Provinces 省份名，逗号分隔。取值与 ip2region / GeoLite2 返回的一致，
 	// 如 "广东省,福建省"。只在有属地库时才有意义。
 	Provinces string `gorm:"size:512;not null;default:''" json:"provinces"`
+	// Cities 城市名，逗号分隔，如 "深圳,广州"。
+	//
+	// 与省份的关键差别：城市名**不校验真实性**，只做写法归一（见 CanonicalCity）。
+	// 候选集是开放的（全国几百个地级市加上海外城市），而写错的后果同样是静默
+	// 不命中 —— 省份只有 34 个值、能做成封闭校验，城市做不到，只能靠界面提示。
+	Cities string `gorm:"size:512;not null;default:''" json:"cities"`
 	// CIDRs 来源地址段，逗号/空格/换行分隔，如 "1.2.3.0/24, 2001:db8::/32"。
 	//
 	// 显式指定列名：GORM 的命名策略把 "CIDRs" 拆成了 C + ID + Rs
@@ -70,6 +77,24 @@ type RateRule struct {
 	//
 	// **这个字段一旦非空，规则就落在内核层**，且不能再有国家/省份条件。
 	Ports string `gorm:"size:1024;not null;default:''" json:"ports"`
+
+	// ---- 动作 ----
+
+	// Block 命中即拦截：直接拒绝这次连接，不计数、不限速。
+	//
+	// 与"限速 / 阈值封禁"是两条不同的路：那两个都是**先放过去、超了才处理**，
+	// 这个是命中就进不来。所以它不能和端口条件同时出现 —— 端口落内核，而内核
+	// 只有丢包一种动作、且丢包发生在 frps 之前，应用层的"命中即拒绝"在那里
+	// 表达不出来（见 DESIGN D16）。
+	//
+	// 也不能与限速 / 封禁配置同时出现：命中就直接拒了，后面那些参数永远轮不到
+	// 生效。留着就是"配了不生效"的陷阱，Validate 会直接拒绝这种组合。
+	// 这里带 default:false 并不违背上面 Enabled 那条"不加 default"的经验：
+	// 那个坑的条件是**默认值为 true** —— 零值 false 被省略，就变成库里默认的 true。
+	// 默认值本身就是 false 时，省略与不省略的结果一致，所以留着无妨。
+	// 但别顺手把它改成 default:true：那会立刻复现同一个 bug 的反向版本
+	//（显式写入的 false 读回来变成 true，"关掉拦截"保存后还在拦）。
+	Block bool `gorm:"not null;default:false" json:"block"`
 
 	// ---- 动作：限速 ----
 
@@ -109,7 +134,9 @@ func (r *RateRule) Layer() string {
 
 // HasGeoCondition 是否带属地条件。
 func (r *RateRule) HasGeoCondition() bool {
-	return strings.TrimSpace(r.Countries) != "" || strings.TrimSpace(r.Provinces) != ""
+	return strings.TrimSpace(r.Countries) != "" ||
+		strings.TrimSpace(r.Provinces) != "" ||
+		strings.TrimSpace(r.Cities) != ""
 }
 
 // CountryList 把国家码拆开，统一大写去重。
@@ -130,6 +157,21 @@ func (r *RateRule) ProvinceList() []string {
 	out := make([]string, 0, 4)
 	for _, s := range splitList(r.Provinces) {
 		if c := CanonicalProvince(s); c != "" {
+			out = append(out, c)
+		}
+	}
+	return dedupeStrings(out)
+}
+
+// CityList 把城市拆开、归一化、去重。
+//
+// 归一化放在这里（而不是只在 Normalize 里）的理由与 ProvinceList 相同：
+// 让所有读出城市的地方拿到同一套形态 —— 校验用它、落库用它、guard 编译规则
+// 也用它。只要有一处拿到原始字符串，规则就可能在"看着配了"和"实际生效"之间错位。
+func (r *RateRule) CityList() []string {
+	out := make([]string, 0, 4)
+	for _, s := range splitList(r.Cities) {
+		if c := CanonicalCity(s); c != "" {
 			out = append(out, c)
 		}
 	}
@@ -186,6 +228,43 @@ func (r *RateRule) BanConfigured() bool {
 // RateConfigured 判断这条规则是否配了限速动作。
 func (r *RateRule) RateConfigured() bool { return r.PerSec > 0 }
 
+// BanRef 返回这条规则在封禁记录里的来源引用，停用的规则返回空串。
+//
+// 用**内容签名**而不是规则 ID：rate_rules 表是整体替换的（保存时先清空再插入，
+// ID 每次都会变），拿 ID 当引用的话，保存一次规则之后历史封禁里的 "rule:5"
+// 就指向了另一条规则 —— 删掉它会把不相干的地址一起解封。
+//
+// 签名只取影响判定的字段，不含名字：改个名字不该让谁解封；而条件一改，旧的
+// 封禁依据就不成立了，旧签名随之消失、由它封的地址跟着解封，正是想要的。
+// 停用的规则不产生封禁，所以直接返回空串 —— 这样"停用"天然落进"旧签名消失"
+// 的那一类，不需要单独判一次。
+func (r *RateRule) BanRef() string {
+	if !r.Enabled {
+		return ""
+	}
+	sig := strings.Join([]string{
+		strconv.FormatBool(r.Block),
+		r.Countries, r.Provinces, r.Cities, r.CIDRs, r.Ports,
+	}, "|")
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(sig))
+	return BanRefRule + ":" + strconv.FormatUint(uint64(h.Sum32()), 16)
+}
+
+// RateRuleBanRefs 返回一组规则的封禁来源引用集合（停用的不计）。
+//
+// 保存规则时用它做前后对比：旧集合里有、新集合里没有的，就是"依据已经消失"
+// 的那些 —— 被删掉的、被停用的、条件被改动的，三种情况一并覆盖。
+func RateRuleBanRefs(rules []RateRule) map[string]bool {
+	out := make(map[string]bool, len(rules))
+	for i := range rules {
+		if ref := rules[i].BanRef(); ref != "" {
+			out[ref] = true
+		}
+	}
+	return out
+}
+
 // Normalize 把各字段改写成规范形态并回写。
 //
 // 存储形态就是用户敲进去的那串文本（去重、排序之后），中间不做结构转换 ——
@@ -200,6 +279,9 @@ func (r *RateRule) Normalize() {
 	// 以及匹配时用的形态保持同一套，界面里不会出现"我选了广东，
 	// 存进去成了广东省"这种对不上的情况。
 	r.Provinces = strings.Join(r.ProvinceList(), ",")
+
+	// 城市同理：存下来的形态与匹配时用的形态保持同一套。
+	r.Cities = strings.Join(r.CityList(), ",")
 
 	// 地址段按解析后的规范形态回写：把 1.2.3.4 补成 1.2.3.4/32，
 	// 把 1.2.3.5/24 归成 1.2.3.0/24。内核规则是按这个字符串下发的。
@@ -258,6 +340,12 @@ func (r *RateRule) Validate() error {
 			return fmt.Errorf("规则「%s」的省份「%s」无法识别，请从下拉列表中选择（如 广东、内蒙古、中国香港）", r.Name, p)
 		}
 	}
+	// 城市不校验真实性（候选集开放），但要挡住"填了却一个有效值都不剩"：
+	// 那种规则会落在应用层、界面上看着配了属地条件，实际永远不命中 ——
+	// 与省份写错是同一类问题，只是这里只能用"归一到空"这个更弱的判据。
+	if strings.TrimSpace(r.Cities) != "" && len(r.CityList()) == 0 {
+		return fmt.Errorf("规则「%s」的城市「%s」没有一个能识别，请检查写法（如 深圳、广州）", r.Name, r.Cities)
+	}
 	if _, err := r.PrefixList(); err != nil {
 		return fmt.Errorf("规则「%s」：%w", r.Name, err)
 	}
@@ -275,6 +363,11 @@ func (r *RateRule) Validate() error {
 
 	if len(ports) > 0 {
 		// ---- 内核层 ----
+		if r.Block {
+			return fmt.Errorf(
+				"规则「%s」同时写了「端口」和「直接拦截」：端口落内核，而内核只能丢包、丢包发生在 frps 之前，"+
+					"应用层的拦截在那里表达不出来（见 DESIGN D16）。去掉端口条件即可改走应用层", r.Name)
+		}
 		if r.PerSec < 1 {
 			return fmt.Errorf("规则「%s」落在内核层，必须填写「每秒连接数上限」", r.Name)
 		}
@@ -296,6 +389,18 @@ func (r *RateRule) Validate() error {
 	if r.Burst < 0 {
 		return fmt.Errorf("规则「%s」的突发额度不能为负数", r.Name)
 	}
+
+	// 命中即拦截的规则不需要、也不允许再配限速 / 封禁：命中就拒了，那些参数
+	// 永远轮不到生效。
+	if r.Block {
+		if r.RateConfigured() || r.BanConfigured() {
+			return fmt.Errorf(
+				"规则「%s」同时配置了「直接拦截」和限速/封禁：命中就直接拒绝了，后面的限速与阈值"+
+					"永远不会被用到。两者只保留一个", r.Name)
+		}
+		return nil
+	}
+
 	if !r.RateConfigured() && !r.BanConfigured() {
 		return fmt.Errorf("规则「%s」既没有限速也没有封禁阈值，命中后什么都不会发生", r.Name)
 	}

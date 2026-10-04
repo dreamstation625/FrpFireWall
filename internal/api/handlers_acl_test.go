@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dreamstation625/FrpFireWall/internal/model"
@@ -219,5 +220,209 @@ func TestNormalizeScopePorts(t *testing.T) {
 				t.Fatalf("ports = %q，期望 %q", got, c.want)
 			}
 		})
+	}
+}
+
+// 地区条目的"导出 → 导入"闭环。
+//
+// 导出文件是拿来重新导入的（留档、换机器），而地区条目的目标不是地址 ——
+// 不带类型前缀的话，导入端只会把它当地址解析、报一句"非法的 IP 地址"，
+// 等于地区条目根本没法备份。前缀就是为这件事存在的，所以这里必须闭环验证。
+//
+// 和范围那组一样，刻意调用 renderTargetField 而不是在手写样本里硬编码前缀：
+// 手写的样本只能证明"我抄对了"。
+func TestTargetFieldRoundTrip(t *testing.T) {
+	cases := []struct {
+		name       string
+		entry      model.ACLEntry
+		wantTarget string // 期望的入库形态（= 导入后应当还原成的样子）
+		wantType   string
+	}{
+		{
+			"普通地址不加前缀",
+			model.ACLEntry{Target: "1.2.3.4", TargetType: "ipv4"},
+			"1.2.3.4", "ipv4",
+		},
+		{
+			"网段不加前缀",
+			model.ACLEntry{Target: "1.2.3.0/24", TargetType: "cidr4"},
+			"1.2.3.0/24", "cidr4",
+		},
+		{
+			"国家 / 地区",
+			model.ACLEntry{Target: "CN,HK", TargetType: model.TargetGeoCountry},
+			"CN,HK", model.TargetGeoCountry,
+		},
+		{
+			"省份",
+			model.ACLEntry{Target: "广东,福建", TargetType: model.TargetGeoProvince},
+			"广东,福建", model.TargetGeoProvince,
+		},
+		{
+			"城市",
+			model.ACLEntry{Target: "深圳", TargetType: model.TargetGeoCity},
+			"深圳", model.TargetGeoCity,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			field := renderTargetField(c.entry)
+			// 导出那一列绝不能带逗号：它同时是列分隔符，一出现就会把
+			// 后面的范围列、备注列整段切走。地区多值必须换成分号。
+			if strings.Contains(field, ",") {
+				t.Fatalf("导出列里不该出现逗号（那是列分隔符）：%q", field)
+			}
+			target, tt, err := normalizeImportTarget(field)
+			if err != nil {
+				t.Fatalf("%q 导入失败：%v", field, err)
+			}
+			if target != c.wantTarget || tt != c.wantType {
+				t.Fatalf("回读为 (%q, %q)，期望 (%q, %q)", target, tt, c.wantTarget, c.wantType)
+			}
+		})
+	}
+}
+
+// 导出成一行之后，整行走一遍 parseImportLine 也必须还原 —— 这才是用户实际
+// 走的路径（一行三列：目标,范围,备注）。
+func TestImportLineCarriesGeoEntry(t *testing.T) {
+	entry := model.ACLEntry{
+		Target: "广东,福建", TargetType: model.TargetGeoProvince,
+		Scope: model.ScopeAll, Remark: "机房所在省",
+	}
+	line := renderTargetField(entry) + "," + renderScopeField(entry.Scope, entry.Ports) + "," + entry.Remark
+
+	targetPart, scope, ports, remark, err := parseImportLine(line, model.ScopeAll, "")
+	if err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if remark != entry.Remark {
+		t.Errorf("备注应为 %q，实际 %q", entry.Remark, remark)
+	}
+
+	target, tt, err := normalizeImportTarget(targetPart)
+	if err != nil {
+		t.Fatalf("目标解析失败：%v", err)
+	}
+	if target != "广东,福建" || tt != model.TargetGeoProvince {
+		t.Fatalf("回读为 (%q, %q)，期望 (广东,福建, %s)", target, tt, model.TargetGeoProvince)
+	}
+
+	// 地区条目没有"范围"可言，一律摆正成全端口 —— 行内写了 custom:... 也忽略，
+	// 那个范围在它身上落不了地（见 aclScopePorts）。
+	if model.IsGeoTargetType(tt) {
+		scope, ports = model.ScopeAll, ""
+	}
+	if scope != model.ScopeAll || ports != "" {
+		t.Fatalf("地区条目的范围应恒为 all/空，实际 (%q, %q)", scope, ports)
+	}
+}
+
+// 带前缀但值非法时，报错要指向真正的原因，别回落成"非法的 IP 地址"。
+func TestNormalizeImportTargetErrorMessages(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string // 错误里必须出现的关键词
+	}{
+		// 国家码写成三位：真正的问题是格式，不是"这不是个 IP"
+		{"country:CHN", "两位字母"},
+		{"country:1", "两位字母"},
+		// 省份拼错：省份候选集封闭，这里必须说"无法识别"
+		{"province:深证", "无法识别"},
+		{"province:0", "省份不能为空"},
+		{"city:0", "城市不能为空"},
+		// 前缀对但值为空
+		{"country:", "不能为空"},
+	}
+	for _, c := range cases {
+		_, _, err := normalizeImportTarget(c.in)
+		if err == nil {
+			t.Errorf("%q 应当被拒绝", c.in)
+			continue
+		}
+		if strings.Contains(err.Error(), "IP 地址") {
+			t.Errorf("%q 的报错落回了地址解析，会把人带偏：%v", c.in, err)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q 的报错里没有 %q：%v", c.in, c.want, err)
+		}
+	}
+}
+
+// 没有前缀一律按地址解析：老版本导出的文件里全是裸地址，不改一个字节就要能导入。
+// 顺带钉住 IPv6 那个坑 —— 它本身带冒号，不能被当成"未知的地区前缀"处理。
+func TestNormalizeImportTargetFallsBackToAddress(t *testing.T) {
+	cases := []struct {
+		in       string
+		want     string
+		wantType string
+	}{
+		{"1.2.3.4", "1.2.3.4", "ipv4"},
+		{"1.2.3.5/24", "1.2.3.0/24", "cidr4"},
+		// 冒号到处都是，前缀判定必须只认已知的地区类型
+		{"2001:db8::1", "2001:db8::1", "ipv6"},
+		{"2001:db8::/32", "2001:db8::/32", "cidr6"},
+		// 未知前缀也不能直接报"未知的地区类型"，交给地址解析给原因
+		{"1.2.3.4:8080", "", ""},
+	}
+	for _, c := range cases {
+		target, tt, err := normalizeImportTarget(c.in)
+		if c.want == "" {
+			if err == nil {
+				t.Errorf("%q 应当被拒绝", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%q 导入失败：%v", c.in, err)
+			continue
+		}
+		if target != c.want || tt != c.wantType {
+			t.Errorf("%q 解析为 (%q, %q)，期望 (%q, %q)", c.in, target, tt, c.want, c.wantType)
+		}
+	}
+}
+
+// 接口层的地区目标归一化：类型必须显式给，不能从内容猜。
+//
+// 两位字母既可能是国家码、也可能是个手滑的地址片段，猜错的后果是"配了一条
+// 永远不命中、或者莫名其妙命中的条目"，而两种错都看不出来。
+func TestNormalizeACLTargetGeo(t *testing.T) {
+	target, tt, err := normalizeACLTarget("cn, hk", model.TargetGeoCountry)
+	if err != nil {
+		t.Fatalf("不该报错：%v", err)
+	}
+	if target != "CN,HK" || tt != model.TargetGeoCountry {
+		t.Fatalf("得到 (%q, %q)，期望 (CN,HK, %s)", target, tt, model.TargetGeoCountry)
+	}
+
+	// 不传 target_type 时，即使内容看着像国家码也必须走地址解析 ——
+	// 老客户端不带这个字段，语义要和升级前完全一致。
+	if _, _, err := normalizeACLTarget("CN", ""); err == nil {
+		t.Error("\"CN\" 在不给 target_type 时应当按地址解析并报错")
+	}
+
+	// 地区类型不给值（或给错值）要报错
+	if _, _, err := normalizeACLTarget("", model.TargetGeoCity); err == nil {
+		t.Error("地区值为空应当报错")
+	}
+
+	// 地区条目的范围恒为 all/空，传进来的范围与端口一律忽略
+	scope, ports, err := aclScopePorts(model.KindBlack, model.TargetGeoCountry, model.ScopeCustom, "8080")
+	if err != nil {
+		t.Fatalf("不该报错：%v", err)
+	}
+	if scope != model.ScopeAll || ports != "" {
+		t.Fatalf("地区条目的范围应恒为 all/空，实际 (%q, %q)", scope, ports)
+	}
+
+	// 白名单也一样，且不会因为传了非法范围而报错：范围对地区条目没有第二种含义
+	scope, ports, err = aclScopePorts(model.KindWhite, model.TargetGeoProvince, "bogus", "x")
+	if err != nil {
+		t.Fatalf("不该报错：%v", err)
+	}
+	if scope != model.ScopeAll || ports != "" {
+		t.Fatalf("白名单地区条目应恒为 all/空，实际 (%q, %q)", scope, ports)
 	}
 }

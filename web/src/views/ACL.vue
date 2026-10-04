@@ -27,6 +27,11 @@
         影响面小，代价是对方仍能扫到本机其它端口；<b>自定义端口</b>只封指定的那几个端口。
         范围只决定内核层丢哪些端口上的包，不影响判定本身 —— 插件回调拿不到端口，
         自定义端口只用来精确控制内核封哪里。
+        <div style="margin-top: 6px">
+          <b>地区条目</b>（国家 / 省份 / 城市）按属地匹配，命中的来源会被立即拒绝并封进内核。
+          属地库是查询型库、没法反向列出某个国家的网段，所以地区条件本身不产生内核规则 ——
+          <b>没来访过的地址在内核里没有痕迹</b>，扫别的端口不受这条约束。
+        </div>
       </template>
     </el-alert>
 
@@ -60,17 +65,25 @@
           <span class="mono">{{ row.target }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="target_type" label="类型" v-bind="cw.col('类型', { width: 80 })">
+      <el-table-column prop="target_type" label="类型" v-bind="cw.col('类型', { width: 92 })">
         <template #default="{ row }">
-          <el-tag size="small" type="info">{{ row.target_type }}</el-tag>
+          <el-tag size="small" :type="isGeoTarget(row.target_type) ? 'warning' : 'info'">
+            {{ typeLabel(row.target_type) }}
+          </el-tag>
         </template>
       </el-table-column>
       <!-- 范围只对黑名单有意义，白名单不显示这一列 -->
       <el-table-column v-if="kind === 'black'" label="范围" v-bind="cw.col('范围', { width: 118 })">
         <template #default="{ row }">
+          <!-- 地区条目没有"范围"这个字段的含义：它不产生内核规则，命中之后
+               封的是那个具体 IP（全端口）。列里显示"全端口"会让人以为有一条
+               按全端口生效中的内核规则，而实际上它挡不住任何没来访过的地址。 -->
+          <el-tooltip v-if="isGeoTarget(row.target_type)" content="命中后把该来源全端口封进内核；地区条件本身不产生内核规则" placement="top">
+            <el-tag size="small" type="warning">命中即封</el-tag>
+          </el-tooltip>
           <!-- 带上 ports 一起看：范围是 custom 却没有端口时后端会退化成全端口下发，
                提示语必须说同一件事，否则界面讲"只封这几个端口"、实际封了全部 -->
-          <el-tooltip :content="scopeTip(row.scope, row.ports)" placement="top">
+          <el-tooltip v-else :content="scopeTip(row.scope, row.ports)" placement="top">
             <el-tag size="small" :type="scopeTagType(row.scope)">
               {{ scopeLabel(row.scope) }}
             </el-tag>
@@ -124,19 +137,104 @@
 
     <TablePager v-model:page="page" v-model:size="size" :total="total" @change="reload" />
 
-    <el-dialog v-model="editVisible" :title="editing ? '编辑条目' : '新增条目'" width="480px">
+    <el-dialog v-model="editVisible" :title="editing ? '编辑条目' : '新增条目'" width="520px">
       <el-form label-width="90px">
-        <el-form-item label="地址">
+        <el-form-item label="目标类型">
+          <el-radio-group v-model="form.targetType" :disabled="editing">
+            <el-radio-button v-for="o in TARGET_TYPE_OPTIONS" :key="o.value" :value="o.value">
+              {{ o.label }}
+            </el-radio-button>
+          </el-radio-group>
+          <div v-if="editing" class="hint" style="margin-top: 6px">
+            类型与匹配值建好之后不能改，要换类型请删掉重建。
+          </div>
+        </el-form-item>
+
+        <el-form-item :label="targetLabel">
+          <!-- IP / CIDR -->
           <el-input
+            v-if="!isGeo"
             v-model="form.target"
             :disabled="editing"
             placeholder="1.2.3.4 或 1.2.3.0/24"
           />
+
+          <!-- 国家 / 地区：候选表来自服务端，和属地库返回的是同一套码。
+               同时允许直接输入 —— 候选表是刻意只收常见来源地的，未收录的国家
+               若不让人手输，就只能靠导入文件才能配得出来。 -->
+          <el-select
+            v-else-if="form.targetType === 'geo_country'"
+            v-model="geoValues"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            :max-collapse-tags="8"
+            :disabled="editing"
+            placeholder="选择或直接输入两位国家码（如 CN、CU）"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="c in countries"
+              :key="c.code"
+              :label="`${c.name}（${c.code}）`"
+              :value="c.code"
+            >
+              <span>{{ c.name }}</span>
+              <span class="opt-code">{{ c.code }}</span>
+              <el-tag v-if="c.common" size="small" type="info" style="margin-left: 6px">常见</el-tag>
+            </el-option>
+          </el-select>
+
+          <!-- 省份：候选集封闭（34 个省级行政区），所以用下拉而不是自由输入 -->
+          <el-select
+            v-else-if="form.targetType === 'geo_province'"
+            v-model="geoValues"
+            multiple
+            filterable
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            :max-collapse-tags="8"
+            :disabled="editing"
+            placeholder="选择省份（可多选）"
+            style="width: 100%"
+          >
+            <el-option v-for="p in provinces" :key="p.name" :label="p.full" :value="p.name" />
+          </el-select>
+
+          <!-- 城市：候选集开放，只能自由输入 -->
+          <el-select
+            v-else
+            v-model="geoValues"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            clearable
+            collapse-tags
+            collapse-tags-tooltip
+            :max-collapse-tags="8"
+            :disabled="editing"
+            placeholder="输入城市名后回车（可多个），例如 深圳"
+            style="width: 100%"
+          >
+            <el-option v-for="c in geoValues" :key="c" :label="c" :value="c" />
+          </el-select>
+
+          <div class="hint" style="margin-top: 6px">{{ targetHint }}</div>
         </el-form-item>
+
         <el-form-item label="备注">
           <el-input v-model="form.remark" placeholder="可选" />
         </el-form-item>
-        <el-form-item v-if="kind === 'black'" label="封禁范围">
+        <!-- 地区条目恒为全端口：它命中之后的落地方式是"把这个具体 IP 全端口封掉"，
+             内核里没有"地区"这个对象，也就不存在能限定到某几个端口的规则。
+             所以这里整块隐藏，而不是显示一个改不动的禁用框。 -->
+        <el-form-item v-if="kind === 'black' && !isGeo" label="封禁范围">
           <el-radio-group v-model="form.scope">
             <el-radio-button
               v-for="o in SCOPE_OPTIONS"
@@ -148,7 +246,7 @@
           </el-radio-group>
           <div class="hint" style="margin-top: 6px">{{ scopeFormHint(form.scope) }}</div>
         </el-form-item>
-        <el-form-item v-if="kind === 'black' && form.scope === 'custom'" label="封禁端口">
+        <el-form-item v-if="kind === 'black' && !isGeo && form.scope === 'custom'" label="封禁端口">
           <el-input v-model="form.ports" placeholder="8080,9000-9100" />
           <div class="hint" style="margin-top: 6px">
             写单个端口（8080）或区间（9000-9100），多个用逗号分隔。
@@ -175,6 +273,11 @@
         每行一个地址，支持 <span class="mono">1.2.3.4</span>、
         <span class="mono">1.2.3.0/24</span>，可以追加备注：<span class="mono">1.2.3.4,机房备用</span>。
         以 # 开头的行会被忽略。
+        <br />
+        地区条目在目标前加类型前缀：<span class="mono">country:CN</span>、
+        <span class="mono">province:广东</span>、
+        <span class="mono">city:深圳</span>，多个值用<strong>分号</strong>分隔
+        （<span class="mono">province:广东;福建</span>）。不加前缀的一律按地址解析。
       </div>
       <div v-if="kind === 'black'" class="hint" style="margin-bottom: 10px">
         黑名单还可以在第二列写范围 <span class="mono">all</span> /
@@ -197,7 +300,11 @@
               {{ o.label }}
             </el-radio-button>
           </el-radio-group>
-          <div class="hint" style="margin-top: 6px">未写范围的行按此处理。</div>
+          <div class="hint" style="margin-top: 6px">
+            未写范围的行按此处理。地区条目（<span class="mono">country:</span> /
+            <span class="mono">province:</span> / <span class="mono">city:</span> 开头的行）
+            不受此项影响，恒为全端口。
+          </div>
         </el-form-item>
         <el-form-item v-if="importScope === 'custom'" label="默认端口">
           <el-input v-model="importPorts" placeholder="8080,9000-9100" />
@@ -240,6 +347,31 @@ import { useColumnWidths } from '@/utils/table'
 
 const cw = useColumnWidths('acl')
 
+// 目标类型。前四个是地址（后端按内容推断），后三个是地区。
+// 值直接就是后端的 target_type 常量，不做二次映射 —— 多一层映射就多一处
+// 可能对不上的地方，而"界面写着城市、存进去是国家"这种错很难看出来。
+const TARGET_TYPE_OPTIONS = [
+  { label: 'IP / 网段', value: 'ip' },
+  { label: '国家 / 地区', value: 'geo_country' },
+  { label: '省份', value: 'geo_province' },
+  { label: '城市', value: 'geo_city' },
+]
+
+// 列表里的类型标签。地区类型要用中文，否则表格里是 geo_country 这种内部常量，
+// 用户既读不出它和「国家/地区」是一回事，也没法核对。
+const TYPE_LABEL: Record<string, string> = {
+  ipv4: 'IPv4',
+  ipv6: 'IPv6',
+  cidr4: 'IPv4 网段',
+  cidr6: 'IPv6 网段',
+  geo_country: '国家/地区',
+  geo_province: '省份',
+  geo_city: '城市',
+}
+
+const isGeoTarget = (t?: string) => !!t && t.startsWith('geo_')
+const typeLabel = (t?: string) => (t ? TYPE_LABEL[t] || t : '')
+
 const kind = ref('white')
 const rows = ref<any[]>([])
 const loading = ref(false)
@@ -251,7 +383,43 @@ const total = ref(0)
 const editVisible = ref(false)
 const editing = ref(false)
 const saving = ref(false)
-const form = reactive({ id: 0, target: '', remark: '', expires: 0, scope: 'all', ports: '' })
+const form = reactive({
+  id: 0,
+  target: '',
+  targetType: 'ip',
+  remark: '',
+  expires: 0,
+  scope: 'all',
+  ports: '',
+})
+// 地区条目的多值单独存一份数组：多选组件的 v-model 必须是数组，
+// 而入库形态是逗号分隔的一串。打开弹窗时拆开、保存时拼回去，只在这两处转换。
+const geoValues = ref<string[]>([])
+
+const countries = ref<any[]>([])
+const provinces = ref<any[]>([])
+
+const isGeo = computed(() => isGeoTarget(form.targetType))
+
+const targetLabel = computed(() => {
+  if (form.targetType === 'geo_country') return '国家 / 地区'
+  if (form.targetType === 'geo_province') return '省份'
+  if (form.targetType === 'geo_city') return '城市'
+  return '地址'
+})
+
+const targetHint = computed(() => {
+  switch (form.targetType) {
+    case 'geo_country':
+      return '命中所选任一国家/地区的来源会被拒绝。多选是「或」的关系。下拉里只收了常见来源地，没收录的国家直接敲两位代码（如 CU）即可回车添加。'
+    case 'geo_province':
+      return '省份取值与属地库返回的一致（已去掉「省 / 自治区」这类后缀）。多选是「或」。'
+    case 'geo_city':
+      return '城市没有候选列表，写错不会报错、只会永远不命中。写「深圳」或「深圳市」都行（后缀会被去掉），拿不准先用「属地查询」核对。'
+    default:
+      return '单个 IP（1.2.3.4）或网段（1.2.3.0/24）。'
+  }
+})
 
 const importVisible = ref(false)
 const importing = ref(false)
@@ -263,8 +431,8 @@ const importResult = ref<any>(null)
 // 黑名单多给一行带范围的示例，白名单保持原样
 const importPlaceholder = computed(() =>
   kind.value === 'black'
-    ? '1.2.3.4,frp,扫描源\n1.2.3.0/24,办公网\n1.2.3.4,custom:8080;9000-9100,只封两个端口\n# 注释行'
-    : '1.2.3.4\n1.2.3.0/24,办公网\n# 注释行'
+    ? '1.2.3.4,frp,扫描源\n1.2.3.0/24,办公网\ncountry:CN,扫描源\nprovince:广东;福建\n1.2.3.4,custom:8080;9000-9100,只封两个端口\n# 注释行'
+    : '1.2.3.4\n1.2.3.0/24,办公网\ncountry:CN\n# 注释行'
 )
 
 function fmt(t: string) {
@@ -299,9 +467,26 @@ function search() {
   reload()
 }
 
+// 逗号 / 分号 / 中文标点 / 空白都当分隔符：入库形态是逗号，但手工改过的库、
+// 从别处粘来的文本都可能带别的写法。地名里不会出现这些字符，多认几个不会误伤。
+const splitList = (s?: string) =>
+  String(s ?? '')
+    .split(/[,，;；\s]+/)
+    .map((v) => v.trim())
+    .filter(Boolean)
+
 function openCreate() {
   editing.value = false
-  Object.assign(form, { id: 0, target: '', remark: '', expires: 0, scope: 'all', ports: '' })
+  Object.assign(form, {
+    id: 0,
+    target: '',
+    targetType: 'ip',
+    remark: '',
+    expires: 0,
+    scope: 'all',
+    ports: '',
+  })
+  geoValues.value = []
   editVisible.value = true
 }
 
@@ -310,33 +495,49 @@ function openEdit(row: any) {
   Object.assign(form, {
     id: row.id,
     target: row.target,
+    // 老行存的是 ipv4 / cidr4 这类具体类型，回显到选项里都归到「IP / 网段」
+    // 那一档 —— 选项里没有 ipv4 这一项，直接塞进去会让整个单选组一个都不选中。
+    targetType: isGeoTarget(row.target_type) ? row.target_type : 'ip',
     remark: row.remark || '',
     expires: 0,
     // 老条目可能是空串，回显成全端口而不是留空，避免用户以为没设置过
     scope: row.scope === 'frp' || row.scope === 'custom' ? row.scope : 'all',
     ports: row.ports || '',
   })
+  geoValues.value = isGeoTarget(row.target_type) ? splitList(row.target) : []
   editVisible.value = true
 }
 
 async function save() {
-  if (!form.target && !editing.value) {
+  if (isGeo.value) {
+    // 地区条目的"值"在多选组件里，不是 form.target。这里必须单独判，
+    // 否则空选也能提交，后端报一句"国家/地区不能为空"，用户还得找是哪个框。
+    if (!geoValues.value.length) {
+      ElMessage.warning(`请至少填一个${targetLabel.value}`)
+      return
+    }
+  } else if (!form.target && !editing.value) {
     ElMessage.warning('请填写地址')
     return
   }
   // 自定义范围必须有端口：没有端口内核一条规则都生成不出来，而列表里它会显示成
   // 一条正常生效中的条目。后端也会拦，这里先拦一道是为了不白跑一趟。
-  if (kind.value === 'black' && form.scope === 'custom' && !form.ports.trim()) {
+  if (kind.value === 'black' && !isGeo.value && form.scope === 'custom' && !form.ports.trim()) {
     ElMessage.warning('自定义范围需要至少一个端口')
     return
   }
   // 非自定义范围一律把端口清成空串，而不是"不传"：库里残留一份不参与生效的端口，
   // 是"配置里写着、实际不生效"那类最难排查的问题。
-  const ports = form.scope === 'custom' ? form.ports.trim() : ''
+  // 地区条目本身恒为全端口，端口也一并清空（后端同样会摆正）。
+  const ports = !isGeo.value && form.scope === 'custom' ? form.ports.trim() : ''
+  // 地区值拼成入库形态（逗号分隔）；地址条目的值就是 form.target。
+  const target = isGeo.value ? geoValues.value.join(',') : form.target
+  const targetType = isGeo.value ? form.targetType : ''
   saving.value = true
   try {
     // 编辑时总是带上 scope：form.scope 已用行内原值回填，等价于"不改动"。
     // 白名单的 scope 由后端忽略，这里不用特判。
+    // 类型与匹配值不可改，所以更新请求里不带 target / target_type。
     if (editing.value) {
       await api.updateACL(kind.value, form.id, {
         remark: form.remark,
@@ -346,7 +547,8 @@ async function save() {
       })
     } else {
       await api.createACL(kind.value, {
-        target: form.target,
+        target,
+        target_type: targetType,
         remark: form.remark,
         expires_in_sec: form.expires,
         scope: form.scope,
@@ -369,8 +571,12 @@ async function remove(row: any) {
   } catch {
     return
   }
-  await api.deleteACL(kind.value, row.id)
-  ElMessage.success('已删除')
+  const r: any = await api.deleteACL(kind.value, row.id)
+  // 删条目会连带解禁"由这条条目封掉"的地址（否则删了名单，被它封的地址还是
+  // 进不来，而界面上已经看不到那条名单了）。这里必须把件数报出来 ——
+  // 静默解禁几个 IP 是那种"事后完全查不出发生过什么"的操作。
+  const n = r?.released_bans ?? 0
+  ElMessage.success(n > 0 ? `已删除，并解禁了 ${n} 条由它产生的封禁` : '已删除')
   reload()
 }
 
@@ -421,7 +627,23 @@ function exportList() {
   window.open(api.exportACLURL(kind.value), '_blank')
 }
 
-onMounted(reload)
+// 国家与省份候选表来自服务端：这两个值必须和属地库返回的是同一套写法，
+// 前端自己抄一份就等于把这份约定抄成了两份，早晚有一份会过时。
+async function loadGeoOptions() {
+  try {
+    const [c, p]: any[] = await Promise.all([api.geoCountries(), api.geoProvinces()])
+    countries.value = c?.countries || []
+    provinces.value = p?.provinces || []
+  } catch {
+    // 候选表拉不到不该让整个页面打不开：地址条目完全用不到它，
+    // 地区条目的下拉会空着，但用户仍能通过批量导入把条目写进去。
+  }
+}
+
+onMounted(() => {
+  reload()
+  loadGeoOptions()
+})
 </script>
 
 <style scoped>
@@ -438,5 +660,11 @@ onMounted(reload)
 
 .spacer {
   flex: 1;
+}
+
+.opt-code {
+  float: right;
+  color: #8a919f;
+  font-size: 12px;
 }
 </style>

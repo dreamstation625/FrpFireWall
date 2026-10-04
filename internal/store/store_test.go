@@ -329,3 +329,112 @@ func TestPurgeEventsRemovesOnlyExpired(t *testing.T) {
 		}
 	}
 }
+
+// 联动解禁只动"由这条来源封的"那几条，别的必须原样留着。
+//
+// 这一步错了的后果不对称：多解禁 = 该封的地址被放进来（还查不出原因，
+// 因为界面上那条依据已经删了）；少解禁 = 用户以为删干净了、地址却还是进不来。
+// 两个方向都要钉住。
+func TestReleaseBansIsScopedToGivenIDs(t *testing.T) {
+	s := openTemp(t)
+
+	now := time.Now()
+	mustCreate := func(target, ref string) *model.BanRecord {
+		t.Helper()
+		b := &model.BanRecord{
+			Target: target, TargetType: model.TargetTypeOf(target),
+			Scope: model.ScopeAll, Reason: "测试", Source: model.SourceGeoIP,
+			SourceRef: ref, Status: model.BanActive, BannedAt: now,
+		}
+		if err := s.CreateBan(b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	ref := model.BanSourceRef(model.BanRefACL, 12)
+	mine := mustCreate("203.0.113.1/32", ref)
+	mustCreate("203.0.113.2/32", ref)
+	other := mustCreate("198.51.100.1/32", model.BanSourceRef(model.BanRefACL, 99))
+	noRef := mustCreate("192.0.2.1/32", "")
+
+	// 空 ids 直接返回，不发空 UPDATE（空 UPDATE 在 GORM 里会报
+	// "WHERE conditions required"，把这个约束写死在这里）。
+	if err := s.ReleaseBans(nil, "tester", model.BanReleased); err != nil {
+		t.Fatalf("空 ids 不该报错：%v", err)
+	}
+
+	if err := s.ReleaseBans([]uint{mine.ID}, "tester", model.BanReleased); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetBan(mine.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.BanReleased || got.ReleasedBy != "tester" || got.ReleasedAt == nil {
+		t.Errorf("被封禁记录没有被正确标记：%+v", got)
+	}
+
+	for _, id := range []uint{other.ID, noRef.ID} {
+		b, err := s.GetBan(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Status != model.BanActive {
+			t.Errorf("第 %d 条不该被解禁，实际状态 %q", id, b.Status)
+		}
+	}
+
+	// 还留在同一来源上的那一条，也必须还是活跃的 —— 统计口径是
+	// "这条来源上还有多少没解的"，少算一条会让调用方以为已经清干净了。
+	left, err := s.CountActiveBansOfRef(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left != 1 {
+		t.Fatalf("同一来源上应还剩 1 条活跃封禁，实际 %d 条", left)
+	}
+}
+
+// CountActiveBansOfRef 的口径：只数活跃的，且是精确匹配来源引用。
+//
+// 不存在（比如规则被删光了）时返回 0 而不是报错 —— 调用方拿它做的是
+// "报个数给用户"，不是"据此决定要不要动数据"。
+func TestCountActiveBansOfRef(t *testing.T) {
+	s := openTemp(t)
+
+	ref := model.BanSourceRef(model.BanRefRule, 0) // 拼不出来，是空串
+	if ref != "" {
+		t.Fatalf("ID 为 0 的引用应当是空串，实际 %q", ref)
+	}
+
+	now := time.Now()
+	for _, b := range []*model.BanRecord{
+		{Target: "203.0.113.1/32", Status: model.BanActive, SourceRef: "rule:abc", BannedAt: now},
+		{Target: "203.0.113.2/32", Status: model.BanReleased, SourceRef: "rule:abc", BannedAt: now},
+		{Target: "203.0.113.3/32", Status: model.BanActive, SourceRef: "acl:1", BannedAt: now},
+	} {
+		if err := s.CreateBan(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := s.CountActiveBansOfRef("rule:abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("应当只数活跃的那 1 条，实际 %d 条", n)
+	}
+
+	// 空引用不能把所有"没有来源"的封禁一网打尽，否则频次自动封禁会被
+	// 误算到任何一次联动解禁里。
+	empty, err := s.CountActiveBansOfRef("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty != 0 {
+		t.Fatalf("空引用不该匹配到任何东西，实际 %d 条", empty)
+	}
+}

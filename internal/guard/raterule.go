@@ -30,7 +30,16 @@ type appRule struct {
 
 	countries map[string]bool
 	provinces map[string]bool
+	cities    map[string]bool
 	prefixes  []netip.Prefix
+
+	// block 为 true 表示这条规则的动作是"命中即拦截"：条件对上就直接拒绝，
+	// 后面的 window/threshold/bucket 都不会被用到（Validate 也不允许它们共存）。
+	block bool
+
+	// ref 是这条规则在封禁记录里的来源引用（内容签名，见 model.RateRule.BanRef）。
+	// 不用规则 ID —— 规则表整体替换，ID 每次保存都会变。
+	ref string
 
 	// window / threshold / steps 来自规则自己的封禁配置。
 	// threshold <= 0 表示这条规则只管限速、不封禁。
@@ -66,6 +75,14 @@ func (r *appRule) match(addr netip.Addr, geo *geoip.Info) bool {
 		// 而规则里存的是归一后的「广东」「内蒙古」。不归一的话两边永远对不上，
 		// 而且是静默不命中。
 		if geo == nil || !r.provinces[model.CanonicalProvince(geo.Province)] {
+			return false
+		}
+	}
+	if len(r.cities) > 0 {
+		// 城市同理。注意城市名的候选集是开放的：写成「深圳」还是「深圳市」
+		// 由 CanonicalCity 统一，但写成别的城市名不会报错、只会不命中 ——
+		// 这一点在界面上必须说清楚（见 model.CanonicalCity）。
+		if geo == nil || !r.cities[model.CanonicalCity(geo.City)] {
 			return false
 		}
 	}
@@ -154,7 +171,10 @@ func compileRules(rows []model.RateRule) (app []appRule, kernel []kernelRule, sk
 			name:      row.Name,
 			countries: stringSet(row.CountryList()),
 			provinces: stringSet(row.ProvinceList()),
+			cities:    stringSet(row.CityList()),
 			prefixes:  prefixes,
+			block:     row.Block,
+			ref:       row.BanRef(),
 		}
 		if row.WindowSeconds > 0 && row.Threshold > 0 {
 			a.window = time.Duration(row.WindowSeconds) * time.Second

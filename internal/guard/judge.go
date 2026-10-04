@@ -47,15 +47,20 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 
 	now := time.Now()
 
+	// 属地先算出来：地区名单的判定要用它。查询本身在锁外做（要查库/文件），
+	// 不能带着锁去查。
+	geoInfo := m.lookupGeo(addr)
+
 	m.mu.RLock()
 	policy := m.policy
 	isWhite := m.matchAnyLocked(m.white, addr)
 	isBlack := m.matchAnyBlockLocked(m.black, addr)
+	geoWhiteHit := m.matchGeoLocked(m.geoWhite, geoInfo)
+	geoBlackHit := m.matchGeoLocked(m.geoBlack, geoInfo)
 	trusted := m.protect != nil && m.protect.IsTrustedProxy(addr)
 	ban, banned := m.findBanLocked(addr, policy, now)
 	m.mu.RUnlock()
 
-	geoInfo := m.lookupGeo(addr)
 	evt := func(detail string) {
 		m.pushEvent(&model.Event{
 			Category: category,
@@ -68,9 +73,15 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 		})
 	}
 
-	// 1. 白名单：直接放行，永不封禁。
-	if isWhite {
-		evt("命中白名单，放行")
+	// 1. 白名单：直接放行，永不封禁。IP 条目与地区条目同权 —— 对用户来说
+	//    "这个来源放行"是一件事，只是写法和匹配方式不同。
+	if isWhite || geoWhiteHit != nil {
+		detail := "命中白名单，放行"
+		if geoWhiteHit != nil && !isWhite {
+			detail = fmt.Sprintf("命中白名单地区条目（%s %s），放行",
+				model.GeoTargetLabel(geoWhiteHit.kind), geoWhiteHit.list)
+		}
+		evt(detail)
 		return Verdict{Allow: true, Reason: "whitelist"}
 	}
 
@@ -83,6 +94,28 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 			Detail: "命中手动黑名单",
 		})
 		return Verdict{Allow: false, Reason: "blacklist", Detail: "IP 已在黑名单中"}
+	}
+
+	// 2b. 地区黑名单：命中即把这个地址封掉。
+	//
+	// 内核认不出属地（mmdb / ip2region 都是查询型库，没法反向枚举出一个国家的
+	// CIDR 列表），所以地区条目**一条内核规则都不产生**。做法与下面第 5 步的
+	// 全局地域名单是同一套：应用层先认出来，再把这个**具体 IP** 落进内核封禁。
+	// 差别只在名单来源 —— 这里是人工条目，那里是全局策略里的地区列表。
+	//
+	// 已知边界：没被命中过的地址在内核里没有任何痕迹，所以地区条目挡的是
+	// "来连 frp"这件事，挡不住别人直接扫其它端口（见 DESIGN D22）。
+	if geoBlackHit != nil {
+		reason := fmt.Sprintf("来源属地命中黑名单条目：%s %s",
+			model.GeoTargetLabel(geoBlackHit.kind), geoBlackHit.list)
+		m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo, nil,
+			model.BanSourceRef(model.BanRefACL, geoBlackHit.id))
+		m.pushEvent(&model.Event{
+			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Country: geoInfo.Country, Province: geoInfo.Province,
+			Detail: reason,
+		})
+		return Verdict{Allow: false, Reason: "geo-blacklist", Detail: reason}
 	}
 
 	// 3. 活跃封禁：拒绝，并把剩余时间回给 frpc，方便运维排查。
@@ -121,7 +154,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 			if policy.GeoIPMode == "whitelist" {
 				reason = fmt.Sprintf("来源国家/地区 %s 不在放行名单内", geoInfo.CountryName)
 			}
-			m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo, nil)
+			m.triggerBan(addr, model.SourceGeoIP, reason, user, geoInfo, nil, "")
 			m.pushEvent(&model.Event{
 				Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
@@ -137,6 +170,26 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 	//    地域名单，也不含自动封禁 / 观察模式这类全局开关 —— 那几个是行为开关，
 	//    不是"这条规则用多大力度"。
 	rule := m.matchAppRule(addr, geoInfo)
+
+	// 6b. 命中即拦截：条件对上就直接拒绝，不计数、不限速。
+	//
+	// 排在限速与阈值之前是有意的 —— 这条规则的动作就是"进不来"，
+	// 让它先过一遍窗口计数或令牌桶只是白费，而且会给限速的桶攒下状态，
+	// 影响同一来源在别的规则上的表现。
+	//
+	// 同样按"命中即封禁"落地（与地区黑名单、全局地域名单一致）：封的是这个
+	// 具体 IP，不是"某地区"。sourceRef 指向规则本身，规则被删除或停用时由它
+	// 封掉的地址要一起解封。
+	if rule != nil && rule.block {
+		reason := "规则「" + rule.name + "」命中，来源被直接拦截"
+		m.triggerBan(addr, model.SourceRule, reason, user, geoInfo, nil, rule.ref)
+		m.pushEvent(&model.Event{
+			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
+			Country: geoInfo.Country, Province: geoInfo.Province,
+			Detail: reason,
+		})
+		return Verdict{Allow: false, Reason: "rule-blocked", Detail: reason}
+	}
 
 	// 7. 频控参数：命中规则就用规则的，否则用全局策略。
 	tag, win, threshold, steps, who := "", time.Duration(0), 0, []int64(nil), ""
@@ -190,7 +243,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, extra string) Verdi
 			return Verdict{Allow: true, Reason: "threshold-hit-no-autoban"}
 		}
 
-		m.triggerBan(addr, model.SourceAuto, detail, user, geoInfo, steps)
+		m.triggerBan(addr, model.SourceAuto, detail, user, geoInfo, steps, "")
 		m.pushEvent(&model.Event{
 			Category: model.EvtLoginBlocked, IP: ip, User: user, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,

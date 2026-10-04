@@ -806,6 +806,81 @@ get -X DELETE "$BASE/api/v1/acl/black/$SC2ID" -H "$AUTH" > /dev/null
 get -X DELETE "$BASE/api/v1/acl/white/$SCWID" -H "$AUTH" > /dev/null
 
 echo
+echo "########## 9b. 名单里的地区条目（国家 / 省份 / 城市） ##########"
+# 地区条目与地址条目共用一张表，但**落地方式完全不同**：属地库都是查询型的
+# （给 IP 问地区可以，反查一个国家的 CIDR 列表不行），所以地区条目不产生任何
+# 内核规则，只在命中之后把那个具体 IP 封掉（见 DESIGN D22）。
+# 这里覆盖的是"存得进来 / 读得出去 / 导得回来"这一层；真正的命中行为需要
+# 属地库文件（仓库里不放 mmdb / xdb），由 model 与 guard 的单测覆盖。
+
+GEO=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"cn, hk,CN","target_type":"geo_country","scope":"frp","remark":"冒烟-地区"}')
+check "新增国家地区条目" "$(printf '%s' "$GEO" | jqf data.target_type)" "geo_country"
+# 归一化：小写转大写、去空格、去重。归一化结果就是入库形态，也是匹配时比较的形态
+check "国家码归一化（大写 / 去重 / 去空格）" "$(printf '%s' "$GEO" | jqf data.target)" "CN,HK"
+# 地区条目没有"范围"可言，传了也不能落库 —— 否则界面上会出现一条
+# "显示只封 frp 端口、实际按全端口封"的条目
+check "地区条目忽略范围" "$(printf '%s' "$GEO" | jqf data.scope)" "all"
+GEOID=$(printf '%s' "$GEO" | jqf data.id)
+
+GEOP=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"广东省","target_type":"geo_province"}')
+check "省份归一化（广东省 → 广东）" "$(printf '%s' "$GEOP" | jqf data.target)" "广东"
+GEOPID=$(printf '%s' "$GEOP" | jqf data.id)
+
+# 城市只做写法归一、不校验真实性（候选集是开放的），所以「深圳市」要变成「深圳」，
+# 而没收录的地名也照样收下 —— 写错的表现是"永远不命中"，不是报错。
+GEOC=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"深圳市, 深圳市","target_type":"geo_city"}')
+check "城市归一化（去「市」后缀 + 去重）" "$(printf '%s' "$GEOC" | jqf data.target)" "深圳"
+GEOCID=$(printf '%s' "$GEOC" | jqf data.id)
+
+# 省份反过来：候选集完整且封闭（34 个省级行政区），写错的后果同样是静默不命中，
+# 所以这里是**报错**而不是放行 —— 校验强度的差异是刻意的，不是漏写。
+check_err "无法识别的省份被拒" \
+  "$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"target":"火星省","target_type":"geo_province"}' | jqf error)" "无法识别"
+# 国家码只校验"两位字母"的格式，不查真实性：能查的只有属地库那份**常见来源地**表，
+# 拿它当白名单会把哈萨克斯坦、古巴这类真实国家一起拒掉。所以 KZ 必须放行。
+check_err "三位字母的国家码被拒（只查格式）" \
+  "$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"target":"CHN","target_type":"geo_country"}' | jqf error)" "两位字母"
+KZ=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"kz","target_type":"geo_country"}')
+check "未收录的国家码照收（不做真实性校验）" "$(printf '%s' "$KZ" | jqf data.target)" "KZ"
+KZID=$(printf '%s' "$KZ" | jqf data.id)
+
+# 导出必须带类型前缀：不带前缀的 "CN" / "深圳" 在导入端只能被当成地址解析、
+# 报"非法的 IP 地址" —— 那等于地区条目根本没法备份（导出→导入是最常走的一条路）。
+# 多值用分号，因为逗号是列分隔符。
+EXP=$(get -H "$AUTH" "$BASE/api/v1/acl/black/export")
+check "导出带国家类型前缀" "$(printf '%s' "$EXP" | grep -c 'country:CN;HK')" "1"
+check "导出带省份类型前缀" "$(printf '%s' "$EXP" | grep -c 'province:广东')" "1"
+check "导出带城市类型前缀" "$(printf '%s' "$EXP" | grep -c 'city:深圳')" "1"
+
+# 导出 → 导入闭环
+check "导入地区行（带前缀 / 多值分号）" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"country:CN;HK,冒烟-地区\nprovince:广东;福建\ncity:深圳","dry_run":true}' | jqf data.added)" "3"
+# 带前缀但值非法时**不回落**成地址解析：回落只会让人看到"非法的 IP 地址"，
+# 而真正的问题是省份写错了。所以这一行必须进 invalid，而不是被当成地址收下。
+check "导入里写错的省份进 invalid（不回落成地址）" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"province:火星省","dry_run":true}' | jqf data.invalid)" "[1]"
+# 无前缀一律按地址解析 —— 老版本导出的文件不用改一个字节就能导入
+check "无前缀仍按地址解析（老文件兼容）" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"198.51.100.30","dry_run":true}' | jqf data.added)" "1"
+
+# 删条目要报出"顺带解禁了几条"。没有属地库时它恒为 0，但字段本身必须存在：
+# 前端靠它决定提示什么，字段没了就是静默不提示（这条链路的完整行为在 12b 覆盖）。
+check "删条目返回联动解禁条数" \
+  "$(get -X DELETE "$BASE/api/v1/acl/black/$GEOID" -H "$AUTH" | jqf data.released_bans)" "0"
+get -X DELETE "$BASE/api/v1/acl/black/$GEOPID" -H "$AUTH" > /dev/null
+get -X DELETE "$BASE/api/v1/acl/black/$GEOCID" -H "$AUTH" > /dev/null
+get -X DELETE "$BASE/api/v1/acl/black/$KZID" -H "$AUTH" > /dev/null
+
+echo
 echo "########## 10. 封禁 ##########"
 check_any "活跃封禁列表" "$(get -H "$AUTH" "$BASE/api/v1/bans/active" | jqf data.total)"
 check_any "封禁历史 total" "$(get -H "$AUTH" "$BASE/api/v1/bans?page=1&size=5" | jqf data.total)"
@@ -909,6 +984,76 @@ BID3=$(printf '%s' "$BL" | jqf data.items.0.id)
 get -X DELETE "$BASE/api/v1/bans/$BID3" -H "$AUTH" > /dev/null
 check "解封后 banned=false" \
   "$(get -X POST "$BASE/api/v1/bans/lookup" -H "$AUTH" -H 'Content-Type: application/json' -d "{\"target\":\"$FIP\"}" | jqf data.banned)" "false"
+
+echo
+echo "########## 12b. 直接拦截与关联解禁 ##########"
+# 「直接拦截」是细分规则里的第三种动作：不等频次，条件命中就拒绝这次连接，
+# 并按"命中即封禁"把该 IP 落进内核 —— 与地区名单条目、全局地域名单是同一套
+# 落地方式（见 DESIGN D22）。
+#
+# 这里用网段条件而不是地区条件来测：地区条件需要真实属地库，仓库里不放 mmdb / xdb。
+# 但两者走的是**同一条代码路径**（命中即 triggerBan，带上来源引用），
+# 所以这条链路的行为能在这里完整验证（见 DESIGN D23）。
+BRIP="198.51.100.$(( ($(date +%s) % 180) + 40 ))"
+printf '%s' "$BODY" | mut -id -updated_at \
+  "rules=[{\"name\":\"直接拦截段\",\"cidrs\":\"$BRIP\",\"block\":true}]" > /tmp/br1.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/br1.json)
+check "保存直接拦截规则" "$(printf '%s' "$R" | jqf ok)" "true"
+RL=$(get -H "$AUTH" "$RULES_URL")
+# 不填端口 ⇒ 落应用层。内核只有丢包一种动作，且发生在 frps 之前，
+# 应用层的"命中即拒绝"在那里表达不出来（所以 block + 端口是保存时就报错的组合）
+check "拦截规则落应用层" "$(printf '%s' "$RL" | jqf data.rules.0.layer)" "app"
+check "拦截标记读得回来" "$(printf '%s' "$RL" | jqf data.rules.0.block)" "true"
+
+# 互斥：拦截与限速/封禁配在同一条里只会有一条生效，必须保存就报错
+printf '%s' "$BODY" | mut -id -updated_at \
+  "rules=[{\"name\":\"混搭\",\"cidrs\":\"$BRIP\",\"block\":true,\"per_sec\":5}]" > /tmp/br2.json
+check_err "拒绝拦截 + 限速同条" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/br2.json | jqf error)" "永远不会被用到"
+printf '%s' "$BODY" | mut -id -updated_at \
+  "rules=[{\"name\":\"混搭\",\"ports\":\"443\",\"block\":true}]" > /tmp/br3.json
+check_err "拒绝拦截 + 端口同条" \
+  "$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/br3.json | jqf error)" "表达不出来"
+
+R=$(post_op Login "$(login_body br1 "$BRIP:5000")")
+check "命中直接拦截规则" "$(printf '%s' "$R" | jqf reject)" "true"
+# reject_reason 取的是判定里的 Detail（不是 reason 枚举值），所以这里断言的是
+# 人话里带着**规则名** —— 用户拿到这条拒绝唯一能顺下去排查的信息就是它
+check_err "拦截原因里带规则名" "$(printf '%s' "$R" | jqf reject_reason)" "直接拦截段"
+
+BL=$(get -H "$AUTH" "$BASE/api/v1/bans?page=1&size=5&keyword=$BRIP")
+check "命中即封禁该 IP" "$(printf '%s' "$BL" | jqf data.total)" "1"
+check "封禁来源标为规则" "$(printf '%s' "$BL" | jqf data.items.0.source)" "rule"
+# 来源引用是**匹配条件的内容签名**，不是规则 ID：规则表是整表替换的，ID 每次
+# 保存都变，拿 ID 做引用会在第一次保存后就失配（见 DESIGN D23）。
+# 只断言前缀 —— 签名值依赖条件内容，写死等于每次改条件就要回来改脚本。
+check "封禁记录带来源引用" \
+  "$(printf '%s' "$BL" | jqr data.items | grep -c '"source_ref":"rule:')" "1"
+BRID=$(printf '%s' "$BL" | jqf data.items.0.id)
+
+# 手动解封一个"因为规则被封"的地址：规则本身**不动** —— 规则还在跑，
+# 删掉它下次连接照样命中。所以清理计数必须是 0，而不是"顺手把规则删了"。
+check "规则来源的手动解封不清规则" \
+  "$(get -X DELETE "$BASE/api/v1/bans/$BRID" -H "$AUTH" | jqf data.source_entry_removed)" "0"
+check "规则仍在（手动解封不删依据）" "$(get -H "$AUTH" "$RULES_URL" | jqf data.rules)" "[1]"
+check "手动解封后 banned=false" \
+  "$(get -X POST "$BASE/api/v1/bans/lookup" -H "$AUTH" -H 'Content-Type: application/json' -d "{\"target\":\"$BRIP\"}" | jqf data.banned)" "false"
+
+# 依据消失时联动解禁：删掉规则（等价于"这条拦截不再成立"），被它封掉的地址
+# 必须跟着放开 —— 否则界面上已经看不到那条规则了、地址却还进不来，
+# 用户既不知道该点哪里，也想不通为什么。
+post_op Login "$(login_body br2 "$BRIP:5000")" > /dev/null
+check "再次命中后重新封禁" \
+  "$(get -H "$AUTH" "$BASE/api/v1/bans/active" | jqr data.items | grep -c "$BRIP")" "1"
+printf '%s' "$BODY" | mut -id -updated_at 'rules=[]' > /tmp/br4.json
+get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/br4.json > /dev/null
+check "删掉规则后联动解禁" \
+  "$(get -X POST "$BASE/api/v1/bans/lookup" -H "$AUTH" -H 'Content-Type: application/json' -d "{\"target\":\"$BRIP\"}" | jqf data.banned)" "false"
+# 还原跑之前就存在的规则（第 14 节不碰规则，这里漏了就会把用户的规则清空）
+printf '%s' "$BODY" | mut -id -updated_at "rules=$RULES0" > /tmp/br5.json
+R=$(get -X PUT "$BASE/api/v1/policy" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/br5.json)
+check "12b 收尾：原有规则已还原" \
+  "$(get -H "$AUTH" "$RULES_URL" | jqf data.rules)" "$(printf '%s' "$RULES0" | jqf '')"
 
 echo
 echo "########## 13. 观察模式 ##########"

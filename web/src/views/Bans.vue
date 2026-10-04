@@ -331,30 +331,48 @@ function searchHistory() {
   loadHistory()
 }
 
+// source_ref 形如 "acl:12" / "rule:3a7f"，指向"因为谁被封的"。
+// 只有 acl: 开头的才会在解封时连带删掉那条名单 —— 规则是整体保存的，
+// 删单条规则无从谈起（改规则会让它的引用失效，那一路由保存动作负责解禁）。
+function fromACL(row: any) {
+  return String(row?.source_ref || '').startsWith('acl:')
+}
+
 async function unban(row: any) {
+  // 解封必须把背后那条名单一起说清楚：只解封不动名单的话，这个地址下次一连
+  // 又会被同一条名单挡回去，用户会以为"解封没用"；而连带删名单是实打实地
+  // 改了配置，不先说一声就删掉一条黑名单条目同样说不过去。
+  const tip = fromACL(row)
+    ? `确定解封 ${row.target} 吗？它是由黑名单条目封掉的，解封会同时删除那条条目（否则它下次一连又会被同一条挡回来）。`
+    : `确定解封 ${row.target} 吗？`
   try {
-    await ElMessageBox.confirm(`确定解封 ${row.target} 吗？`, '确认解封', { type: 'warning' })
+    await ElMessageBox.confirm(tip, '确认解封', { type: 'warning' })
   } catch {
     return
   }
-  await api.deleteBan(row.record_id)
-  ElMessage.success('已解封')
+  const r: any = await api.deleteBan(row.record_id)
+  ElMessage.success(r?.source_entry_removed ? '已解封，并删除了背后那条黑名单条目' : '已解封')
   await loadActive()
   await loadHistory()
 }
 
 async function batchUnban() {
   if (!selected.value.length) return
+  const n = selected.value.filter(fromACL).length
+  const tip = n
+    ? `确定解封选中的 ${selected.value.length} 个地址吗？其中 ${n} 个由黑名单条目封掉，会连同那些条目一起删除。`
+    : `确定解封选中的 ${selected.value.length} 个地址吗？`
   try {
-    await ElMessageBox.confirm(`确定解封选中的 ${selected.value.length} 个地址吗？`, '批量解封', {
-      type: 'warning',
-    })
+    await ElMessageBox.confirm(tip, '批量解封', { type: 'warning' })
   } catch {
     return
   }
   const ids = selected.value.map((r) => r.record_id)
   const r: any = await api.batchDeleteBan(ids)
-  ElMessage.success(`成功 ${r.success} 个，失败 ${r.failed} 个`)
+  const removed = r?.source_entry_removed ?? 0
+  ElMessage.success(
+    `成功 ${r.success} 个，失败 ${r.failed} 个` + (removed > 0 ? `，删除名单条目 ${removed} 条` : '')
+  )
   await loadActive()
   await loadHistory()
 }

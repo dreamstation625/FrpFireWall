@@ -47,29 +47,29 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 	}
 
 	var req struct {
-		Target    string `json:"target"`
-		Remark    string `json:"remark"`
-		ExpiresIn int64  `json:"expires_in_sec"` // <=0 表示永久
-		Scope     string `json:"scope"`          // all | frp | custom，留空按 all
-		Ports     string `json:"ports"`          // 仅 scope=custom 时有意义
+		Target string `json:"target"`
+		// TargetType 留空时按 IP/CIDR 推断（老客户端不传这个字段）。
+		// 要建地区条目就必须显式给 geo_country / geo_province / geo_city ——
+		// 不从内容去猜：两位字母既可能是国家码也可能是个手滑的地址片段，
+		// 猜错的后果是"配了一条永远不命中或莫名其妙命中的条目"。
+		TargetType string `json:"target_type"`
+		Remark     string `json:"remark"`
+		ExpiresIn  int64  `json:"expires_in_sec"` // <=0 表示永久
+		Scope      string `json:"scope"`          // all | frp | custom，留空按 all
+		Ports      string `json:"ports"`          // 仅 scope=custom 时有意义
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		badRequest(c, "请求格式不正确")
 		return
 	}
 
-	target, err := normalizeTargetString(req.Target)
+	target, targetType, err := normalizeACLTarget(req.Target, req.TargetType)
 	if err != nil {
 		badRequest(c, err.Error())
 		return
 	}
 
-	scope, err := normalizeScope(kind, req.Scope)
-	if err != nil {
-		badRequest(c, err.Error())
-		return
-	}
-	ports, err := normalizeScopePorts(scope, req.Ports)
+	scope, ports, err := aclScopePorts(kind, targetType, req.Scope, req.Ports)
 	if err != nil {
 		badRequest(c, err.Error())
 		return
@@ -78,7 +78,7 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 	entry := &model.ACLEntry{
 		Kind:       kind,
 		Target:     target,
-		TargetType: model.TargetTypeOf(target),
+		TargetType: targetType,
 		Scope:      scope,
 		Ports:      ports,
 		Remark:     req.Remark,
@@ -92,10 +92,13 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 		entry.ExpiresAt = &t
 	}
 
-	// 顺带把属地填上，列表里直接能看到来源
-	if info := s.geo.LookupString(target); info != nil {
-		entry.Country = info.Country
-		entry.Province = info.Province
+	// 顺带把属地填上，列表里直接能看到来源。
+	// 只对 IP 条目做：地区条目的 Target 是地名本身，拿去查属地没有意义。
+	if !model.IsGeoTargetType(targetType) {
+		if info := s.geo.LookupString(target); info != nil {
+			entry.Country = info.Country
+			entry.Province = info.Province
+		}
 	}
 
 	if err := s.store.UpsertACL(entry); err != nil {
@@ -146,39 +149,46 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 		return
 	}
 
-	if req.Scope != nil {
-		scope, err := normalizeScope(entry.Kind, *req.Scope)
-		if err != nil {
-			badRequest(c, err.Error())
-			return
+	// 地区条目的范围与端口恒为 all / 空，直接摆正不报错：这个字段对地区条目
+	// 本来就没有第二种含义（见 aclScopePorts），而库里的老行、前端漏传、
+	// 手工调接口都可能带进来一个与落地方式不符的值。
+	if model.IsGeoTargetType(entry.TargetType) {
+		entry.Scope, entry.Ports = model.ScopeAll, ""
+	} else {
+		if req.Scope != nil {
+			scope, err := normalizeScope(entry.Kind, *req.Scope)
+			if err != nil {
+				badRequest(c, err.Error())
+				return
+			}
+			entry.Scope = scope
 		}
-		entry.Scope = scope
-	}
-	// 顺手把库里的老行补正：AutoMigrate 加列前写入的行 scope 可能为空串
-	// （NOT NULL 列的 default 不会回头填已有行）。这类行读出来就到 guard 层
-	// 才被兜底成 all，留一个空值在库里迟早有人读错，碰上了就改掉。
-	if !model.ValidScope(entry.Scope) {
-		entry.Scope = model.ScopeAll
-	}
+		// 顺手把库里的老行补正：AutoMigrate 加列前写入的行 scope 可能为空串
+		// （NOT NULL 列的 default 不会回头填已有行）。这类行读出来就到 guard 层
+		// 才被兜底成 all，留一个空值在库里迟早有人读错，碰上了就改掉。
+		if !model.ValidScope(entry.Scope) {
+			entry.Scope = model.ScopeAll
+		}
 
-	// 端口：没传就沿用库里那份，传了就以传的为准。注意不能只看 req.Ports ——
-	// 从 custom 换成 all / frp 的请求通常不带 ports，而这时候**必须**把端口清掉，
-	// 否则库里会残留一份不参与生效的端口，界面上看不出来、内核对不上。
-	switch {
-	case req.Ports != nil:
-		ports, err := normalizeScopePorts(entry.Scope, *req.Ports)
-		if err != nil {
-			badRequest(c, err.Error())
-			return
+		// 端口：没传就沿用库里那份，传了就以传的为准。注意不能只看 req.Ports ——
+		// 从 custom 换成 all / frp 的请求通常不带 ports，而这时候**必须**把端口清掉，
+		// 否则库里会残留一份不参与生效的端口，界面上看不出来、内核对不上。
+		switch {
+		case req.Ports != nil:
+			ports, err := normalizeScopePorts(entry.Scope, *req.Ports)
+			if err != nil {
+				badRequest(c, err.Error())
+				return
+			}
+			entry.Ports = ports
+		case req.Scope != nil:
+			ports, err := normalizeScopePorts(entry.Scope, entry.Ports)
+			if err != nil {
+				badRequest(c, err.Error())
+				return
+			}
+			entry.Ports = ports
 		}
-		entry.Ports = ports
-	case req.Scope != nil:
-		ports, err := normalizeScopePorts(entry.Scope, entry.Ports)
-		if err != nil {
-			badRequest(c, err.Error())
-			return
-		}
-		entry.Ports = ports
 	}
 
 	entry.Remark = req.Remark
@@ -214,13 +224,33 @@ func (s *Server) handleDeleteACL(c *gin.Context) {
 	}
 	s.refreshGuard()
 
+	// 联动解禁：被这条条目封掉的地址要一起放开。
+	//
+	// 少这一步的后果很隐蔽 —— 界面上那条名单已经没了，被它挡在外面的地址却
+	// 还挂在封禁列表里，用户既不知道它们为什么进不来，也不知道该点哪几条。
+	released := s.releaseBansOfACL(c, entry.ID, "名单条目已删除")
+
 	_ = s.store.AddEvent(&model.Event{
 		Category: model.EvtConfig,
 		IP:       c.ClientIP(),
 		Detail:   fmt.Sprintf("删除%s条目 %s", kindLabel(entry.Kind), entry.Target),
 		Actor:    s.currentUser(c),
 	})
-	ok(c, gin.H{"message": "已删除"})
+	ok(c, gin.H{"message": "已删除", "released_bans": released})
+}
+
+// releaseBansOfACL 解除由某条名单条目触发的活跃封禁，返回解除的条数。
+//
+// 失败只记日志、不打断调用方：删条目本身已经成功，因为"解封没做干净"就把
+// 整个请求报成失败，会让用户以为条目没删掉而反复重试。
+func (s *Server) releaseBansOfACL(c *gin.Context, id uint, why string) int {
+	n, err := s.guard.ReleaseBansByRef(
+		model.BanSourceRef(model.BanRefACL, id), s.currentUser(c), why)
+	if err != nil {
+		s.log.Warn("名单条目联动解禁失败", "err", err, "acl_id", id)
+		return 0
+	}
+	return n
 }
 
 func (s *Server) handleBatchACL(c *gin.Context) {
@@ -234,22 +264,14 @@ func (s *Server) handleBatchACL(c *gin.Context) {
 		Action  string   `json:"action"` // add | delete
 		IDs     []uint   `json:"ids"`
 		Targets []string `json:"targets"`
-		Scope   string   `json:"scope"` // add 时本批统一用的范围，留空按 all
-		Ports   string   `json:"ports"` // 仅 scope=custom 时有意义
+		// TargetType 是 add 时本批统一的目标类型。留空按 IP/CIDR 逐条推断；
+		// 给地区类型时，Targets 里每一条就是一个地区值（"CN" / "广东" / "深圳"）。
+		TargetType string `json:"target_type"`
+		Scope      string `json:"scope"` // add 时本批统一用的范围，留空按 all
+		Ports      string `json:"ports"` // 仅 scope=custom 时有意义
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		badRequest(c, "请求格式不正确")
-		return
-	}
-
-	scope, err := normalizeScope(kind, req.Scope)
-	if err != nil {
-		badRequest(c, err.Error())
-		return
-	}
-	ports, err := normalizeScopePorts(scope, req.Ports)
-	if err != nil {
-		badRequest(c, err.Error())
 		return
 	}
 
@@ -259,26 +281,45 @@ func (s *Server) handleBatchACL(c *gin.Context) {
 			serverErr(c, err)
 			return
 		}
+		// 逐条联动解禁：批量删的每一条都可能封过一批地址，漏掉一条就等于
+		// 留了一批"界面上已经没有依据、却还进不来"的地址。
+		released := 0
+		for _, id := range req.IDs {
+			released += s.releaseBansOfACL(c, id, "名单条目已删除")
+		}
+		s.refreshGuard()
+		ok(c, gin.H{"message": "已处理", "released_bans": released})
+		return
+
 	case "add":
+		scope, ports, err := aclScopePorts(kind, req.TargetType, req.Scope, req.Ports)
+		if err != nil {
+			badRequest(c, err.Error())
+			return
+		}
+		isGeo := model.IsGeoTargetType(req.TargetType)
+
 		added := 0
 		for _, t := range req.Targets {
-			target, err := normalizeTargetString(t)
+			target, targetType, err := normalizeACLTarget(t, req.TargetType)
 			if err != nil {
 				continue
 			}
 			e := &model.ACLEntry{
 				Kind:       kind,
 				Target:     target,
-				TargetType: model.TargetTypeOf(target),
+				TargetType: targetType,
 				Scope:      scope,
 				Ports:      ports,
 				Source:     model.SourceManual,
 				CreatedAt:  time.Now(),
 				UpdatedAt:  time.Now(),
 			}
-			if info := s.geo.LookupString(target); info != nil {
-				e.Country = info.Country
-				e.Province = info.Province
+			if !isGeo {
+				if info := s.geo.LookupString(target); info != nil {
+					e.Country = info.Country
+					e.Province = info.Province
+				}
 			}
 			if err := s.store.UpsertACL(e); err == nil {
 				added++
@@ -287,13 +328,11 @@ func (s *Server) handleBatchACL(c *gin.Context) {
 		ok(c, gin.H{"added": added})
 		s.refreshGuard()
 		return
+
 	default:
 		badRequest(c, "action 只能是 add 或 delete")
 		return
 	}
-
-	s.refreshGuard()
-	ok(c, gin.H{"message": "已处理"})
 }
 
 // handleImportACL 批量导入。每行一个条目，支持以下写法：
@@ -361,11 +400,20 @@ func (s *Server) handleImportACL(c *gin.Context) {
 			skipped++
 			continue
 		}
-		target, err := normalizeTargetString(targetPart)
+		// 目标列可能带地区前缀（country:CN / province:广东 / city:深圳），
+		// 那是导出时写上去的。不带前缀的地区条目导入回来会被当成地址解析、
+		// 报"非法的 IP 地址"—— 导出再导入是用户最常走的一条路（留档、换机器），
+		// 断了等于地区条目没法备份。
+		target, targetType, err := normalizeImportTarget(targetPart)
 		if err != nil {
 			invalid = append(invalid, line)
 			skipped++
 			continue
+		}
+		// 地区条目没有"范围"可言，一律 all + 空端口（见 aclScopePorts）。
+		// 行内写了 custom:... 也忽略 —— 那个范围在它身上落不了地。
+		if model.IsGeoTargetType(targetType) {
+			lineScope, linePorts = model.ScopeAll, ""
 		}
 		if _, dup := seen[target]; dup {
 			skipped++
@@ -381,7 +429,7 @@ func (s *Server) handleImportACL(c *gin.Context) {
 		e := &model.ACLEntry{
 			Kind:       kind,
 			Target:     target,
-			TargetType: model.TargetTypeOf(target),
+			TargetType: targetType,
 			Scope:      lineScope,
 			Ports:      linePorts,
 			Remark:     remark,
@@ -389,9 +437,11 @@ func (s *Server) handleImportACL(c *gin.Context) {
 			CreatedAt:  time.Now(),
 			UpdatedAt:  time.Now(),
 		}
-		if info := s.geo.LookupString(target); info != nil {
-			e.Country = info.Country
-			e.Province = info.Province
+		if !model.IsGeoTargetType(targetType) {
+			if info := s.geo.LookupString(target); info != nil {
+				e.Country = info.Country
+				e.Province = info.Province
+			}
 		}
 		if err := s.store.UpsertACL(e); err != nil {
 			skipped++
@@ -445,13 +495,14 @@ func (s *Server) handleExportACL(c *gin.Context) {
 		// 拆列之后备注列一定会被端口串里的逗号切开。
 		b.WriteString("# 格式：地址,范围[,备注]\n")
 		b.WriteString("# 范围：all = 封禁该地址到本机的全部端口；frp = 只封 frp 服务端口\n")
-		b.WriteString("#       custom:端口 = 只封列出的端口，多个用分号分隔，如 custom:8080;9000-9100\n\n")
+		b.WriteString("#       custom:端口 = 只封列出的端口，多个用分号分隔，如 custom:8080;9000-9100\n")
+		b.WriteString("# 地区条目写成 country:CN / province:广东 / city:深圳，多个值用分号分隔\n\n")
 		for _, r := range rows {
 			scope := r.Scope
 			if !model.ValidScope(scope) {
 				scope = model.ScopeAll
 			}
-			b.WriteString(r.Target + "," + renderScopeField(scope, r.Ports))
+			b.WriteString(renderTargetField(r) + "," + renderScopeField(scope, r.Ports))
 			if r.Remark != "" {
 				b.WriteString("," + r.Remark)
 			}
@@ -459,12 +510,13 @@ func (s *Server) handleExportACL(c *gin.Context) {
 		}
 	} else {
 		// 白名单导出不带范围：范围描述的是"封住多少访问"，对豁免列表没有意义。
-		b.WriteString("# 格式：地址[,备注]\n\n")
+		b.WriteString("# 格式：地址[,备注]\n")
+		b.WriteString("# 地区条目写成 country:CN / province:广东 / city:深圳\n\n")
 		for _, r := range rows {
 			if r.Remark != "" {
-				b.WriteString(r.Target + "," + r.Remark + "\n")
+				b.WriteString(renderTargetField(r) + "," + r.Remark + "\n")
 			} else {
-				b.WriteString(r.Target + "\n")
+				b.WriteString(renderTargetField(r) + "\n")
 			}
 		}
 	}
@@ -557,11 +609,128 @@ func (s *Server) handleDeleteBan(c *gin.Context) {
 		badRequest(c, "ID 不正确")
 		return
 	}
-	if err := s.guard.UnbanByRecordID(uint(id), s.currentUser(c)); err != nil {
+	// 先把记录取出来：解封之后内存里那份就没了，来源引用也就查不到了。
+	rec, err := s.store.GetBan(uint(id))
+	if err != nil {
+		fail(c, http.StatusNotFound, "封禁记录不存在")
+		return
+	}
+
+	user := s.currentUser(c)
+	if err := s.guard.UnbanByRecordID(uint(id), user); err != nil {
 		badRequest(c, err.Error())
 		return
 	}
-	ok(c, gin.H{"message": "已解封"})
+
+	// 计数形式，和批量解封那个接口同一个口径（单条只可能是 0 或 1）。
+	// 一个接口给布尔、另一个给数字的话，前端得为同一个字段写两种判断。
+	cleared := 0
+	if s.clearBanSourceEntry(c, rec.SourceRef, rec.Target, user) {
+		cleared = 1
+	}
+	ok(c, gin.H{"message": "已解封", "source_entry_removed": cleared})
+}
+
+// clearBanSourceEntry 手动解封之后，把"把它挡在外面"的那条名单条目一并清掉。
+//
+// 为什么需要：某个地址因为命中一条黑名单条目被封，用户点解封 —— 解封当场生效，
+// 但它下一次连接又会命中同一条条目、立刻再被封一次。用户看到的是"解封没起作用"，
+// 而他的真实意图显然是"让这个地址进来"，所以顺手清掉那条条目才符合预期。
+//
+// 两道边界：
+//   - **条目的 Target 必须精确等于被封的地址。** 条目是个网段（1.2.3.0/24）时，
+//     删掉它等于顺手放行另外 255 个地址，那超出了用户点这一次解封的授权范围；
+//     这种情况只解封、不动条目。
+//   - **只管名单条目**。规则（rule:*）是条件型的（"来自某地区的一律拦"），
+//     没法从中"移除一个地址"，强行动作只会把整条规则改坏，所以只记一笔事件，
+//     让用户自己决定要不要调整规则。
+//
+// 返回是否真的删掉了条目。
+func (s *Server) clearBanSourceEntry(c *gin.Context, ref, target, user string) bool {
+	// 先按类型分岔，再去解析 ID。
+	//
+	// 顺序反过来的话，"规则引用"这一支永远不会被执行到：规则引用里的标识是
+	// 十六进制内容签名，ParseBanSourceRef 解析不出十进制 ID、直接返回 ok=false，
+	// 于是整段在这里就退出了 —— 用户解封一个"被规则一直拦着"的地址，什么提示
+	// 都看不到，只会发现解禁之后又被拦回来。
+	switch model.BanSourceRefKind(ref) {
+	case model.BanRefRule:
+		_ = s.store.AddEvent(&model.Event{
+			Category: model.EvtUnban,
+			IP:       target,
+			Detail:   "该地址由细分规则拦截：解封后若规则仍启用，下次连接会再次命中，请按需调整规则",
+			Actor:    user,
+		})
+		return false
+	case model.BanRefACL:
+		// 继续往下走，需要 entry id
+	default:
+		// 没有来源引用（频次自动封禁、全局地域名单、人工封禁）或者类型不认识。
+		return false
+	}
+
+	// 到这一步类型已经确定是名单条目，只差把主键取出来。
+	// 解析失败只可能是引用被写坏了，跳过联动处理、别去碰任何条目。
+	if _, id, ok := model.ParseBanSourceRef(ref); ok {
+		if s.releaseBanByACLID(c, id, target, user) {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseBanByACLID 是"解封时清理背后那条名单条目"的实际动作。
+//
+// 单独拆出来只为让 clearBanSourceEntry 的分岔逻辑一眼看得完：那里全是
+// "哪些情况不该动"的判断，真正的删除动作混在同一段里，很容易把某个
+// 早退条件连同删除一起漏掉。
+func (s *Server) releaseBanByACLID(c *gin.Context, id uint, target, user string) bool {
+	entry, err := s.store.GetACL(id)
+	if err != nil {
+		// 条目可能已经被删了（比如刚在名单页删掉），这不是错误。
+		return false
+	}
+	if !sameTarget(entry.Target, target) {
+		return false
+	}
+	if err := s.store.DeleteACL(id); err != nil {
+		s.log.Warn("解封时清理名单条目失败", "err", err, "acl_id", id)
+		return false
+	}
+	s.refreshGuard()
+
+	_ = s.store.AddEvent(&model.Event{
+		Category: model.EvtConfig,
+		IP:       c.ClientIP(),
+		Detail: fmt.Sprintf("解封 %s 时一并移除%s条目 %s（它是该地址被拦的原因，留着会再次拦下它）",
+			target, kindLabel(entry.Kind), entry.Target),
+		Actor: user,
+	})
+	return true
+}
+
+// sameTarget 判断两个目标是不是同一个地址/网段。
+//
+// 不能直接比字符串：封禁记录里的 Target 来自 banPrefix，按封禁粒度可能写成
+// "1.2.3.0/24" 甚至带 /32；而名单条目里存的是裸 IP。两者字面不同、指的却是
+// 同一件事，直接比字符串会让"同一个地址"被误判成不同，于是该清的条目清不掉。
+func sameTarget(a, b string) bool {
+	na, ok1 := canonicalTarget(a)
+	nb, ok2 := canonicalTarget(b)
+	return ok1 && ok2 && na == nb
+}
+
+// canonicalTarget 把目标统一成前缀形态（裸 IP 补成 /32 或 /128）。
+func canonicalTarget(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if p, err := netip.ParsePrefix(s); err == nil {
+		return p.Masked().String(), true
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		a = a.Unmap()
+		return netip.PrefixFrom(a, a.BitLen()).String(), true
+	}
+	return "", false
 }
 
 func (s *Server) handleBatchDeleteBan(c *gin.Context) {
@@ -574,10 +743,19 @@ func (s *Server) handleBatchDeleteBan(c *gin.Context) {
 	}
 
 	user := s.currentUser(c)
-	success, failed := 0, 0
+	success, failed, cleared := 0, 0, 0
 	errs := make([]string, 0, 4)
 
 	for _, id := range req.IDs {
+		// 逐条先把记录取出来：解封之后内存里那份就没了，来源引用也就查不到了。
+		rec, err := s.store.GetBan(id)
+		if err != nil {
+			failed++
+			if len(errs) < 4 {
+				errs = append(errs, fmt.Sprintf("#%d: 封禁记录不存在", id))
+			}
+			continue
+		}
 		if err := s.guard.UnbanByRecordID(id, user); err != nil {
 			failed++
 			if len(errs) < 4 {
@@ -585,9 +763,12 @@ func (s *Server) handleBatchDeleteBan(c *gin.Context) {
 			}
 			continue
 		}
+		if s.clearBanSourceEntry(c, rec.SourceRef, rec.Target, user) {
+			cleared++
+		}
 		success++
 	}
-	ok(c, gin.H{"success": success, "failed": failed, "errors": errs})
+	ok(c, gin.H{"success": success, "failed": failed, "errors": errs, "source_entry_removed": cleared})
 }
 
 // handleLookupIP 排障用：查一个 IP 当前处于什么状态。
@@ -690,9 +871,37 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 	}
 
 	if req.Rules != nil {
+		// 先记下旧规则的「封禁依据」签名，保存之后拿它和新集合作差。
+		//
+		// 差集里的就是"依据已经消失"的那些规则 —— 被删掉的、被停用的、条件
+		// 被改动过的，三种情况一并覆盖；由它们封掉的地址要跟着解封，否则界面上
+		// 那条规则已经改了甚至没了，被它挡在外面的地址却还进不来。
+		//
+		// 对比用**内容签名**而不是规则 ID：rate_rules 是整体替换的，ID 每次
+		// 保存都会变（见 model.RateRule.BanRef），拿 ID 比会得出满屏的假差集。
+		oldRows, err := s.store.RateRules()
+		if err != nil {
+			serverErr(c, err)
+			return
+		}
+		oldRefs := model.RateRuleBanRefs(oldRows)
+
 		if err := s.store.SavePolicyWithRules(&p, rules); err != nil {
 			serverErr(c, err)
 			return
+		}
+
+		newRefs := model.RateRuleBanRefs(rules)
+		for ref := range oldRefs {
+			if newRefs[ref] {
+				continue
+			}
+			// 解禁失败不打断保存：规则本身已经落盘了，因为联动解禁出错就报
+			// "保存失败"，会让用户以为规则没存进去而反复重试。
+			if _, err := s.guard.ReleaseBansByRef(ref, s.currentUser(c),
+				"细分规则已删除、停用或改动"); err != nil {
+				s.log.Warn("规则改动联动解禁失败", "err", err, "ref", ref)
+			}
 		}
 	} else if err := s.store.SavePolicy(&p); err != nil {
 		serverErr(c, err)
@@ -833,6 +1042,55 @@ func normalizeTargetString(s string) (string, error) {
 	return a.String(), nil
 }
 
+// normalizeACLTarget 归一化名单条目的目标，返回入库文本与目标类型。
+//
+// 两条路径：targetType 是地区类型时按地区口径处理（国家码 / 省份 / 城市），
+// 否则一律按 IP/CIDR 处理 —— 老客户端不传 targetType，走的也是这条路，
+// 所以这里不能要求它必填。
+//
+// 返回的 target 就是入库形态：IP 条目是规范化后的地址，地区条目是归一化后
+// 的逗号分隔地名（例如 "CN,US" / "广东,福建" / "深圳"）。
+func normalizeACLTarget(raw, targetType string) (target, tt string, err error) {
+	targetType = strings.TrimSpace(targetType)
+
+	if model.IsGeoTargetType(targetType) {
+		list, err := model.NormalizeGeoTarget(targetType, raw)
+		if err != nil {
+			return "", "", err
+		}
+		return list, targetType, nil
+	}
+
+	// 传了具体的 IP 类型但内容不是地址时，也让 normalizeTargetString 去报错 ——
+	// 它给出的原因（"非法的 CIDR" / "非法的 IP 地址"）比"类型不匹配"更好懂。
+	t, err := normalizeTargetString(raw)
+	if err != nil {
+		return "", "", err
+	}
+	return t, model.TargetTypeOf(t), nil
+}
+
+// aclScopePorts 决定一个条目的范围与端口。
+//
+// 地区条目恒为 all + 空端口：它命中之后的落地方式是"把这个具体 IP 全端口
+// 封掉"，内核里根本没有"地区"这个对象，也就不存在一条可以被限定到某几个
+// 端口的规则。强制写成 all/空，是为了别在库里留下一句"标着 frp、实际全端口"
+// 的谎话 —— 那种不一致在界面上完全看不出来，只有去数内核规则才会发现对不上。
+func aclScopePorts(kind, targetType, reqScope, reqPorts string) (scope, ports string, err error) {
+	if model.IsGeoTargetType(targetType) {
+		return model.ScopeAll, "", nil
+	}
+	scope, err = normalizeScope(kind, reqScope)
+	if err != nil {
+		return "", "", err
+	}
+	ports, err = normalizeScopePorts(scope, reqPorts)
+	if err != nil {
+		return "", "", err
+	}
+	return scope, ports, nil
+}
+
 // normalizeScope 校验并归一化封禁范围。
 //
 // 范围只对黑名单有意义：白名单描述的是"豁免谁"，条目本身不产生任何封禁动作，
@@ -925,6 +1183,140 @@ func renderScopeField(scope, ports string) string {
 		return model.ScopeAll
 	}
 	return scopeFieldPrefix + ":" + ps.StringSep(";")
+}
+
+// geoFieldPrefix 返回地区类型在导出文件里的前缀写法。
+//
+// 另给一个函数、而不是直接写 map：前缀与类型的对应关系只在这一处，导出（写）
+// 与导入（读）都从这里拿，两边不会各写一套而慢慢走岔。
+func geoFieldPrefix(targetType string) string {
+	switch targetType {
+	case model.TargetGeoCountry:
+		return "country"
+	case model.TargetGeoProvince:
+		return "province"
+	case model.TargetGeoCity:
+		return "city"
+	}
+	return ""
+}
+
+// geoTargetTypeOfPrefix 是 geoFieldPrefix 的逆运算。
+//
+// 同时认 "country" 与 "geo_country" 两种写法：前者是给用户看/手写的短形态，
+// 后者直接就是内部的类型常量（接口调用方会见到它）。多认一种写法的代价只是
+// 多一个 case，而少认一种的表现是"文件明明照着类型名写的却导入不了"。
+func geoTargetTypeOfPrefix(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "country", model.TargetGeoCountry:
+		return model.TargetGeoCountry
+	case "province", model.TargetGeoProvince:
+		return model.TargetGeoProvince
+	case "city", model.TargetGeoCity:
+		return model.TargetGeoCity
+	}
+	return ""
+}
+
+// renderTargetField 把条目的目标渲染成导出文件里那一列。
+//
+// IP / CIDR 条目原样输出；地区条目带上类型前缀（country:CN / province:广东 /
+// city:深圳）。**前缀不是装饰**：导出文件是拿来重新导入的（留档、换机器），
+// 不带前缀的"CN"、"深圳"在导入端只能被当成地址解析、报"非法的 IP 地址" ——
+// 那等于地区条目根本没法备份。
+//
+// 多值用分号分隔，理由与范围列里的端口列表完全一样：逗号是列分隔符。
+func renderTargetField(r model.ACLEntry) string {
+	prefix := geoFieldPrefix(r.TargetType)
+	if prefix == "" {
+		return r.Target
+	}
+	values := splitGeoTarget(r.Target)
+	if len(values) == 0 {
+		// 库里被手工改坏的地区条目（类型标着地区、值却是空的）。返回带前缀的
+		// 空串比返回裸空列好：至少导入方能看到"这条本来是地区条目"，而不是
+		// 平白多出一行解析不了的空地址。
+		return prefix + ":"
+	}
+	return prefix + ":" + strings.Join(values, ";")
+}
+
+// splitGeoTarget 把入库形态（逗号分隔）的地区值切成列表。
+//
+// 逗号、分号、中文标点都认：入库形态只可能是逗号（NormalizeGeoTarget 的产物），
+// 但这行的输入也可能来自界面表单或手工改过的库，多认几个分隔符不会误伤 ——
+// 地名里不可能出现这些字符。
+func splitGeoTarget(s string) []string {
+	out := make([]string, 0, 4)
+	f := func(r rune) bool {
+		switch r {
+		case ',', '，', ';', '；':
+			return true
+		}
+		return false
+	}
+	for _, v := range strings.FieldsFunc(s, f) {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// cutGeoPrefix 把 "country:CN" 拆成前缀与值。
+//
+// 找不到冒号返回 ok=false。冒号在 IPv6 里到处都是（2001:db8::1），所以这里
+// **只负责拆**，是不是真的地区前缀由调用方拿 geoTargetTypeOfPrefix 判断 ——
+// 拆出来的前缀不是已知地区类型时按地址走。
+func cutGeoPrefix(s string) (prefix, rest string, ok bool) {
+	i := strings.Index(s, ":")
+	if i < 0 {
+		return "", "", false
+	}
+	return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:]), true
+}
+
+// normalizeImportTarget 解析导入文件里的一列目标，返回入库文本与目标类型。
+//
+// 与 normalizeACLTarget 的差别只在"类型信息从哪来"：接口调用方有独立的
+// target_type 字段，而导入文件的类型只能写在目标里（country:CN）。老文件里
+// 全是裸地址、没有任何前缀，所以**无前缀一律按地址处理** —— 老导出的文件
+// 必须不改一个字节就能导入（与 parseImportLine 对第二列的宽容同一个理由）。
+//
+// 带前缀但值非法时**不回落成按地址解析**：那样只会让人看到"非法的 IP 地址"，
+// 而真正的问题是省份/国家码写错了，报错得指向真正的原因。
+//
+// 已知边界：切列时空格也是分隔符（见 cutLine），所以 "city:New York" 会在
+// 空格处被切开。国内城市名没有空格，这是"国内城市为主"口径下可接受的代价。
+func normalizeImportTarget(s string) (target, tt string, err error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "", fmt.Errorf("目标不能为空")
+	}
+	prefix, rest, ok := cutGeoPrefix(s)
+	if !ok {
+		t, err := normalizeTargetString(s)
+		if err != nil {
+			return "", "", err
+		}
+		return t, model.TargetTypeOf(t), nil
+	}
+	tt = geoTargetTypeOfPrefix(prefix)
+	if tt == "" {
+		// 形如 xxx:yyy 但不是已知地区前缀 —— 多半是 IPv6。交给地址解析判断，
+		// 它给的报错（"非法的 CIDR" / "非法的 IP 地址"）比"未知的地区类型"
+		// 更贴近真实情况。
+		t, err := normalizeTargetString(s)
+		if err != nil {
+			return "", "", err
+		}
+		return t, model.TargetTypeOf(t), nil
+	}
+	list, err := model.NormalizeGeoTarget(tt, rest)
+	if err != nil {
+		return "", "", err
+	}
+	return list, tt, nil
 }
 
 // parseImportLine 解析批量导入的一行，返回地址、封禁范围、端口、备注。

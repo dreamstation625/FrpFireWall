@@ -3,7 +3,11 @@ package api
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/dreamstation625/FrpFireWall/internal/model"
 )
 
 // 取一条名单条目当前在**库里**的样子。
@@ -136,5 +140,305 @@ func TestACLCustomPortsRejectsBadInput(t *testing.T) {
 	}
 	if scope, ports, _ := aclRow(t, h, entryID(t, h, r)); scope != "all" || ports != "" {
 		t.Errorf("白名单条目 = (%q, %q)，期望 (all, 空)", scope, ports)
+	}
+}
+
+// 地区条目的完整链路：新增 → 落库 → 导出带类型前缀 → 导入还原 → 删除。
+//
+// 这条链上最容易断的是导出：地区条目的目标不是地址，导出时不带类型前缀的话
+// 导入端会报"非法的 IP 地址" —— 等于地区条目根本没法留档、没法换机器搬。
+func TestACLGeoEntryEndToEnd(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+		"target":      "cn, hk",
+		"target_type": "geo_country",
+		// 地区条目没有"范围"可言，传进来的范围与端口必须被忽略
+		"scope":  "custom",
+		"ports":  "8080",
+		"remark": "境外扫描源",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("POST 应 200，得到 %d %s", code, r.Error)
+	}
+	id := entryID(t, h, r)
+
+	row, err := h.srv.store.GetACL(id)
+	if err != nil {
+		t.Fatalf("读条目失败：%v", err)
+	}
+	if row.Target != "CN,HK" || row.TargetType != model.TargetGeoCountry {
+		t.Fatalf("入库目标 = (%q, %q)，期望 (CN,HK, geo_country)", row.Target, row.TargetType)
+	}
+	if row.Scope != model.ScopeAll || row.Ports != "" {
+		t.Fatalf("地区条目的范围必须是 all/空，实际 (%q, %q) —— "+
+			"库里留一句「标着 custom、实际全端口」的谎话，界面上完全看不出来",
+			row.Scope, row.Ports)
+	}
+	// 地区条目的 Target 是地名，拿它查属地没有意义
+	if row.Country != "" || row.Province != "" {
+		t.Fatalf("地区条目不该回填属地，实际 (%q, %q)", row.Country, row.Province)
+	}
+
+	// 导出：必须是 country:CN;HK 这种带前缀的写法（多值用分号，逗号是列分隔符）
+	code, body := h.raw(http.MethodGet, "/api/v1/acl/black/export", nil)
+	if code != http.StatusOK {
+		t.Fatalf("导出应 200，得到 %d", code)
+	}
+	if !strings.Contains(body, "country:CN;HK") {
+		t.Fatalf("导出内容里没有带前缀的地区行：\n%s", body)
+	}
+	if strings.Contains(body, "country:CN,HK") {
+		t.Fatalf("多值用了逗号 —— 那是列分隔符，会把备注列切走：\n%s", body)
+	}
+
+	// 把导出的那一行原样导入回来，必须能还原成同一个条目
+	line := ""
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "country:") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("导出内容里找不到地区行：\n%s", body)
+	}
+	code, r = h.call(http.MethodPost, "/api/v1/acl/black/import", map[string]any{
+		"content":  line,
+		"dry_run":  true,
+		"scope":    "custom:8080", // 地区行必须忽略它
+		"dry_run2": nil,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("导入校验应 200，得到 %d %s", code, r.Error)
+	}
+	if n, _ := h.data(r)["added"].(float64); n != 1 {
+		t.Fatalf("导出的那一行应当能被导入，实际 added=%v（invalid=%v）",
+			h.data(r)["added"], h.data(r)["invalid"])
+	}
+
+	// 删除：即便没有任何封禁由它产生，也要把 released_bans 这个字段给出
+	// （前端直接读它报数），值为 0 而不是缺字段。
+	code, r = h.call(http.MethodDelete, "/api/v1/acl/black/"+strconv.Itoa(int(id)), nil)
+	if code != http.StatusOK {
+		t.Fatalf("DELETE 应 200，得到 %d %s", code, r.Error)
+	}
+	if _, ok := h.data(r)["released_bans"]; !ok {
+		t.Fatalf("删除响应里应当带 released_bans 字段：%v", h.data(r))
+	}
+	if _, err := h.srv.store.GetACL(id); err == nil {
+		t.Fatal("条目应当已被删除")
+	}
+}
+
+// 地区值写错时的报错要指向真正的原因。
+func TestACLGeoEntryRejectsBadInput(t *testing.T) {
+	h := newHarness(t)
+
+	cases := []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{"国家码三位", map[string]any{"target": "CHN", "target_type": "geo_country"}, "两位字母"},
+		{"省份无法识别", map[string]any{"target": "深证", "target_type": "geo_province"}, "无法识别"},
+		{"城市为空", map[string]any{"target": "  ", "target_type": "geo_city"}, "城市不能为空"},
+		// 不给类型时按地址解析，"CN" 不是地址
+		{"不给类型按地址", map[string]any{"target": "CN"}, "IP 地址"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, r := h.call(http.MethodPost, "/api/v1/acl/black", c.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("应 400，得到 %d %s", code, r.Error)
+			}
+			if !strings.Contains(r.Error, c.want) {
+				t.Fatalf("报错里没有 %q：%s", c.want, r.Error)
+			}
+		})
+	}
+}
+
+// 国家码只校验格式，**不校验真实性** —— 这条边界要钉住，免得哪天有人
+// "顺手补一个存在性校验"。
+//
+// 能拿来做白名单的只有 geoip 包那份国家表，而它是刻意只收常见来源地的
+// （未收录的国家按 ISO 码展示，不影响功能）。拿它当白名单会把哈萨克斯坦
+// 之外的一大票真实国家一起拒掉 —— 那比"写错了不报错"严重得多。
+func TestACLGeoCountryOnlyChecksFormat(t *testing.T) {
+	h := newHarness(t)
+
+	// CU 是老名单里没收录的真实国家；ZZ 是根本不存在的码。
+	// 两者都按两位字母放行 —— 这是有意的取舍，不是漏了校验。
+	for _, country := range []string{"KZ", "CU", "ZZ"} {
+		st, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+			"target":      country,
+			"target_type": "geo_country",
+		})
+		if st != http.StatusOK {
+			t.Errorf("国家码 %q 只该看格式，不该被拒：%d %s", country, st, r.Error)
+		}
+	}
+}
+
+// 手动解封一个"被某条名单条目封掉"的地址时，那条条目必须一并删掉。
+//
+// 不删的后果很具体：解封当场生效，但它下一次连接又命中同一条条目、立刻再被封
+// 一次 —— 用户看到的是"解封没起作用"，而他的真实意图是"让这个地址进来"。
+func TestUnbanClearsBackingACLEntry(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{
+		"target": "203.0.113.7",
+		"remark": "扫描源",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("POST 应 200，得到 %d %s", code, r.Error)
+	}
+	aclID := entryID(t, h, r)
+
+	// 造一条"由这条条目产生"的封禁。Target 写成 /32 是刻意的：真实的封禁记录
+	// 来自 banPrefix，按封禁粒度可能带掩码，而条目里存的是裸 IP —— 两者字面不同、
+	// 指的却是同一件事，比对时必须归一化。
+	rec := &model.BanRecord{
+		Target: "203.0.113.7/32", TargetType: "cidr4",
+		Scope: model.ScopeAll, Reason: "命中黑名单", Source: model.SourceGeoIP,
+		SourceRef: model.BanSourceRef(model.BanRefACL, aclID),
+		Status:    model.BanActive, BannedAt: time.Now(),
+	}
+	if err := h.srv.store.CreateBan(rec); err != nil {
+		t.Fatalf("造封禁记录失败：%v", err)
+	}
+
+	code, r = h.call(http.MethodDelete, "/api/v1/bans/"+strconv.Itoa(int(rec.ID)), nil)
+	if code != http.StatusOK {
+		t.Fatalf("解封应 200，得到 %d %s", code, r.Error)
+	}
+	if n, _ := h.data(r)["source_entry_removed"].(float64); n != 1 {
+		t.Fatalf("应当报告清理了 1 条名单条目，实际 %v", h.data(r)["source_entry_removed"])
+	}
+	if _, err := h.srv.store.GetACL(aclID); err == nil {
+		t.Fatal("背后的名单条目应当已被删除，否则解封之后它还会被同一条拦回来")
+	}
+
+	// 清理痕迹要留事件：静默删掉一条黑名单条目是"事后完全查不出发生过什么"的操作
+	ev, err := h.srv.store.ListEventsPage("", "", nil, 1, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range ev.Items {
+		if strings.Contains(e.Detail, "一并移除") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("应当留下「一并移除条目」的事件记录，实际 %d 条事件都没提到", len(ev.Items))
+	}
+}
+
+// 条目是网段时，**只解封、不动条目**。
+//
+// 条目 1.2.3.0/24 背后是 256 个地址，删掉它等于顺手把另外 255 个也放进来，
+// 那超出了用户点这一次解封的授权范围。
+func TestUnbanKeepsCIDREntry(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPost, "/api/v1/acl/black", map[string]any{"target": "203.0.113.0/24"})
+	if code != http.StatusOK {
+		t.Fatalf("POST 应 200，得到 %d %s", code, r.Error)
+	}
+	aclID := entryID(t, h, r)
+
+	// 封禁记录的 Target 是该网段里的一个具体地址 → 与条目不等
+	rec := &model.BanRecord{
+		Target: "203.0.113.7/32", TargetType: "cidr4",
+		Scope: model.ScopeAll, Reason: "命中黑名单", Source: model.SourceGeoIP,
+		SourceRef: model.BanSourceRef(model.BanRefACL, aclID),
+		Status:    model.BanActive, BannedAt: time.Now(),
+	}
+	if err := h.srv.store.CreateBan(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	code, r = h.call(http.MethodDelete, "/api/v1/bans/"+strconv.Itoa(int(rec.ID)), nil)
+	if code != http.StatusOK {
+		t.Fatalf("解封应 200，得到 %d %s", code, r.Error)
+	}
+	if n, _ := h.data(r)["source_entry_removed"].(float64); n != 0 {
+		t.Fatalf("网段条目不该被删，实际报告清理了 %v 条", h.data(r)["source_entry_removed"])
+	}
+	if _, err := h.srv.store.GetACL(aclID); err != nil {
+		t.Fatalf("网段条目必须留着，实际读不到了：%v", err)
+	}
+}
+
+// 解封一个"由细分规则拦下"的地址时，不动规则，但必须留一句提示。
+//
+// 规则是条件型的（"来自某地区的一律拦"），没法从中"移除一个地址" ——
+// 强行动作只会把整条规则改坏。但什么也不说同样不行：用户会发现解禁之后
+// 又被拦回来，只能自己猜原因。
+func TestUnbanFromRuleLeavesRuleAlone(t *testing.T) {
+	h := newHarness(t)
+
+	// PUT /policy 要求带上完整的全局策略（窗口、阈值这些不能缺），
+	// 用模板而不是自己拼一个半截请求体 —— 半截的会被"统计窗口需在 1~86400"
+	// 这类校验挡下来，测不到规则那部分。
+	body := h.policyBody()
+	body["rules"] = []map[string]any{{
+		"name": "整段拉黑", "enabled": true,
+		"cidrs": "203.0.113.0/24", "block": true,
+	}}
+	code, r := h.call(http.MethodPut, "/api/v1/policy", body)
+	if code != http.StatusOK {
+		t.Fatalf("保存规则应 200，得到 %d %s", code, r.Error)
+	}
+
+	rules, err := h.srv.store.RateRules()
+	if err != nil || len(rules) != 1 {
+		t.Fatalf("应当存下 1 条规则，实际 %d 条（err=%v）", len(rules), err)
+	}
+	if !rules[0].Block || rules[0].Cities != "" {
+		t.Fatalf("规则的 block 没落库：%+v", rules[0])
+	}
+	ref := rules[0].BanRef()
+	if !strings.HasPrefix(ref, model.BanRefRule+":") {
+		t.Fatalf("规则来源引用形态不对：%q", ref)
+	}
+
+	rec := &model.BanRecord{
+		Target: "203.0.113.7/32", TargetType: "cidr4",
+		Scope: model.ScopeAll, Reason: "命中规则", Source: model.SourceRule,
+		SourceRef: ref, Status: model.BanActive, BannedAt: time.Now(),
+	}
+	if err := h.srv.store.CreateBan(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	code, r = h.call(http.MethodDelete, "/api/v1/bans/"+strconv.Itoa(int(rec.ID)), nil)
+	if code != http.StatusOK {
+		t.Fatalf("解封应 200，得到 %d %s", code, r.Error)
+	}
+	if n, _ := h.data(r)["source_entry_removed"].(float64); n != 0 {
+		t.Fatalf("不该报告清理了条目，实际 %v", h.data(r)["source_entry_removed"])
+	}
+
+	// 规则原样留着
+	if left, err := h.srv.store.RateRules(); err != nil || len(left) != 1 || !left[0].Block {
+		t.Fatalf("规则不该被动过：%d 条（err=%v）", len(left), err)
+	}
+
+	// 但事件里必须说清楚"是规则拦的、规则还开着"
+	ev, err := h.srv.store.ListEventsPage("", "", nil, 1, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range ev.Items {
+		if strings.Contains(e.Detail, "细分规则拦截") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("应当留一句「该地址由细分规则拦截」的提示，实际没有（事件 %d 条）", len(ev.Items))
 	}
 }
