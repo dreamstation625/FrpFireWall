@@ -393,6 +393,21 @@ check "订阅 2 个 op" "$(printf '%s' "$SN" | jqf data.ops)" "[2]"
 check_err "片段包含 httpPlugins" "$(printf '%s' "$SN" | jqf data.snippet)" "httpPlugins"
 check_err "片段包含 ops" "$(printf '%s' "$SN" | jqf data.snippet)" 'ops = ["Login", "NewUserConn"]'
 check_err "片段插件名正确" "$(printf '%s' "$SN" | jqf data.snippet)" 'name = "frpfirewall"'
+
+# JSON 形态（供 frps.json 用）。字段名是驼峰，改大小写会被 frp 的严格校验直接
+# 拒掉（json: unknown field），所以断言文本，而不是"能解析就算过"。
+SNJ="$(printf '%s' "$SN" | jqf data.snippet_json)"
+check_err "JSON 片段含 httpPlugins" "$SNJ" '"httpPlugins"'
+check_err "JSON 字段名用驼峰 tlsVerify" "$SNJ" '"tlsVerify": false'
+check_err "JSON 片段含 ops" "$SNJ" '"ops": ["Login", "NewUserConn"]'
+# 标准 JSON 不支持注释。TOML 版本里那几行说明若被顺手带过来，frps 会在解析
+# 阶段就报 invalid character '/'，用户很难自己定位。
+if printf '%s' "$SNJ" | grep -qE '//|#'; then
+  printf '  %s %-44s JSON 片段里出现了注释\n' "$(red FAIL)" "JSON 片段无注释"; FAIL=$((FAIL + 1))
+else
+  printf '  %s %-44s 确认无注释\n' "$(green PASS)" "JSON 片段无注释"; PASS=$((PASS + 1))
+fi
+
 # Ping 绝不能出现在 ops 里：每客户端 30s 心跳会成倍放大插件调用量。
 # 只看 ops 行，片段正文里的说明性注释允许提到 Ping。
 if printf '%s' "$SN" | jqf data.snippet | grep '^ops = ' | grep -q 'Ping'; then
@@ -404,6 +419,8 @@ check "warnings 有 3 条" "$(printf '%s' "$SN" | jqf data.warnings)" "[3]"
 check "插件 healthz" "$(get -o /dev/null -w '%{http_code}' "$PLUGIN/healthz")" "200"
 FC=$(get -H "$AUTH" "$BASE/api/v1/frps/config")
 check_err "加固配置含 tls.force" "$(printf '%s' "$FC" | jqf data.hardening)" "tls.force"
+check_err "加固配置 JSON 含 transport.tls.force" "$(printf '%s' "$FC" | jqf data.hardening_json)" '"force": true'
+check_err "插件片段 JSON 一并下发" "$(printf '%s' "$FC" | jqf data.plugin_snippet_json)" '"httpPlugins"'
 check "面板侧健康探测" "$(get -H "$AUTH" "$BASE/api/v1/frps/health" | jqf data.ok)" "true"
 
 echo

@@ -306,14 +306,19 @@ func (s *Server) handleListRuleChanges(c *gin.Context) {
 
 func (s *Server) handleFrpsSnippet(c *gin.Context) {
 	ok(c, gin.H{
-		"snippet":  frpsplugin.Snippet(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
-		"addr":     s.cfg.Frps.PluginListen,
-		"path":     s.cfg.Frps.PluginPath,
-		"ops":      []string{"Login", "NewUserConn"},
+		// TOML 与 JSON 两份等价配置一起下发，由前端切换展示。
+		// frp 从 v0.52.0 起两种格式都支持，用哪份取决于用户现有配置文件的后缀。
+		"snippet":      frpsplugin.Snippet(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
+		"snippet_json": frpsplugin.SnippetJSON(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
+		"addr":         s.cfg.Frps.PluginListen,
+		"path":         s.cfg.Frps.PluginPath,
+		// ops 取自 frpsplugin，不在这里另写一份：界面告诉用户订阅了哪几个 op，
+		// 与实际生成到配置里的必须一致。
+		"ops":       frpsplugin.Ops(),
 		"bind_port": s.cfg.Frps.BindPort,
 		"warnings": []string{
 			"ops 绝对不要加 \"Ping\"：心跳是每客户端 30s 一次，挂上来会让插件 QPS 乘以客户端数，可能拖垮 frps。",
-			"修改 frps.toml 后需要 systemctl restart frps，重启期间所有隧道会断开，建议避开业务高峰。",
+			"修改配置后需要 systemctl restart frps，重启期间所有隧道会断开，建议避开业务高峰。",
 			"插件服务只监听回环地址，frps 必须与本程序在同一台机器上。",
 		},
 	})
@@ -342,16 +347,15 @@ func (s *Server) handleFrpsHealth(c *gin.Context) {
 }
 
 // handleFrpsConfig 返回 frps 侧建议的进阶配置。
+//
+// 文本由 frpsplugin 生成而不是在这里拼：那几份配置要能拿真实的 frps 校验
+// （frps verify -c），放在包里才好一起测。
 func (s *Server) handleFrpsConfig(c *gin.Context) {
 	ok(c, gin.H{
-		"plugin_snippet": frpsplugin.Snippet(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
-		"hardening": "# 以下为可选加固项，按需追加到 frps.toml\n" +
-			"# 只接受启用 TLS 的客户端，减少协议层攻击面\n" +
-			"transport.tls.force = true\n\n" +
-			"# 让心跳与工作连接也参与插件校验（注意：会增加插件调用量）\n" +
-			"# auth.additionalScopes = [\"HeartBeats\", \"NewWorkConns\"]\n\n" +
-			"# 限制单个客户端的代理数量\n" +
-			"maxPortsPerClient = 10\n",
+		"plugin_snippet":      frpsplugin.Snippet(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
+		"plugin_snippet_json": frpsplugin.SnippetJSON(s.cfg.Frps.PluginListen, s.cfg.Frps.PluginPath),
+		"hardening":           frpsplugin.HardeningTOML(),
+		"hardening_json":      frpsplugin.HardeningJSON(),
 	})
 }
 

@@ -17,7 +17,7 @@
 | 频次控制 | 滑动窗口统计失败次数，超阈值自动封禁，支持阶梯式递增封禁时长 |
 | GeoIP | MaxMind GeoLite2 判国家/大洲（可拦截），ip2region 判国内省市（用于展示） |
 | 黑白名单 | 手动增删改、批量导入导出、来源标记、到期时间 |
-| frp 配置生成 | 前端直接给出需要追加到 `frps.toml` 的配置片段，可一键复制 |
+| frp 配置生成 | 前端给出需要写进 frps 配置的片段（TOML / JSON 两种），可一键复制 |
 | 事件与审计 | 登录失败、封禁、解封、规则变更全量留痕 |
 
 ### 1.2 不做什么（明确排除）
@@ -1242,9 +1242,9 @@ frpfirewall -data /var/lib/frpfirewall
 | GET | `/events` | 事件流，**游标分页**（`limit` + `cursor`） |
 | GET | `/events/stats` | 聚合统计（趋势、Top IP、Top 地区） |
 | GET | `/events/changes` | 规则变更审计 |
-| GET | `/frps/snippet` | 生成 frps.toml 需追加的配置片段 |
+| GET | `/frps/snippet` | 生成 frps 接入配置片段（TOML 与 JSON 两份） |
 | GET | `/frps/health` | 插件自检（供 frps 配置前确认连通） |
-| GET | `/frps/config` | 可选的 frps 加固配置片段 |
+| GET | `/frps/config` | 可选的 frps 加固配置片段（TOML 与 JSON 两份） |
 | POST | `/frps/handler` | **frps 插件入口**（非 JWT 鉴权，仅回环可访问） |
 
 事件流用游标分页而不是 offset：事件表只增不减，深翻页时 offset 要先扫过并丢弃
@@ -1267,7 +1267,7 @@ frpfirewall -data /var/lib/frpfirewall
 | 封禁记录 Bans | 活跃封禁表（剩余时间实时倒计时）、历史表（状态筛选）、手动封禁（可选封禁范围）、批量解封、排障查询 |
 | 频控策略 Policy | 分两张卡。**细分规则**：可排序的规则表（启用开关、规则名、落点标签、匹配条件、动作），支持新增/编辑/上移下移/删除；编辑对话框按「有没有填目的端口」动态切换可用字段 —— 填了端口就禁用地区/省份与封禁配置，并当场说明原因，而不是让用户保存时去吃后端的报错。**全局规则**：窗口秒数、阈值、阶梯时长编辑器（可增删/上移/永久档）、升级窗口、封禁粒度、fail-open/close、自动封禁与观察模式、地域封禁、连接速率限制。两张卡共用右上角一个「保存并生效」（见 D16）。编译不过的规则会在规则表上方用红框列出原因 |
 | IP 属地 GeoIP | 三个库的状态卡（加载状态/大小/更新时间，各带预估大小、「下载更新」按钮与「前往下载源仓库」链接）、加速源下拉（默认自动、选择记在 localStorage）、上传替换、IP 查询工具（属地 + 当前拦截状态 + 窗口命中数），未加载库时给出降级提示 |
-| frp 接入 Frps | 生成的 `frps.toml` 片段（一键复制）、插件连通性检测、受保护端口展示、可选加固项、判定链路说明 |
+| frp 接入 Frps | 生成的 frps 配置片段（TOML / JSON 可切换、一键复制）、插件连通性检测、受保护端口展示、可选加固项、判定链路说明 |
 | 事件日志 Events | 事件日志（类别/时间范围/关键字筛选 + 游标分页）与规则变更审计双 Tab |
 | 系统设置 Settings | 面板监听/TLS/账号、frps 对接、防护与日志、版本更新开关与来源；改启动期配置后如实提示需重启 |
 
@@ -1290,7 +1290,13 @@ frpfirewall -data /var/lib/frpfirewall
 
 ## 6. frps 需要增加的配置（前端生成）
 
-程序生成的片段（前端展示 + 一键复制，**不自动改 frps 配置**）：
+程序生成的片段（前端展示 + 一键复制，**不自动改 frps 配置**）。
+
+frp 从 v0.52.0 起同时支持 TOML / YAML / JSON（INI 已废弃），所以**两种格式都生成**，
+由用户按自己那份配置文件的后缀切换。两份描述的是同一件事，改一份必须改另一份
+（测试里有逐条对账）。
+
+TOML —— 追加到 `frps.toml` 末尾即可：
 
 ```toml
 # ===== FrpFireWall 接入配置 =====
@@ -1307,13 +1313,43 @@ tlsVerify = false
 # 乘以客户端数量，小内存机器上足以把 frps 拖垮。
 ```
 
+JSON —— 供 `frps.json` 使用，**要合并进现有配置**：
+
+```json
+{
+  "httpPlugins": [
+    {
+      "name": "frpfirewall",
+      "addr": "127.0.0.1:9100",
+      "path": "/frps/handler",
+      "ops": ["Login", "NewUserConn"],
+      "tlsVerify": false
+    }
+  ]
+}
+```
+
+JSON 形态与 TOML 有两处**不能照搬**的差别，切到 JSON 时前端会显示对应提示：
+
+- **没有「追加一段」的语法**。`httpPlugins` 是顶层对象的数组字段，所以是「把这个元素
+  合并进现有数组」，而不是往文件末尾贴一段。拿它整个覆盖 `frps.json` 会丢掉 `bindPort`
+  等已有配置。
+- **不支持注释**。标准 JSON 没有注释语法（带 `//` 会得到 `invalid character '/'`），
+  于是「不要把 Ping 加进 ops」这类说明带不过来 —— 这是唯一必须靠界面兜住的地方，
+  所以那条提醒在 UI 上是独立展示的，不依赖代码块里的注释。
+
+字段名用 frp 的 json tag（驼峰 `httpPlugins` / `tlsVerify`），**大小写写错会被直接拒掉**：
+frp 默认开严格校验，写成 `tls_verify` 会得到 `json: unknown field "tls_verify"`。
+四种生成形态已用 frps v0.71.0 实测（`frps verify -c` 全部 `syntax is ok`），
+测试里也把驼峰写法钉死，避免以后被"顺手"改成下划线。
+
 要点说明（同步展示在前端）：
 - `ops` 只填 `Login` 与 `NewUserConn`。**不要加 `Ping`**（心跳高频，会拖垮 frps，详见 D6）。
 - `addr` 必须是 frpfirewall 监听地址；frpfirewall 默认只绑 `127.0.0.1`。
 - 修改后需 `systemctl restart frps`，重启期间隧道断开（提示用户避开业务高峰）。
 - 若 `Login` 走不通，frp 端会看到 `reject_reason` 里的封禁原因，便于排障。
 
-可选增强（前端作为"进阶配置"展示）：
+可选增强（前端作为"进阶配置"展示，同样两种格式）：
 
 ```toml
 # 减少攻击面（可选）
@@ -1321,6 +1357,17 @@ transport.tls.force = true          # 只接受启用 TLS 的客户端
 auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
 maxPortsPerClient = 10              # 限制单客户端代理数
 ```
+
+```json
+{
+  "transport": { "tls": { "force": true } },
+  "maxPortsPerClient": 10
+}
+```
+
+JSON 版本**少一项** `auth.additionalScopes`，这不是遗漏：TOML 里它是注释掉的「可选」，
+而 JSON 没有注释语法，写进文件就等于生效 —— 它会让插件调用量随客户端数一起上涨，
+是否开启应该由用户决定，不能替他默认打开。界面在 JSON 模式下给出这个字段的写法。
 
 ---
 

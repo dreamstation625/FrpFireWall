@@ -146,7 +146,10 @@ ssh -L 7930:127.0.0.1:7930 root@<服务器>
 
 ### 4. 接入 frps
 
-面板 → **frp 接入** → 复制配置片段，追加到 `/etc/frp/frps.toml`：
+面板 → **frp 接入** → 复制配置片段。卡片右上角可切换 **TOML / JSON**：frp 从 v0.52.0 起
+两种格式都支持，用哪一份取决于你手上那个配置文件的后缀。
+
+用 `/etc/frp/frps.toml` 的话，把这段追加到文件末尾：
 
 ```toml
 [[httpPlugins]]
@@ -157,7 +160,30 @@ ops = ["Login", "NewUserConn"]
 tlsVerify = false
 ```
 
+用 `frps.json` 的话，JSON 没有「追加一段」这种语法，要把 `httpPlugins` 元素合并进现有
+配置里（**别拿它整个覆盖文件**，那会丢掉 `bindPort` 等已有项）：
+
+```json
+{
+  "httpPlugins": [
+    {
+      "name": "frpfirewall",
+      "addr": "127.0.0.1:9100",
+      "path": "/frps/handler",
+      "ops": ["Login", "NewUserConn"],
+      "tlsVerify": false
+    }
+  ]
+}
+```
+
+`ops` 只填这两个。**不要加 `Ping`** —— 心跳是每客户端 30s 一次，挂上来会让插件调用量
+乘以客户端数，小内存机器上足以把 frps 拖垮。
+
+改完先验证再重启，不用等重启失败才发现写错：
+
 ```bash
+frps verify -c /etc/frp/frps.toml    # 或 frps.json
 sudo systemctl restart frps
 ```
 

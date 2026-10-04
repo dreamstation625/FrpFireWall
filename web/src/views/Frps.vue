@@ -49,11 +49,25 @@
 
     <div class="page-card panel mt">
       <div class="panel-head">
-        <span class="section-title">frps.toml 需要增加的配置</span>
-        <el-button size="small" @click="copy(snippetText)">复制</el-button>
+        <span class="section-title">{{ cfgFile }} 需要增加的配置</span>
+        <div class="head-actions">
+          <el-radio-group v-model="fmt" size="small">
+            <el-radio-button value="toml">TOML</el-radio-button>
+            <el-radio-button value="json">JSON</el-radio-button>
+          </el-radio-group>
+          <el-button size="small" @click="copy(snippetText)">复制</el-button>
+        </div>
       </div>
 
       <pre class="code-block">{{ snippetText }}</pre>
+
+      <div v-if="fmt === 'json'" class="alert-note" style="margin-top: 12px">
+        JSON 没有「追加一段」的语法：要把上面这串里的
+        <span class="mono">httpPlugins</span> 元素合并进你现有的
+        <span class="mono">frps.json</span>，别拿它整个覆盖 —— 那会丢掉
+        <span class="mono">bindPort</span> 等已有配置。另外标准 JSON 不支持注释，
+        TOML 版本里的说明文字带不过来，看下面那几条提醒。
+      </div>
 
       <div class="alert-danger" style="margin-top: 12px">
         <div v-for="(w, i) in snippet?.warnings || []" :key="i">· {{ w }}</div>
@@ -67,9 +81,21 @@
     <div class="page-card panel mt">
       <div class="panel-head">
         <span class="section-title">可选加固项</span>
-        <el-button size="small" @click="copy(hardening)">复制</el-button>
+        <div class="head-actions">
+          <el-radio-group v-model="fmt" size="small">
+            <el-radio-button value="toml">TOML</el-radio-button>
+            <el-radio-button value="json">JSON</el-radio-button>
+          </el-radio-group>
+          <el-button size="small" @click="copy(hardeningText)">复制</el-button>
+        </div>
       </div>
-      <pre class="code-block">{{ hardening }}</pre>
+      <pre class="code-block">{{ hardeningText }}</pre>
+      <div v-if="fmt === 'json'" class="alert-note" style="margin-top: 12px">
+        JSON 版本比 TOML 少一项 <span class="mono">auth.additionalScopes</span>：
+        TOML 里它是被注释掉的可选项，而 JSON 没有注释语法，写进文件就等于打开。
+        确实需要的话，自己往顶层加
+        <span class="mono">"auth": { "additionalScopes": ["HeartBeats"] }</span>。
+      </div>
       <div class="hint" style="margin-top: 10px">
         非必需项。<span class="mono">auth.additionalScopes</span> 加到
         <span class="mono">HeartBeats</span> 或 <span class="mono">NewWorkConns</span>
@@ -112,10 +138,28 @@ const loading = ref(false)
 const checking = ref(false)
 const snippet = ref<any>(null)
 const info = ref<any>(null)
-const hardening = ref('')
+const cfg = ref<any>(null)
 const health = ref<any>(null)
 
-const snippetText = computed(() => snippet.value?.snippet || '（加载中…）')
+// 配置文件格式。frp 从 v0.52.0 起同时支持 TOML / YAML / JSON，
+// 用哪一份取决于用户手上那个文件的后缀 —— 所以两份都下发，由用户自己切。
+// 两个卡片共用这一个状态：用户「用的是 json 配置」是这个人的属性，不是某张卡片的属性，
+// 分成两个开关迟早会出现一张卡片 TOML、另一张 JSON 的错配。
+const fmt = ref<'toml' | 'json'>('toml')
+
+const cfgFile = computed(() => (fmt.value === 'json' ? 'frps.json' : 'frps.toml'))
+
+const snippetText = computed(() => {
+  const s = snippet.value
+  if (!s) return '（加载中…）'
+  return (fmt.value === 'json' ? s.snippet_json : s.snippet) || '（加载中…）'
+})
+
+const hardeningText = computed(() => {
+  const c = cfg.value
+  if (!c) return ''
+  return (fmt.value === 'json' ? c.hardening_json : c.hardening) || ''
+})
 
 const protectedPorts = computed(() => {
   // proxy_ports 是一段文本（可能含区间），后端已经归一化过，
@@ -134,10 +178,10 @@ async function load() {
     snippet.value = s
     info.value = i
     try {
-      const c: any = await api.frpsConfig()
-      hardening.value = c?.hardening || ''
+      cfg.value = await api.frpsConfig()
     } catch {
-      hardening.value = ''
+      // 加固项拿不到不影响主流程（接入片段才是必须的），降级成空即可
+      cfg.value = null
     }
   } finally {
     loading.value = false
@@ -195,6 +239,13 @@ onMounted(load)
 
 .panel-head .section-title {
   margin: 0;
+}
+
+/* 格式切换与复制按钮凑一组，和左侧标题分列两端 */
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .mt {
