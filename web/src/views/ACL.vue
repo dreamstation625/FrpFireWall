@@ -36,30 +36,37 @@
         placeholder="搜索地址 / 备注 / 属地"
         clearable
         style="width: 260px"
-        @keyup.enter="reload"
+        @keyup.enter="search"
       >
         <template #prefix><el-icon><Search /></el-icon></template>
       </el-input>
-      <el-button @click="reload">查询</el-button>
+      <el-button @click="search">查询</el-button>
       <div class="spacer" />
       <el-button type="primary" @click="openCreate">新增</el-button>
       <el-button @click="openImport">批量导入</el-button>
       <el-button @click="exportList">导出</el-button>
     </div>
 
-    <el-table :data="rows" v-loading="loading" size="small" empty-text="暂无数据">
-      <el-table-column prop="target" label="地址" min-width="170">
+    <el-table
+      :data="rows"
+      v-loading="loading"
+      size="small"
+      border
+      empty-text="暂无数据"
+      @header-dragend="cw.onDragend"
+    >
+      <el-table-column prop="target" label="地址" v-bind="cw.col('地址', { minWidth: 170 })">
         <template #default="{ row }">
           <span class="mono">{{ row.target }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="target_type" label="类型" width="80">
+      <el-table-column prop="target_type" label="类型" v-bind="cw.col('类型', { width: 80 })">
         <template #default="{ row }">
           <el-tag size="small" type="info">{{ row.target_type }}</el-tag>
         </template>
       </el-table-column>
       <!-- 范围只对黑名单有意义，白名单不显示这一列 -->
-      <el-table-column v-if="kind === 'black'" label="范围" width="118">
+      <el-table-column v-if="kind === 'black'" label="范围" v-bind="cw.col('范围', { width: 118 })">
         <template #default="{ row }">
           <!-- 带上 ports 一起看：范围是 custom 却没有端口时后端会退化成全端口下发，
                提示语必须说同一件事，否则界面讲"只封这几个端口"、实际封了全部 -->
@@ -70,13 +77,17 @@
           </el-tooltip>
         </template>
       </el-table-column>
-      <el-table-column v-if="kind === 'black'" label="封禁端口" min-width="130">
+      <el-table-column
+        v-if="kind === 'black'"
+        label="封禁端口"
+        v-bind="cw.col('封禁端口', { minWidth: 130 })"
+      >
         <template #default="{ row }">
           <span v-if="row.scope === 'custom' && row.ports" class="mono">{{ row.ports }}</span>
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
-      <el-table-column label="属地" min-width="150">
+      <el-table-column label="属地" v-bind="cw.col('属地', { minWidth: 150 })">
         <template #default="{ row }">
           <span v-if="row.country || row.province">
             {{ [row.country, row.province].filter(Boolean).join(' · ') }}
@@ -84,26 +95,26 @@
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="remark" label="备注" min-width="140">
+      <el-table-column prop="remark" label="备注" v-bind="cw.col('备注', { minWidth: 140 })">
         <template #default="{ row }">
           <span v-if="row.remark">{{ row.remark }}</span>
           <span v-else class="hint">—</span>
         </template>
       </el-table-column>
-      <el-table-column prop="source" label="来源" width="80">
+      <el-table-column prop="source" label="来源" v-bind="cw.col('来源', { width: 80 })">
         <template #default="{ row }">
           <el-tag size="small" :type="row.source === 'manual' ? 'info' : 'warning'">
             {{ row.source === 'manual' ? '手动' : row.source }}
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="到期" width="160">
+      <el-table-column label="到期" v-bind="cw.col('到期', { width: 160 })">
         <template #default="{ row }">
           <span v-if="row.expires_at">{{ fmt(row.expires_at) }}</span>
           <span v-else class="hint">永久</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="130" fixed="right">
+      <el-table-column label="操作" v-bind="cw.col('操作', { width: 130 })" fixed="right">
         <template #default="{ row }">
           <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
           <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
@@ -111,16 +122,7 @@
       </el-table-column>
     </el-table>
 
-    <el-pagination
-      v-model:current-page="page"
-      v-model:page-size="size"
-      :total="total"
-      :page-sizes="[20, 50, 100]"
-      layout="total, sizes, prev, pager, next"
-      style="margin-top: 14px; justify-content: flex-end"
-      @current-change="reload"
-      @size-change="reload"
-    />
+    <TablePager v-model:page="page" v-model:size="size" :total="total" @change="reload" />
 
     <el-dialog v-model="editVisible" :title="editing ? '编辑条目' : '新增条目'" width="480px">
       <el-form label-width="90px">
@@ -232,7 +234,11 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import api from '@/api'
+import TablePager from '@/components/TablePager.vue'
 import { SCOPE_OPTIONS, scopeFormHint, scopeLabel, scopeTagType, scopeTip } from '@/utils/scope'
+import { useColumnWidths } from '@/utils/table'
+
+const cw = useColumnWidths('acl')
 
 const kind = ref('white')
 const rows = ref<any[]>([])
@@ -283,6 +289,13 @@ async function reload() {
 function onTabChange() {
   page.value = 1
   keyword.value = ''
+  reload()
+}
+
+// 查询条件变了要回到第 1 页：停在第 5 页改关键字，新结果很可能不足 5 页，
+// 用户看到的是一张空表，会以为"没搜到"。
+function search() {
+  page.value = 1
   reload()
 }
 

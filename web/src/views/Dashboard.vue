@@ -68,26 +68,77 @@
       <el-col :span="12">
         <div class="page-card panel">
           <div class="section-title">Top 来源 IP</div>
-          <el-table :data="stats.top_ips || []" size="small" :show-header="true" empty-text="暂无数据">
-            <el-table-column type="index" width="50" label="#" />
-            <el-table-column prop="name" label="IP 地址">
+          <el-table
+            :data="topIPs"
+            size="small"
+            border
+            :show-header="true"
+            empty-text="暂无数据"
+            @header-dragend="cwTopIPs.onDragend"
+          >
+            <el-table-column
+              type="index"
+              label="#"
+              v-bind="cwTopIPs.col('#', { width: 50 })"
+              :index="ipsIndex"
+            />
+            <el-table-column
+              prop="name"
+              label="IP 地址"
+              v-bind="cwTopIPs.col('IP 地址', { minWidth: 160 })"
+            >
               <template #default="{ row }">
                 <span class="mono">{{ row.name }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="count" label="拦截次数" width="100" />
+            <el-table-column
+              prop="count"
+              label="拦截次数"
+              v-bind="cwTopIPs.col('拦截次数', { width: 100 })"
+            />
           </el-table>
+
+          <TablePager
+            v-model:page="ipsPage"
+            v-model:size="ipsSize"
+            :total="(stats.top_ips || []).length"
+          />
         </div>
       </el-col>
 
       <el-col :span="12">
         <div class="page-card panel">
           <div class="section-title">Top 来源地区</div>
-          <el-table :data="stats.top_countries || []" size="small" empty-text="暂无数据">
-            <el-table-column type="index" width="50" label="#" />
-            <el-table-column prop="name" label="国家 / 地区" />
-            <el-table-column prop="count" label="拦截次数" width="100" />
+          <el-table
+            :data="topCountries"
+            size="small"
+            border
+            empty-text="暂无数据"
+            @header-dragend="cwTopGeo.onDragend"
+          >
+            <el-table-column
+              type="index"
+              label="#"
+              v-bind="cwTopGeo.col('#', { width: 50 })"
+              :index="geoIndex"
+            />
+            <el-table-column
+              prop="name"
+              label="国家 / 地区"
+              v-bind="cwTopGeo.col('国家 / 地区', { minWidth: 160 })"
+            />
+            <el-table-column
+              prop="count"
+              label="拦截次数"
+              v-bind="cwTopGeo.col('拦截次数', { width: 100 })"
+            />
           </el-table>
+
+          <TablePager
+            v-model:page="geoPage"
+            v-model:size="geoSize"
+            :total="(stats.top_countries || []).length"
+          />
         </div>
       </el-col>
     </el-row>
@@ -98,12 +149,41 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import echarts, { type EChartsType } from '@/utils/echarts'
 import api from '@/api'
+import TablePager from '@/components/TablePager.vue'
+import { useColumnWidths } from '@/utils/table'
 import { useSystemStore } from '@/stores/system'
+
+const cwTopIPs = useColumnWidths('dashboard-top-ips')
+const cwTopGeo = useColumnWidths('dashboard-top-countries')
 
 const sys = useSystemStore()
 const s = computed<any>(() => sys.info || {})
 
 const stats = ref<any>({})
+
+// 两个榜各自分页。后端给的是固定 Top 10（store.EventStats 里的 Limit(10)），
+// 眼下永远只有一页、分页器会自动收起；将来放宽 Top N 时这里不用再动。
+const ipsPage = ref(1)
+const ipsSize = ref(20)
+const geoPage = ref(1)
+const geoSize = ref(20)
+
+const topIPs = computed(() => paged(stats.value?.top_ips, ipsPage.value, ipsSize.value))
+const topCountries = computed(() => paged(stats.value?.top_countries, geoPage.value, geoSize.value))
+
+function paged(list: any[] | undefined, page: number, size: number) {
+  return (list || []).slice((page - 1) * size, page * size)
+}
+
+// 排名列要接着往下数，不能每页都从 1 开始
+function ipsIndex(i: number) {
+  return (ipsPage.value - 1) * ipsSize.value + i + 1
+}
+
+function geoIndex(i: number) {
+  return (geoPage.value - 1) * geoSize.value + i + 1
+}
+
 const hours = ref(24)
 const trendRef = ref<HTMLElement>()
 let chart: EChartsType | null = null

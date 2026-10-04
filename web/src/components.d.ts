@@ -56,6 +56,7 @@ declare module 'vue' {
     RateRuleDialog: typeof import('./components/RateRuleDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    TablePager: typeof import('./components/TablePager.vue')['default']
     UpdateDialog: typeof import('./components/UpdateDialog.vue')['default']
   }
   export interface GlobalDirectives {

@@ -27,22 +27,29 @@
           <el-button size="small" @click="reset">重置</el-button>
         </div>
 
-        <el-table :data="events" v-loading="loading" size="small" empty-text="暂无事件">
-          <el-table-column label="时间" width="165">
+        <el-table
+          :data="events"
+          v-loading="loading"
+          size="small"
+          border
+          empty-text="暂无事件"
+          @header-dragend="cwEvents.onDragend"
+        >
+          <el-table-column label="时间" v-bind="cwEvents.col('时间', { width: 165 })">
             <template #default="{ row }">{{ fmt(row.ts) }}</template>
           </el-table-column>
-          <el-table-column label="类别" width="110">
+          <el-table-column label="类别" v-bind="cwEvents.col('类别', { width: 110 })">
             <template #default="{ row }">
               <el-tag size="small" :type="catType(row.category)">{{ catName(row.category) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="ip" label="IP" width="150">
+          <el-table-column prop="ip" label="IP" v-bind="cwEvents.col('IP', { width: 150 })">
             <template #default="{ row }">
               <span v-if="row.ip" class="mono">{{ row.ip }}</span>
               <span v-else class="hint">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="属地" width="150">
+          <el-table-column label="属地" v-bind="cwEvents.col('属地', { width: 150 })">
             <template #default="{ row }">
               <span v-if="row.country || row.province">
                 {{ [row.country, row.province].filter(Boolean).join(' · ') }}
@@ -50,14 +57,19 @@
               <span v-else class="hint">—</span>
             </template>
           </el-table-column>
-          <el-table-column prop="user" label="账号" width="110">
+          <el-table-column prop="user" label="账号" v-bind="cwEvents.col('账号', { width: 110 })">
             <template #default="{ row }">
               <span v-if="row.user">{{ row.user }}</span>
               <span v-else class="hint">—</span>
             </template>
           </el-table-column>
-          <el-table-column prop="detail" label="详情" min-width="300" show-overflow-tooltip />
-          <el-table-column prop="actor" label="操作者" width="100">
+          <el-table-column
+            prop="detail"
+            label="详情"
+            v-bind="cwEvents.col('详情', { minWidth: 300 })"
+            show-overflow-tooltip
+          />
+          <el-table-column prop="actor" label="操作者" v-bind="cwEvents.col('操作者', { width: 100 })">
             <template #default="{ row }">
               <span v-if="row.actor">{{ row.actor }}</span>
               <span v-else class="hint">系统</span>
@@ -65,13 +77,7 @@
           </el-table-column>
         </el-table>
 
-        <div class="more">
-          <el-button v-if="hasMore" size="small" :loading="loading" @click="loadMore">
-            加载更多
-          </el-button>
-          <span v-else-if="events.length" class="hint">已到底部</span>
-          <span class="hint">已加载 {{ events.length }} 条<span v-if="total">，共 {{ total }} 条</span></span>
-        </div>
+        <TablePager v-model:page="page" v-model:size="size" :total="total" @change="loadEvents" />
       </el-tab-pane>
 
       <el-tab-pane label="规则变更审计" name="changes">
@@ -79,36 +85,49 @@
           <el-button size="small" @click="loadChanges">刷新</el-button>
         </div>
 
-        <el-table :data="changes" v-loading="loadingChanges" size="small" empty-text="暂无记录">
-          <el-table-column label="时间" width="165">
+        <el-table
+          :data="changes"
+          v-loading="loadingChanges"
+          size="small"
+          border
+          empty-text="暂无记录"
+          @header-dragend="cwChanges.onDragend"
+        >
+          <el-table-column label="时间" v-bind="cwChanges.col('时间', { width: 165 })">
             <template #default="{ row }">{{ fmt(row.ts) }}</template>
           </el-table-column>
-          <el-table-column prop="backend" label="后端" width="100" />
-          <el-table-column prop="action" label="动作" width="160">
+          <el-table-column prop="backend" label="后端" v-bind="cwChanges.col('后端', { width: 100 })" />
+          <el-table-column prop="action" label="动作" v-bind="cwChanges.col('动作', { width: 160 })">
             <template #default="{ row }">
               <span class="mono">{{ row.action }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="结果" width="90">
+          <el-table-column label="结果" v-bind="cwChanges.col('结果', { width: 90 })">
             <template #default="{ row }">
               <el-tag size="small" :type="row.result === 'success' ? 'success' : 'danger'">
                 {{ row.result === 'success' ? '成功' : '失败' }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="payload" label="参数" min-width="240" show-overflow-tooltip />
-          <el-table-column prop="error" label="错误" min-width="200" show-overflow-tooltip />
+          <el-table-column
+            prop="payload"
+            label="参数"
+            v-bind="cwChanges.col('参数', { minWidth: 240 })"
+            show-overflow-tooltip
+          />
+          <el-table-column
+            prop="error"
+            label="错误"
+            v-bind="cwChanges.col('错误', { minWidth: 200 })"
+            show-overflow-tooltip
+          />
         </el-table>
 
-        <el-pagination
-          v-model:current-page="cPage"
-          v-model:page-size="cSize"
+        <TablePager
+          v-model:page="cPage"
+          v-model:size="cSize"
           :total="cTotal"
-          :page-sizes="[20, 50, 100]"
-          layout="total, sizes, prev, pager, next"
-          class="pager"
-          @current-change="loadChanges"
-          @size-change="loadChanges"
+          @change="loadChanges"
         />
       </el-tab-pane>
     </el-tabs>
@@ -118,6 +137,12 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import api from '@/api'
+import TablePager from '@/components/TablePager.vue'
+import { useColumnWidths } from '@/utils/table'
+
+// 两张表各记各的列宽：同名列（时间）在两张表里的含义不同，宽度也没必要联动。
+const cwEvents = useColumnWidths('events-log')
+const cwChanges = useColumnWidths('events-changes')
 
 const tab = ref('events')
 
@@ -138,9 +163,8 @@ const loading = ref(false)
 const category = ref('all')
 const hours = ref(24)
 const keyword = ref('')
-const limit = 50
-const cursor = ref(0)
-const hasMore = ref(false)
+const page = ref(1)
+const size = ref(20)
 const total = ref(0)
 
 const changes = ref<any[]>([])
@@ -175,36 +199,30 @@ function catType(c: string) {
   }
 }
 
-// append 为 true 时接着上一页往后取，否则从最新一条重新开始
-async function loadEvents(append = false) {
+async function loadEvents() {
   loading.value = true
   try {
     const params: Record<string, unknown> = {
       category: category.value,
       keyword: keyword.value,
-      limit,
+      page: page.value,
+      size: size.value,
     }
     if (hours.value > 0) params.hours = hours.value
-    if (append && cursor.value) params.cursor = cursor.value
 
     const r: any = await api.listEvents(params)
-    const items = r.items || []
-    events.value = append ? [...events.value, ...items] : items
-    cursor.value = r.next_cursor || 0
-    hasMore.value = !!r.has_more
-    if (!append) total.value = r.total || 0
+    events.value = r.items || []
+    total.value = r.total || 0
   } finally {
     loading.value = false
   }
 }
 
-function loadMore() {
-  loadEvents(true)
-}
-
+// 筛选条件变了必须回到第 1 页：留在第 5 页再换类别，新条件下那一页很可能
+// 根本不存在，结果是一张空表 —— 看起来像"没搜到"，实际是页码越界了。
 function reload() {
-  cursor.value = 0
-  loadEvents(false)
+  page.value = 1
+  loadEvents()
 }
 
 function reset() {
@@ -242,18 +260,6 @@ onMounted(() => reload())
   gap: 8px;
   flex-wrap: wrap;
   margin-bottom: 14px;
-}
-
-.more {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-top: 12px;
-}
-
-.pager {
-  margin-top: 14px;
-  justify-content: flex-end;
 }
 
 :deep(.el-tabs__header) {

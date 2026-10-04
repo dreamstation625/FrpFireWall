@@ -461,26 +461,26 @@ func (s *Store) AddEvent(e *model.Event) error {
 	return s.db.Create(e).Error
 }
 
-// EventCursor 是事件列表的游标分页结果。
-type EventCursor struct {
-	Items []model.Event `json:"items"`
-	// NextCursor 是下一页要传的游标（即本页最后一条的 id）；为 0 表示已到底。
-	NextCursor uint `json:"next_cursor"`
-	HasMore    bool `json:"has_more"`
-	Total      int64 `json:"total"`
-}
-
-// ListEventsCursor 按 id 倒序取一页事件，用自增主键做游标。
+// ListEventsPage 按 id 倒序取一页事件，页码从 1 开始。
 //
-// 事件表只增不减，offset 分页在深翻页时要先扫过并丢弃前面所有行，
-// 越翻越慢且耗时随总量线性增长；游标分页每页代价恒定。
-// beforeID 为 0 表示取最新一页。
-func (s *Store) ListEventsCursor(category, keyword string, since *time.Time, beforeID uint, limit int) (*EventCursor, error) {
-	if limit <= 0 {
-		limit = 50
+// 这里用 offset 而不是「id < 游标」，因为界面上的分页器要能选页码、显示总页数，
+// 就必须能随机跳到第 N 页，而游标只能顺着往后走。代价有两个，都是这一个选择
+// 自带的，不是实现问题：
+//   - 每次翻页都要重算 total（分页器要显示总页数，而 count 要扫全表）；
+//   - 深翻页时数据库要先扫过并丢弃前面所有行，页越靠后越慢。
+//
+// 事件量级（自建场景，每天几百到几千条）下两条都可忽略，换来的是「跳到第几页
+// 都行、还能选每页条数」。筛选条件与其它分页接口保持同一种写法（Count 后复用
+// 同一个 q 再 Find），免得同一个列表在不同调用点给出不一样的条数。
+func (s *Store) ListEventsPage(category, keyword string, since *time.Time, page, size int) (*Page[model.Event], error) {
+	if page < 1 {
+		page = 1
 	}
-	if limit > 500 {
-		limit = 500
+	if size <= 0 {
+		size = 20
+	}
+	if size > 500 {
+		size = 500
 	}
 
 	q := s.db.Model(&model.Event{})
@@ -495,34 +495,16 @@ func (s *Store) ListEventsCursor(category, keyword string, since *time.Time, bef
 		q = q.Where("ip LIKE ? OR user LIKE ? OR detail LIKE ? OR country LIKE ?", like, like, like, like)
 	}
 
-	// 总数只在首屏统计一次：count 要扫全表，翻页时没必要重复付这个代价。
 	var total int64
-	if beforeID == 0 {
-		if err := q.Count(&total).Error; err != nil {
-			return nil, err
-		}
-	}
-
-	if beforeID > 0 {
-		q = q.Where("id < ?", beforeID)
-	}
-
-	// 多取一条，用来判断后面还有没有数据，省掉一次 count。
-	items := make([]model.Event, 0, limit+1)
-	if err := q.Order("id DESC").Limit(limit + 1).Find(&items).Error; err != nil {
+	if err := q.Count(&total).Error; err != nil {
 		return nil, err
 	}
 
-	hasMore := len(items) > limit
-	if hasMore {
-		items = items[:limit]
+	items := make([]model.Event, 0, size)
+	if err := q.Order("id DESC").Offset((page - 1) * size).Limit(size).Find(&items).Error; err != nil {
+		return nil, err
 	}
-	next := uint(0)
-	if hasMore && len(items) > 0 {
-		next = items[len(items)-1].ID
-	}
-
-	return &EventCursor{Items: items, NextCursor: next, HasMore: hasMore, Total: total}, nil
+	return &Page[model.Event]{Items: items, Total: total, Page: page, Size: size}, nil
 }
 
 // EventStats 给概览页用的聚合统计。

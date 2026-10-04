@@ -24,16 +24,18 @@
         :data="active"
         v-loading="loadingActive"
         size="small"
+        border
         empty-text="当前没有被封禁的地址"
         @selection-change="(v: any[]) => (selected = v)"
+        @header-dragend="cwActive.onDragend"
       >
         <el-table-column type="selection" width="42" />
-        <el-table-column prop="target" label="地址" min-width="160">
+        <el-table-column prop="target" label="地址" v-bind="cwActive.col('地址', { minWidth: 160 })">
           <template #default="{ row }">
             <span class="mono">{{ row.target }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="属地" width="150">
+        <el-table-column label="属地" v-bind="cwActive.col('属地', { width: 150 })">
           <template #default="{ row }">
             <span v-if="row.country || row.province">
               {{ [row.country, row.province].filter(Boolean).join(' · ') }}
@@ -41,12 +43,12 @@
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column prop="source" label="来源" width="90">
+        <el-table-column prop="source" label="来源" v-bind="cwActive.col('来源', { width: 90 })">
           <template #default="{ row }">
             <el-tag size="small" :type="sourceType(row.source)">{{ sourceName(row.source) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="范围" width="118">
+        <el-table-column label="范围" v-bind="cwActive.col('范围', { width: 118 })">
           <template #default="{ row }">
             <el-tooltip :content="scopeTip(row.scope, row.ports)" placement="top">
               <el-tag size="small" :type="scopeTagType(row.scope)">
@@ -55,41 +57,48 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="封禁端口" min-width="120">
+        <el-table-column label="封禁端口" v-bind="cwActive.col('封禁端口', { minWidth: 120 })">
           <template #default="{ row }">
             <span v-if="row.scope === 'custom' && row.ports" class="mono">{{ row.ports }}</span>
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
-        <el-table-column prop="user" label="触发账号" width="100">
+        <el-table-column
+          prop="reason"
+          label="原因"
+          v-bind="cwActive.col('原因', { minWidth: 220 })"
+          show-overflow-tooltip
+        />
+        <el-table-column prop="user" label="触发账号" v-bind="cwActive.col('触发账号', { width: 100 })">
           <template #default="{ row }">
             <span v-if="row.user">{{ row.user }}</span>
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="剩余时间" width="130">
+        <el-table-column label="剩余时间" v-bind="cwActive.col('剩余时间', { width: 130 })">
           <template #default="{ row }">
             <span v-if="row.permanent" class="permanent">永久</span>
             <span v-else class="countdown">{{ remain(row) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="阶梯" width="70">
+        <el-table-column label="阶梯" v-bind="cwActive.col('阶梯', { width: 70 })">
           <template #default="{ row }">第 {{ row.hit_count }} 级</template>
         </el-table-column>
-        <el-table-column label="操作" width="90" fixed="right">
+        <el-table-column label="操作" v-bind="cwActive.col('操作', { width: 90 })" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="unban(row)">解封</el-button>
           </template>
         </el-table-column>
       </el-table>
+
+      <TablePager v-model:page="aPage" v-model:size="aSize" :total="aTotal" @change="loadActive" />
     </div>
 
     <div class="page-card panel mt">
       <div class="panel-head">
         <span class="section-title">封禁历史</span>
         <div class="filters">
-          <el-select v-model="status" size="small" style="width: 120px" @change="loadHistory">
+          <el-select v-model="status" size="small" style="width: 120px" @change="searchHistory">
             <el-option label="全部" value="all" />
             <el-option label="生效中" value="active" />
             <el-option label="已过期" value="expired" />
@@ -101,19 +110,26 @@
             placeholder="搜索地址 / 原因"
             clearable
             style="width: 220px"
-            @keyup.enter="loadHistory"
+            @keyup.enter="searchHistory"
           />
-          <el-button size="small" @click="loadHistory">查询</el-button>
+          <el-button size="small" @click="searchHistory">查询</el-button>
         </div>
       </div>
 
-      <el-table :data="history" v-loading="loadingHistory" size="small" empty-text="暂无记录">
-        <el-table-column prop="target" label="地址" min-width="150">
+      <el-table
+        :data="history"
+        v-loading="loadingHistory"
+        size="small"
+        border
+        empty-text="暂无记录"
+        @header-dragend="cwHistory.onDragend"
+      >
+        <el-table-column prop="target" label="地址" v-bind="cwHistory.col('地址', { minWidth: 150 })">
           <template #default="{ row }">
             <span class="mono">{{ row.target }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="属地" width="140">
+        <el-table-column label="属地" v-bind="cwHistory.col('属地', { width: 140 })">
           <template #default="{ row }">
             <span v-if="row.country || row.province">
               {{ [row.country, row.province].filter(Boolean).join(' · ') }}
@@ -121,12 +137,12 @@
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column prop="source" label="来源" width="90">
+        <el-table-column prop="source" label="来源" v-bind="cwHistory.col('来源', { width: 90 })">
           <template #default="{ row }">
             <el-tag size="small" :type="sourceType(row.source)">{{ sourceName(row.source) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="范围" width="118">
+        <el-table-column label="范围" v-bind="cwHistory.col('范围', { width: 118 })">
           <template #default="{ row }">
             <el-tooltip :content="scopeTip(row.scope, row.ports)" placement="top">
               <el-tag size="small" :type="scopeTagType(row.scope)">
@@ -135,22 +151,27 @@
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="封禁端口" min-width="120">
+        <el-table-column label="封禁端口" v-bind="cwHistory.col('封禁端口', { minWidth: 120 })">
           <template #default="{ row }">
             <span v-if="row.scope === 'custom' && row.ports" class="mono">{{ row.ports }}</span>
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
-        <el-table-column label="状态" width="90">
+        <el-table-column
+          prop="reason"
+          label="原因"
+          v-bind="cwHistory.col('原因', { minWidth: 220 })"
+          show-overflow-tooltip
+        />
+        <el-table-column label="状态" v-bind="cwHistory.col('状态', { width: 90 })">
           <template #default="{ row }">
             <el-tag size="small" :type="statusType(row.status)">{{ statusName(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="封禁时间" width="165">
+        <el-table-column label="封禁时间" v-bind="cwHistory.col('封禁时间', { width: 165 })">
           <template #default="{ row }">{{ fmt(row.banned_at) }}</template>
         </el-table-column>
-        <el-table-column label="解除时间" width="165">
+        <el-table-column label="解除时间" v-bind="cwHistory.col('解除时间', { width: 165 })">
           <template #default="{ row }">
             <span v-if="row.released_at">{{ fmt(row.released_at) }}</span>
             <span v-else class="hint">—</span>
@@ -158,16 +179,7 @@
         </el-table-column>
       </el-table>
 
-      <el-pagination
-        v-model:current-page="page"
-        v-model:page-size="size"
-        :total="total"
-        :page-sizes="[20, 50, 100]"
-        layout="total, sizes, prev, pager, next"
-        style="margin-top: 14px; justify-content: flex-end"
-        @current-change="loadHistory"
-        @size-change="loadHistory"
-      />
+      <TablePager v-model:page="page" v-model:size="size" :total="total" @change="loadHistory" />
     </div>
 
     <el-dialog v-model="banVisible" title="手动封禁" width="480px">
@@ -221,7 +233,14 @@
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import TablePager from '@/components/TablePager.vue'
 import { SCOPE_OPTIONS, scopeFormHint, scopeLabel, scopeTagType, scopeTip } from '@/utils/scope'
+import { useColumnWidths } from '@/utils/table'
+
+// 活跃表与历史表各记各的列宽：两张表有「地址 / 属地 / 来源 / 范围」等同名列，
+// 但内容用途不同，宽度没必要联动。
+const cwActive = useColumnWidths('bans-active')
+const cwHistory = useColumnWidths('bans-history')
 
 const active = ref<any[]>([])
 const history = ref<any[]>([])
@@ -230,6 +249,11 @@ const loadingHistory = ref(false)
 const selected = ref<any[]>([])
 const status = ref('all')
 const keyword = ref('')
+// 活跃封禁分页
+const aPage = ref(1)
+const aSize = ref(20)
+const aTotal = ref(0)
+// 封禁历史分页
 const page = ref(1)
 const size = ref(20)
 const total = ref(0)
@@ -276,8 +300,9 @@ function statusType(s: string) {
 async function loadActive() {
   loadingActive.value = true
   try {
-    const r: any = await api.activeBans()
+    const r: any = await api.activeBans({ page: aPage.value, size: aSize.value })
     active.value = r.items || []
+    aTotal.value = r.total || 0
   } finally {
     loadingActive.value = false
   }
@@ -297,6 +322,13 @@ async function loadHistory() {
   } finally {
     loadingHistory.value = false
   }
+}
+
+// 筛选条件变了回到第 1 页：停在第 5 页改状态筛选，新结果很可能不足 5 页，
+// 用户看到的是一张空表，会以为"没有这类记录"。
+function searchHistory() {
+  page.value = 1
+  loadHistory()
 }
 
 async function unban(row: any) {

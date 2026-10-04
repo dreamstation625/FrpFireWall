@@ -425,26 +425,31 @@ check_err "插件片段 JSON 一并下发" "$(printf '%s' "$FC" | jqf data.plugi
 check "面板侧健康探测" "$(get -H "$AUTH" "$BASE/api/v1/frps/health" | jqf data.ok)" "true"
 
 echo
-echo "########## 7. 事件与规则变更（游标分页） ##########"
+echo "########## 7. 事件与规则变更（页码分页） ##########"
 # 先造几条事件，才有数据验证翻页
 for i in 1 2 3 4 5 6; do
   post_op Login "$(login_body "evt-$i" "203.0.113.$i:5000")" > /dev/null
 done
 
-EV=$(get -H "$AUTH" "$BASE/api/v1/events?limit=5&hours=24")
-check "首页取 5 条" "$(printf '%s' "$EV" | jqf data.items)" "[5]"
-check "还有更多数据" "$(printf '%s' "$EV" | jqf data.has_more)" "true"
+EV=$(get -H "$AUTH" "$BASE/api/v1/events?page=1&size=5&hours=24")
+check "第 1 页取 5 条" "$(printf '%s' "$EV" | jqf data.items)" "[5]"
 check_ok "事件 total" "$(printf '%s' "$EV" | jqf data.total)"
-CUR=$(printf '%s' "$EV" | jqf data.next_cursor)
-# 第二页首条的 id 必须小于游标，否则两页内容会重叠
-NEXT_FIRST=$(get -H "$AUTH" "$BASE/api/v1/events?limit=5&cursor=$CUR" | jqf data.items.0.id)
-if [ -n "$CUR" ] && [ -n "$NEXT_FIRST" ] && [ "$NEXT_FIRST" -lt "$CUR" ] 2>/dev/null; then
-  printf '  %s %-44s 游标 %s → 次页首条 %s\n' "$(green PASS)" "游标翻页不重叠" "$CUR" "$NEXT_FIRST"; PASS=$((PASS + 1))
+# 两页不能重叠：offset 算错（少减 1、拿 page 当 offset）的表现就是第二页重复
+# 第一页的尾条或漏掉一条，一页一页往下翻的时候看不出来。
+EV2=$(get -H "$AUTH" "$BASE/api/v1/events?page=2&size=5&hours=24")
+P1_LAST=$(printf '%s' "$EV" | jqf data.items.4.id)
+P2_FIRST=$(printf '%s' "$EV2" | jqf data.items.0.id)
+if [ -n "$P1_LAST" ] && [ -n "$P2_FIRST" ] && [ "$P2_FIRST" -lt "$P1_LAST" ] 2>/dev/null; then
+  printf '  %s %-44s 第 1 页尾条 %s → 第 2 页首条 %s\n' "$(green PASS)" "页码翻页不重叠" "$P1_LAST" "$P2_FIRST"; PASS=$((PASS + 1))
 else
-  printf '  %s %-44s 游标 %s → 次页首条 %s\n' "$(red FAIL)" "游标翻页不重叠" "$CUR" "$NEXT_FIRST"; FAIL=$((FAIL + 1))
+  printf '  %s %-44s 第 1 页尾条 %s → 第 2 页首条 %s\n' "$(red FAIL)" "页码翻页不重叠" "$P1_LAST" "$P2_FIRST"; FAIL=$((FAIL + 1))
 fi
-check_ok "按类别过滤 login_blocked" "$(get -H "$AUTH" "$BASE/api/v1/events?limit=5&category=login_blocked" | jqf data.total)"
-check_ok "关键字过滤" "$(get -H "$AUTH" "$BASE/api/v1/events?limit=5&keyword=203.0.113" | jqf data.total)"
+# 越界页不能把 total 一起带走：分页器靠 total 算总页数，返回 0 会把用户弹回第 1 页
+check "越界页 total 不变" \
+  "$(get -H "$AUTH" "$BASE/api/v1/events?page=99&size=5&hours=24" | jqf data.total)" \
+  "$(printf '%s' "$EV" | jqf data.total)"
+check_ok "按类别过滤 login_blocked" "$(get -H "$AUTH" "$BASE/api/v1/events?category=login_blocked" | jqf data.total)"
+check_ok "关键字过滤" "$(get -H "$AUTH" "$BASE/api/v1/events?keyword=203.0.113" | jqf data.total)"
 check_any "规则变更审计 total" "$(get -H "$AUTH" "$BASE/api/v1/events/changes?page=1&size=5" | jqf data.total)"
 ES=$(get -H "$AUTH" "$BASE/api/v1/events/stats?hours=24")
 # 此处还没造出被拦截的事件（第 11 节才有），trend/top 必须是空数组而不是 null
@@ -786,6 +791,14 @@ check "排障查询 banned" "$(printf '%s' "$LK" | jqf data.banned)" "true"
 check "排障查询窗口计数存在" "$(printf '%s' "$LK" | jqf data.window_hits)" "0"
 check "排障查询系统保护" "$(printf '%s' "$LK" | jqf data.system_protected)" "false"
 BID=$(printf '%s' "$BAN" | jqf data.id)
+# 活跃封禁也走页码分页（数据在 guard 内存里切片，不去库里重查一遍）。
+# size=1 时只回 1 条，但 total 必须是**全部**生效中的封禁数 —— total 跟着切片
+# 变小的话，分页器会算成只有一页，用户永远翻不到第二条。
+AB1=$(get -H "$AUTH" "$BASE/api/v1/bans/active?page=1&size=1")
+check "活跃封禁按 size 切片" "$(printf '%s' "$AB1" | jqf data.items)" "[1]"
+check "活跃封禁 total 不受切片影响" \
+  "$(printf '%s' "$AB1" | jqf data.total)" \
+  "$(get -H "$AUTH" "$BASE/api/v1/bans/active" | jqf data.total)"
 check "解封" "$(get -X DELETE "$BASE/api/v1/bans/$BID" -H "$AUTH" | jqf data.message)" "已解封"
 check "解封后查询 banned=false" \
   "$(get -X POST "$BASE/api/v1/bans/lookup" -H "$AUTH" -H 'Content-Type: application/json' -d '{"target":"203.0.113.99"}' | jqf data.banned)" "false"

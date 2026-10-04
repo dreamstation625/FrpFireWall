@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
+	"github.com/dreamstation625/FrpFireWall/internal/guard"
 	"github.com/dreamstation625/FrpFireWall/internal/model"
 	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
@@ -487,11 +488,28 @@ func (s *Server) handleListBans(c *gin.Context) {
 }
 
 // handleActiveBans 直接读内存，返回实时封禁状态（含剩余秒数）。
+// handleActiveBans 返回当前生效中的封禁，支持分页。
+//
+// 分页在内存里切片，不去数据库按同样条件再查一遍：这批条目本来就在 guard 的
+// 内存表里（判定用的就是它），从库里查会多出一个窗口 —— 库里已解封、内存还没
+// 刷新时，两份列表的条数对不上，用户看到的总数与他刚解封的操作矛盾。
 func (s *Server) handleActiveBans(c *gin.Context) {
-	ok(c, gin.H{
-		"items": s.guard.Bans(),
-		"total": len(s.guard.Bans()),
-	})
+	bans := s.guard.Bans()
+	total := len(bans)
+
+	page, size := pageParams(c)
+	start := (page - 1) * size
+	if start > total {
+		start = total
+	}
+	end := min(start+size, total)
+
+	items := bans[start:end]
+	if items == nil {
+		// 空列表必须是 []，不能是 null —— 前端直接读它的 length。
+		items = []guard.BanView{}
+	}
+	ok(c, gin.H{"items": items, "total": total, "page": page, "size": size})
 }
 
 func (s *Server) handleCreateBan(c *gin.Context) {

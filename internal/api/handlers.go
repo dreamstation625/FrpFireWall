@@ -255,22 +255,8 @@ func (s *Server) handleListEvents(c *gin.Context) {
 		}
 	}
 
-	limit := 50
-	if l := c.Query("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 500 {
-			limit = n
-		}
-	}
-
-	// 游标就是上一页最后一条的 id
-	var beforeID uint
-	if cur := c.Query("cursor"); cur != "" {
-		if n, err := strconv.ParseUint(cur, 10, 64); err == nil {
-			beforeID = uint(n)
-		}
-	}
-
-	res, err := s.store.ListEventsCursor(category, keyword, since, beforeID, limit)
+	page, size := pageParams(c)
+	res, err := s.store.ListEventsPage(category, keyword, since, page, size)
 	if err != nil {
 		serverErr(c, err)
 		return

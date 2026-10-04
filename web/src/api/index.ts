@@ -96,7 +96,7 @@ export const api = {
 
   // ---- 封禁 ----
   listBans: (params: Record<string, unknown>) => http.get('/bans', { params }),
-  activeBans: () => http.get('/bans/active'),
+  activeBans: (params: Record<string, unknown> = {}) => http.get('/bans/active', { params }),
   createBan: (body: Record<string, unknown>) => http.post('/bans', body),
   deleteBan: (id: number) => http.delete(`/bans/${id}`),
   batchDeleteBan: (ids: number[]) =>

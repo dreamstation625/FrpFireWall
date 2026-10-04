@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/dreamstation625/FrpFireWall/internal/model"
@@ -180,5 +181,105 @@ func TestRateRuleColumnNames(t *testing.T) {
 	}
 	if has["c_id_rs"] {
 		t.Error("CIDRs 又被命名策略拆成了 c_id_rs，column 标签丢了")
+	}
+}
+
+// 事件列表的页码分页。
+//
+// 盯的是「翻页不重不漏」：offset 算错（少减 1、拿 page 当 offset、size 传错）
+// 的表现是第二页重复第一页的尾条或漏掉一条，一页一页翻不容易看出来，
+// 只有把几页拼起来按 id 比对才会露馅。
+func TestListEventsPage(t *testing.T) {
+	s := openTemp(t)
+
+	for i := 1; i <= 7; i++ {
+		if err := s.AddEvent(&model.Event{
+			Category: "login_blocked",
+			IP:       fmt.Sprintf("203.0.113.%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 另一个类别：用来验证筛选改变的是 total，而不是只筛当前页
+	if err := s.AddEvent(&model.Event{Category: "ban", IP: "198.51.100.1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	pages := make([]*Page[model.Event], 0, 3)
+	for page := 1; page <= 3; page++ {
+		p, err := s.ListEventsPage("", "", nil, page, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages = append(pages, p)
+	}
+
+	if pages[0].Total != 8 {
+		t.Errorf("total = %d，期望 8（不筛选时是全表）", pages[0].Total)
+	}
+	if len(pages[0].Items) != 3 {
+		t.Fatalf("第 1 页 %d 条，期望 3", len(pages[0].Items))
+	}
+	// id 倒序 = 最新在前，所以首条是最后写入的那条
+	if got := pages[0].Items[0].IP; got != "198.51.100.1" {
+		t.Errorf("首条应是最后写入的 198.51.100.1，得到 %q", got)
+	}
+
+	seen := map[uint]bool{}
+	ids := make([]uint, 0, 8)
+	for i, p := range pages {
+		for _, e := range p.Items {
+			if seen[e.ID] {
+				t.Errorf("id %d 在第 %d 页重复出现 —— offset 算错了", e.ID, i+1)
+			}
+			seen[e.ID] = true
+			ids = append(ids, e.ID)
+		}
+	}
+	if len(ids) != 8 {
+		t.Errorf("三页合计 %d 条，期望 8（不重不漏）", len(ids))
+	}
+	for i := 1; i < len(ids); i++ {
+		if ids[i] >= ids[i-1] {
+			t.Errorf("id 不是严格递减：%d 后面是 %d", ids[i-1], ids[i])
+			break
+		}
+	}
+
+	// 越界页：条目为空，但 total 必须照旧 —— 分页器要靠它算总页数，
+	// 返回 0 会让页数变成 1 页、把用户直接弹回第一页。
+	beyond, err := s.ListEventsPage("", "", nil, 9, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beyond.Items) != 0 {
+		t.Errorf("越界页返回了 %d 条，期望 0", len(beyond.Items))
+	}
+	if beyond.Items == nil {
+		t.Error("越界页的 items 是 nil，序列化成 JSON 会变成 null")
+	}
+	if beyond.Total != 8 {
+		t.Errorf("越界页 total = %d，期望仍是 8", beyond.Total)
+	}
+
+	// 筛选与分页组合
+	filtered, err := s.ListEventsPage("ban", "", nil, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filtered.Total != 1 || len(filtered.Items) != 1 {
+		t.Errorf("按类别筛选得 total=%d len=%d，期望 1/1", filtered.Total, len(filtered.Items))
+	}
+
+	// 非法入参必须被夹住，而不是把整张表倒出来
+	if big, err := s.ListEventsPage("", "", nil, 1, 100000); err != nil {
+		t.Fatal(err)
+	} else if len(big.Items) > 500 {
+		t.Errorf("size 未被夹到上限：返回 %d 条", len(big.Items))
+	}
+	if zero, err := s.ListEventsPage("", "", nil, 0, 3); err != nil {
+		t.Fatal(err)
+	} else if len(zero.Items) != 3 {
+		t.Errorf("page=0 应被当成第 1 页，得到 %d 条", len(zero.Items))
 	}
 }

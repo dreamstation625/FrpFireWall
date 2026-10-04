@@ -18,27 +18,31 @@
         <div v-for="(p, i) in guardProblems" :key="i">· {{ p }}</div>
       </div>
 
-      <el-table :data="rules" size="small" border>
-        <el-table-column label="顺序" width="60" align="center">
+      <el-table :data="pagedRules" size="small" border @header-dragend="cw.onDragend">
+        <el-table-column label="顺序" v-bind="cw.col('顺序', { width: 60 })" align="center">
           <template #default="{ $index }">
-            <span class="mono">{{ $index + 1 }}</span>
+            <span class="mono">{{ ruleIndex($index) + 1 }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="启用" width="66" align="center">
+        <el-table-column label="启用" v-bind="cw.col('启用', { width: 66 })" align="center">
           <template #default="{ row }">
             <el-switch v-model="row.enabled" size="small" />
           </template>
         </el-table-column>
 
-        <el-table-column label="规则名" min-width="150" show-overflow-tooltip>
+        <el-table-column
+          label="规则名"
+          v-bind="cw.col('规则名', { minWidth: 150 })"
+          show-overflow-tooltip
+        >
           <template #default="{ row }">
             <span :class="{ 'rule-off': !row.enabled }">{{ row.name }}</span>
             <div v-if="row.remark" class="hint">{{ row.remark }}</div>
           </template>
         </el-table-column>
 
-        <el-table-column label="落点" width="88" align="center">
+        <el-table-column label="落点" v-bind="cw.col('落点', { width: 88 })" align="center">
           <template #default="{ row }">
             <el-tooltip :content="LAYER_TIP[rowLayer(row)]" placement="top">
               <el-tag size="small" :type="LAYER_TAG_TYPE[rowLayer(row)]">
@@ -48,34 +52,44 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="匹配条件" min-width="210">
+        <el-table-column label="匹配条件" v-bind="cw.col('匹配条件', { minWidth: 210 })">
           <template #default="{ row }">
             <div v-for="(p, i) in conditionParts(row, countryLabel)" :key="i">{{ p }}</div>
           </template>
         </el-table-column>
 
-        <el-table-column label="动作" min-width="190">
+        <el-table-column label="动作" v-bind="cw.col('动作', { minWidth: 190 })">
           <template #default="{ row }">
             <div v-for="(p, i) in actionParts(row)" :key="i">{{ p }}</div>
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="200" align="center">
+        <el-table-column label="操作" v-bind="cw.col('操作', { width: 200 })" align="center">
           <template #default="{ $index }">
-            <el-button size="small" link type="primary" :disabled="$index === 0" @click="moveRule($index, -1)">
+            <el-button
+              size="small"
+              link
+              type="primary"
+              :disabled="ruleIndex($index) === 0"
+              @click="moveRule(ruleIndex($index), -1)"
+            >
               上移
             </el-button>
             <el-button
               size="small"
               link
               type="primary"
-              :disabled="$index === rules.length - 1"
-              @click="moveRule($index, 1)"
+              :disabled="ruleIndex($index) === rules.length - 1"
+              @click="moveRule(ruleIndex($index), 1)"
             >
               下移
             </el-button>
-            <el-button size="small" link type="primary" @click="editRule($index)">编辑</el-button>
-            <el-button size="small" link type="danger" @click="removeRule($index)">删除</el-button>
+            <el-button size="small" link type="primary" @click="editRule(ruleIndex($index))">
+              编辑
+            </el-button>
+            <el-button size="small" link type="danger" @click="removeRule(ruleIndex($index))">
+              删除
+            </el-button>
           </template>
         </el-table-column>
 
@@ -83,6 +97,8 @@
           <span class="hint">还没有细分规则，所有流量都按下面的全局规则处理。</span>
         </template>
       </el-table>
+
+      <TablePager v-model:page="rPage" v-model:size="rSize" :total="rules.length" />
 
       <div class="hint" style="margin-top: 10px">
         规则的先后顺序就是匹配顺序。改动后需要点右上角「保存并生效」—— 策略和规则在同一次请求里一起保存。
@@ -268,6 +284,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import BanStepsEditor from '@/components/BanStepsEditor.vue'
 import RateRuleDialog from '@/components/RateRuleDialog.vue'
+import TablePager from '@/components/TablePager.vue'
 import { type Step, parseStepsOrDefault, stepsToCSV, validateSteps } from '@/utils/duration'
 import {
   LAYER_LABEL,
@@ -279,6 +296,9 @@ import {
   conditionParts,
   layerOf,
 } from '@/utils/raterule'
+import { useColumnWidths } from '@/utils/table'
+
+const cw = useColumnWidths('policy-rules')
 
 const loading = ref(false)
 const saving = ref(false)
@@ -311,6 +331,37 @@ const capability = ref<any>({})
 // ---- 细分规则 ----
 
 const rules = ref<RateRule[]>([])
+
+// 规则表分页。规则本身仍以全量 rules 为准 —— 保存、脏标记比对、上移下移全都
+// 作用于它，分页只决定「显示哪一段」。所以模板里所有按位置操作的按钮都必须
+// 先把页内序号换成全表序号（ruleIndex）；直接拿 $index 去改会改到别的规则上，
+// 而且改错时界面看起来完全正常。
+const rPage = ref(1)
+const rSize = ref(20)
+const pagedRules = computed(() =>
+  rules.value.slice((rPage.value - 1) * rSize.value, rPage.value * rSize.value)
+)
+
+/** 页内序号 → 全表序号。 */
+function ruleIndex(i: number) {
+  return (rPage.value - 1) * rSize.value + i
+}
+
+/**
+ * 翻到某条规则所在的页。
+ *
+ * 上移下移跨页时必须调用：规则被移到上一页后，当前页的切片里就没有它了，
+ * 用户看到的是「点了上移，这条规则凭空消失」，会以为被删掉了。
+ */
+function gotoRule(i: number) {
+  rPage.value = Math.floor(i / rSize.value) + 1
+}
+
+/** 删完之后当前页可能空了，回退到最后一页，别停在一张空表上。 */
+function clampRulePage() {
+  const last = Math.max(1, Math.ceil(rules.value.length / rSize.value))
+  if (rPage.value > last) rPage.value = last
+}
 const guardProblems = ref<string[]>([])
 const ruleDialogVisible = ref(false)
 const editingIndex = ref(-1)
@@ -369,6 +420,8 @@ function onRuleSaved(r: RateRule) {
     rules.value.splice(editingIndex.value, 1, r)
   } else {
     rules.value.push(r)
+    // 新增的规则追加在末尾，跟过去 —— 否则在当前页看不到它，像是没加上
+    gotoRule(rules.value.length - 1)
   }
 }
 
@@ -380,6 +433,7 @@ async function removeRule(i: number) {
     return
   }
   rules.value.splice(i, 1)
+  clampRulePage()
 }
 
 function moveRule(i: number, dir: number) {
@@ -387,6 +441,7 @@ function moveRule(i: number, dir: number) {
   if (j < 0 || j >= rules.value.length) return
   const arr = rules.value
   ;[arr[i], arr[j]] = [arr[j], arr[i]]
+  gotoRule(j)
 }
 
 // ---- 脏标记 ----
