@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -402,5 +403,102 @@ func TestSavePolicyRejectsPointsAtIndex(t *testing.T) {
 	}
 	if !strings.HasPrefix(r.Error, "第 2 条规则：") {
 		t.Errorf("错误信息应当以「第 2 条规则：」开头，实际 %q", r.Error)
+	}
+}
+
+// 规则里「代理（隧道）名」的往返与两条硬约束。
+//
+// 往返要测是因为这条链上有个专门的守卫（TestRateRuleInputCoversAllWritableFields）
+// 只检查"字段在不在 DTO 里"，不检查值有没有真的落库 —— 少一个字段赋值，
+// 保存返回 200、读回来却是空的，界面上表现为"填了代理名，保存后没了"。
+func TestRateRuleProxyNameRoundTrip(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPut, "/api/v1/policy", withRules(h.policyBody(), []map[string]any{{
+		"name":       "web-ssh 专用限速",
+		"enabled":    true,
+		"proxy_name": "web-ssh",
+		"per_sec":    10,
+	}}))
+	if code != http.StatusOK {
+		t.Fatalf("保存应当 200，实际 %d %s", code, r.Error)
+	}
+
+	list := h.rules()
+	if len(list) != 1 {
+		t.Fatalf("应当存下 1 条规则，实际 %d 条", len(list))
+	}
+	row, _ := list[0].(map[string]any)
+	if row["proxy_name"] != "web-ssh" {
+		t.Fatalf("读回来的 proxy_name = %v，期望 web-ssh（值没落库的话界面上就是"+
+			"填了又消失，而保存返回的是 200）", row["proxy_name"])
+	}
+}
+
+// 代理 + 端口必须被拒：带端口条件的规则下发到内核，那里认不出 frp 的隧道名。
+// 与"地区 + 端口"是同一类冲突，只是方向不同 —— 漏掉这一半，用户配出来的规则
+// 会静默少生效一半。
+func TestRateRuleRejectsProxyWithPorts(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodPut, "/api/v1/policy", withRules(h.policyBody(), []map[string]any{{
+		"name":       "冲突规则",
+		"enabled":    true,
+		"proxy_name": "web-ssh",
+		"ports":      "7000",
+		"per_sec":    10,
+	}}))
+	if code == http.StatusOK {
+		t.Fatal("「代理」+「端口」应当被拒绝，接口却返回了 200")
+	}
+	if !strings.Contains(r.Error, "代理") {
+		t.Errorf("报错里应当指出是「代理」与「端口」冲突，实际：%s", r.Error)
+	}
+}
+
+// /events/proxy-names 给规则编辑器提供候选。
+//
+// 排序按"最近出现"而不是字母序：用户要找的是最近在动的那个隧道，字母序会把
+// 一堆 test-xxx 顶在最前面。空库必须返回空数组而不是 null —— 前端拿 null 就得
+// 处处兜底（见 store 里其它列表的同一条约定）。
+func TestProxyNamesEndpoint(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodGet, "/api/v1/events/proxy-names", nil)
+	if code != http.StatusOK {
+		t.Fatalf("应 200，实际 %d %s", code, r.Error)
+	}
+	items, ok := h.data(r)["items"].([]any)
+	if !ok {
+		t.Fatalf("items 应当是数组（空库也不能是 null），实际 %s", string(r.Data))
+	}
+	if len(items) != 0 {
+		t.Fatalf("空库应当返回空数组，实际 %v", items)
+	}
+
+	now := time.Now()
+	for i, e := range []model.Event{
+		{Category: model.EvtUserConn, ProxyName: "web-1", Ts: now.Add(-2 * time.Hour)},
+		{Category: model.EvtUserConn, ProxyName: "web-ssh", Ts: now.Add(-time.Minute)},
+		{Category: model.EvtUserConn, ProxyName: "web-ssh", Ts: now.Add(-time.Second)},
+		{Category: model.EvtLoginAttempt, Ts: now}, // 登录回调没有代理名，不该进候选
+	} {
+		_ = i
+		if err := h.srv.store.AddEvent(&e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, r = h.call(http.MethodGet, "/api/v1/events/proxy-names", nil)
+	items, ok = h.data(r)["items"].([]any)
+	if !ok {
+		t.Fatalf("items 应当是数组，实际 %s", string(r.Data))
+	}
+	if len(items) != 2 {
+		t.Fatalf("去重后应当是 2 个代理名，实际 %v", items)
+	}
+	// 最近出现过的 web-ssh 排在前面
+	if items[0] != "web-ssh" || items[1] != "web-1" {
+		t.Errorf("应当按最近出现排序，实际 %v", items)
 	}
 }

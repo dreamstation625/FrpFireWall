@@ -184,6 +184,7 @@ func (s *Server) Routes() http.Handler {
 		// ---- 事件 ----
 		auth.GET("/events", s.handleListEvents)
 		auth.GET("/events/stats", s.handleEventStats)
+		auth.GET("/events/proxy-names", s.handleProxyNames)
 		auth.GET("/events/changes", s.handleListRuleChanges)
 
 		// ---- frps 集成 ----

@@ -304,6 +304,26 @@ func (s *Server) handleEventStats(c *gin.Context) {
 	ok(c, stats)
 }
 
+// handleProxyNames 给细分规则的「代理」一栏提供候选值。
+//
+// 列表只是**方便的默认值**，不是全集：它来自事件表，没被访问过的隧道、
+// 以及被事件保留期清掉的旧隧道都不在里面。界面因此必须允许手填（allow-create），
+// 这里也不做任何校验 —— 填错的表现是永远不命中，与城市那一栏是同一个取舍。
+func (s *Server) handleProxyNames(c *gin.Context) {
+	limit := 100
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	names, err := s.store.ListProxyNames(limit)
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	ok(c, gin.H{"items": names})
+}
+
 func (s *Server) handleListRuleChanges(c *gin.Context) {
 	page, size := pageParams(c)
 	res, err := s.store.ListRuleChanges(page, size)

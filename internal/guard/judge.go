@@ -196,7 +196,10 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 	//    取代的范围仅限"频控参数"（限速、窗口、阈值、阶梯），不含上一步的
 	//    地域名单，也不含自动封禁 / 观察模式这类全局开关 —— 那几个是行为开关，
 	//    不是"这条规则用多大力度"。
-	rule := m.matchAppRule(addr, geoInfo)
+	// 代理名参与匹配：规则可以只针对某个隧道生效（不同代理不同力度）。
+	// Login 回调传进来的是空串，所以带代理条件的规则在登录阶段不命中 ——
+	// 那一刻隧道还没建立，没有这个信息可用。
+	rule := m.matchAppRule(addr, geoInfo, proxy)
 
 	// 6b. 命中即拦截：条件对上就直接拒绝，不计数、不限速。
 	//

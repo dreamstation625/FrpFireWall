@@ -456,3 +456,55 @@ func TestRateRuleValidateRejectsEmptyCity(t *testing.T) {
 		t.Error("归一化之后仍然必须被拒绝（此时由「没有任何匹配条件」兜住）")
 	}
 }
+
+// 代理（隧道）名作为匹配条件的三条契约。
+//
+// 一、**它自己就算一个匹配条件**。"只给某个代理定一套参数"正是只有代理名、
+// 没有地区和网段的写法；不把它算进条件里，这种规则会被"没有任何匹配条件"
+// 那条检查拒掉，功能直接配不出来。
+//
+// 二、**不能与端口共存**。代理名来自 frps 的回调，带端口条件的规则下发到内核，
+// 内核只看源地址与目的端口、认不出隧道 —— 凑在一起代理条件永远判不上，
+// 属于"配了不生效"，必须像"地区 + 端口"那样在保存时挡掉。
+//
+// 三、**它进封禁来源引用的签名**。改了代理名等于换了一批适用对象，旧的封禁
+// 依据不再成立，由它封的地址要跟着解封。
+func TestRateRuleProxyNameContract(t *testing.T) {
+	// 一、只有代理名也是一条完整规则
+	only := RateRule{Name: "web-ssh 限速", ProxyName: "web-ssh", PerSec: 10}
+	only.Normalize()
+	if err := only.Validate(); err != nil {
+		t.Fatalf("只有代理名、没有地区/网段的规则应当合法，实际被拒：%v", err)
+	}
+
+	// 二、端口 + 代理必须被拒
+	conflict := RateRule{Name: "x", ProxyName: "web-ssh", Ports: "7000", PerSec: 10}
+	if err := conflict.Validate(); err == nil || !strings.Contains(err.Error(), "代理") {
+		t.Errorf("「代理」+「端口」应当被拒绝并说明原因，实际：%v", err)
+	}
+
+	// 三、代理名进签名
+	a := RateRule{Name: "x", Enabled: true, ProxyName: "web-ssh", Block: true}
+	b := a
+	b.ProxyName = "web-1"
+	if a.BanRef() == b.BanRef() {
+		t.Error("代理名不同却拿到了同一个来源引用 —— 改代理名后旧的封禁不会解封")
+	}
+	c := a
+	c.Name = "换个名字"
+	if c.BanRef() != a.BanRef() {
+		t.Error("改名字不该改变来源引用（只改名字不该让人解封）")
+	}
+}
+
+// 代理名只去首尾空白，大小写原样保留。
+//
+// frp 的代理名区分大小写：悄悄折叠会让一条规则从"命中"变成"永远不命中"，
+// 而配置在界面上一个字都没变 —— 这种差异最难查。
+func TestRateRuleNormalizeKeepsProxyNameCase(t *testing.T) {
+	r := RateRule{Name: "x", ProxyName: "  Web-SSH  ", PerSec: 10}
+	r.Normalize()
+	if r.ProxyName != "Web-SSH" {
+		t.Fatalf("代理名应当是去空白后的 Web-SSH，实际 %q", r.ProxyName)
+	}
+}

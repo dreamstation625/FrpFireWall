@@ -866,7 +866,10 @@ func (m *Manager) Lookup(target string) map[string]any {
 	geoNow := m.lookupGeo(addr)
 	now := time.Now()
 	tag, win, who := "", time.Duration(0), "全局策略"
-	if r := pickAppRule(appRules, addr, geoNow); r != nil {
+	// 代理名在这里永远是空：查询请求只给了一个 IP，没有"连的是哪个隧道"这层
+	// 上下文。后果是**带代理条件的规则在查询结果里显示为不命中** —— 这与真实
+	// 判定一致（登录阶段同样没有代理名），不是查询漏了规则。
+	if r := pickAppRule(appRules, addr, geoNow, ""); r != nil {
 		who = "规则「" + r.name + "」"
 		if r.threshold > 0 {
 			tag, win = r.tag(), r.window

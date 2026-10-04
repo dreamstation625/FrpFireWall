@@ -32,6 +32,9 @@ type appRule struct {
 	provinces map[string]bool
 	cities    map[string]bool
 	prefixes  []netip.Prefix
+	// proxy 是代理（隧道）名，空串表示不限代理。
+	// 与上面几个一样是 AND 关系：写了就必须对得上。
+	proxy string
 
 	// block 为 true 表示这条规则的动作是"命中即拦截"：条件对上就直接拒绝，
 	// 后面的 window/threshold/bucket 都不会被用到（Validate 也不允许它们共存）。
@@ -64,7 +67,14 @@ func (r *appRule) tag() string { return "r" + strconv.FormatUint(uint64(r.id), 1
 // 语义：不同维度之间是 AND，同一维度里的多个值是 OR。
 // 属地条件写了但查不到属地（库里没记录、或属地库没加载）时**算不命中** ——
 // 反过来做的话，"只限制某国"会在库没加载时变成"限制所有人"。
-func (r *appRule) match(addr netip.Addr, geo *geoip.Info) bool {
+//
+// proxy 是调用方报上来的代理名（Login 回调没有，传空串）。规则指定过代理名
+// 就必须相等才算命中，所以**登录阶段的连接永远匹配不上带代理条件的规则** ——
+// 那一刻隧道还没建立，没有这个信息，留空比拿别的维度凑合诚实。
+func (r *appRule) match(addr netip.Addr, geo *geoip.Info, proxy string) bool {
+	if r.proxy != "" && r.proxy != proxy {
+		return false
+	}
 	if len(r.countries) > 0 {
 		if geo == nil || !r.countries[geo.Country] {
 			return false
@@ -173,6 +183,7 @@ func compileRules(rows []model.RateRule) (app []appRule, kernel []kernelRule, sk
 			provinces: stringSet(row.ProvinceList()),
 			cities:    stringSet(row.CityList()),
 			prefixes:  prefixes,
+			proxy:     row.ProxyName,
 			block:     row.Block,
 			ref:       row.BanRef(),
 		}
@@ -242,18 +253,18 @@ func (m *Manager) rateLimitsLocked() []firewall.RateLimitRule {
 //
 // 返回的指针指向上一次 Refresh 装进来的那份切片。Refresh 是整体换切片
 // （不是原地改），所以这里即使在锁外继续用也是安全的：旧切片不会被改写。
-func (m *Manager) matchAppRule(addr netip.Addr, geo *geoip.Info) *appRule {
+func (m *Manager) matchAppRule(addr netip.Addr, geo *geoip.Info, proxy string) *appRule {
 	m.mu.RLock()
 	rules := m.appRules
 	m.mu.RUnlock()
-	return pickAppRule(rules, addr, geo)
+	return pickAppRule(rules, addr, geo, proxy)
 }
 
 // pickAppRule 从一串规则里取第一条命中的。抽成自由函数是为了让
 // IP 查询工具能复用同一套判定，而不是另写一份"看起来一样"的匹配逻辑。
-func pickAppRule(rules []appRule, addr netip.Addr, geo *geoip.Info) *appRule {
+func pickAppRule(rules []appRule, addr netip.Addr, geo *geoip.Info, proxy string) *appRule {
 	for i := range rules {
-		if rules[i].match(addr, geo) {
+		if rules[i].match(addr, geo, proxy) {
 			return &rules[i]
 		}
 	}

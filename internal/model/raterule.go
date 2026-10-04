@@ -75,8 +75,25 @@ type RateRule struct {
 	CIDRs string `gorm:"column:cidrs;size:4096;not null;default:''" json:"cidrs"`
 	// Ports 被访问的目的端口，区间写法，如 "20000-30000,443"。
 	//
-	// **这个字段一旦非空，规则就落在内核层**，且不能再有国家/省份条件。
+	// **这个字段一旦非空，规则就落在内核层**，且不能再有国家/省份条件，
+	// 也不能有代理条件 —— 内核只看得到源地址和目的端口，认不出 frp 的隧道名。
 	Ports string `gorm:"size:1024;not null;default:''" json:"ports"`
+	// ProxyName frp 的代理（隧道）名，精确匹配，单个值。
+	//
+	// 空 = 不限代理，这条规则对所有连接生效（与老行为一致）。
+	// 非空 = 只有回调里报上来的代理名与它完全相同时才命中，用来给不同隧道
+	// 定不同的力度（给某个代理单独限速 / 单独封禁）。
+	//
+	// 只支持单个值而不是列表：多个代理要不同规则，就建多条规则 —— 一条规则
+	// 绑一串名字的话，"这条命中了是因为哪个"又说不清了。
+	//
+	// 它只能落在应用层：代理名来自 frps 的 NewUserConn 回调，内核层压根没有
+	// 这个概念。**Login 回调不带代理名**（隧道还没建立），所以带这条件件的
+	// 规则在登录阶段一律不命中 —— 这不是缺陷，是那一刻还没有这个信息。
+	//
+	// 填了它就已经算一个匹配条件（Validate 认），所以可以出现"只有代理名、
+	// 没有地区和网段"的规则 —— 那正是"给这个隧道定一套自己的参数"的写法。
+	ProxyName string `gorm:"size:128;not null;default:''" json:"proxy_name"`
 
 	// ---- 动作 ----
 
@@ -130,6 +147,11 @@ func (r *RateRule) Layer() string {
 		return LayerKernel
 	}
 	return LayerApp
+}
+
+// HasProxyCondition 是否指定了代理（隧道）名。空 = 不限代理。
+func (r *RateRule) HasProxyCondition() bool {
+	return strings.TrimSpace(r.ProxyName) != ""
 }
 
 // HasGeoCondition 是否带属地条件。
@@ -242,9 +264,11 @@ func (r *RateRule) BanRef() string {
 	if !r.Enabled {
 		return ""
 	}
+	// ProxyName 必须在签名里：它决定这条规则对谁生效。改了代理名等于换了
+	// 一批适用对象，旧的封禁依据不再成立，应由它们跟着解封。
 	sig := strings.Join([]string{
 		strconv.FormatBool(r.Block),
-		r.Countries, r.Provinces, r.Cities, r.CIDRs, r.Ports,
+		r.Countries, r.Provinces, r.Cities, r.CIDRs, r.Ports, r.ProxyName,
 	}, "|")
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(sig))
@@ -273,6 +297,10 @@ func RateRuleBanRefs(rules []RateRule) map[string]bool {
 func (r *RateRule) Normalize() {
 	r.Name = strings.TrimSpace(r.Name)
 	r.Remark = strings.TrimSpace(r.Remark)
+	// 代理名只去首尾空白，不做大小写折叠：frp 的代理名是区分大小写的，
+	// 界面上看见的是 "Web-SSH" 就必须按 "Web-SSH" 去比，悄悄改大小写会让
+	// 一条规则从"命中"变成"永远不命中"，而配置看起来一字没变。
+	r.ProxyName = strings.TrimSpace(r.ProxyName)
 	r.Countries = strings.Join(dedupeStrings(r.CountryList()), ",")
 
 	// 省份归一化后回写：见 province.go。存下来的形态和候选表、
@@ -319,7 +347,11 @@ func (r *RateRule) Validate() error {
 	hasGeo := r.HasGeoCondition()
 	hasCIDR := strings.TrimSpace(r.CIDRs) != ""
 	hasPorts := strings.TrimSpace(r.Ports) != ""
-	if !hasGeo && !hasCIDR && !hasPorts {
+	hasProxy := r.HasProxyCondition()
+	// 代理名本身就是一种匹配条件：只有它、没有地区和网段，是"给这个隧道单独
+	// 定一套参数"的正常写法（不同代理不同力度）。不加进来的话这种规则会被
+	// 当成"没有任何条件、会命中所有流量"给拒掉，功能直接配不出来。
+	if !hasGeo && !hasCIDR && !hasPorts && !hasProxy {
 		return fmt.Errorf("规则「%s」没有任何匹配条件，会命中所有流量；全量兜底请用上方的全局规则", r.Name)
 	}
 
@@ -359,6 +391,14 @@ func (r *RateRule) Validate() error {
 		return fmt.Errorf(
 			"规则「%s」同时写了「地区」和「端口」，无法生效：地区只有 frps 插件能判（它拿不到被访问的端口），"+
 				"端口只有内核能判（见 DESIGN D16）。请拆成两条规则", r.Name)
+	}
+	// 端口 + 代理：同一类冲突的另一半。代理名来自 frps 的 NewUserConn 回调，
+	// 内核那条路上根本没有这个概念（它只看源地址与目的端口），凑在一起代理
+	// 条件永远判不上 —— 与地区那条一样必须拆开，否则是"配了不生效"。
+	if hasPorts && hasProxy {
+		return fmt.Errorf(
+			"规则「%s」同时写了「代理」和「端口」，无法生效：代理名只有 frps 插件能判，"+
+				"带端口条件的规则下发到内核、那里认不出代理（见 DESIGN D16）。请拆成两条规则", r.Name)
 	}
 
 	if len(ports) > 0 {

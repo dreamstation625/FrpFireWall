@@ -225,10 +225,73 @@ func TestAppRuleMatchSemantics(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := c.rule.match(addr, c.geo); got != c.want {
+			if got := c.rule.match(addr, c.geo, ""); got != c.want {
 				t.Fatalf("match = %v，期望 %v", got, c.want)
 			}
 		})
+	}
+}
+
+// 代理（隧道）名作为匹配维度：写了就必须对得上。
+//
+// 关键一条是 **Login 回调传空串时不命中** —— 隧道是 NewUserConn 那一刻才定的，
+// 登录阶段没有这个信息。这不是缺陷，是那一刻确实不知道；留空比拿别的维度凑合
+// 诚实。用户侧的表现是"给某代理配的规则在登录阶段不生效"，界面与文档都要讲明。
+func TestAppRuleMatchProxyName(t *testing.T) {
+	hk := &geoip.Info{Country: "HK"}
+	addr := netip.MustParseAddr("203.0.113.7")
+
+	cases := []struct {
+		name  string
+		rule  appRule
+		proxy string
+		want  bool
+	}{
+		{"不限代理：任何隧道都命中", appRule{}, "web-ssh", true},
+		{"不限代理：登录阶段（无代理名）也命中", appRule{}, "", true},
+		{"指定代理且一致", appRule{proxy: "web-ssh"}, "web-ssh", true},
+		{"指定代理但不一致", appRule{proxy: "web-ssh"}, "web-1", false},
+		{"指定代理、登录阶段没有代理名 → 不命中", appRule{proxy: "web-ssh"}, "", false},
+		{"代理与其它维度是且：代理中、地区不中", appRule{
+			proxy: "web-ssh", countries: map[string]bool{"US": true},
+		}, "web-ssh", false},
+		{"代理与其它维度是且：都中", appRule{
+			proxy: "web-ssh", countries: map[string]bool{"HK": true},
+		}, "web-ssh", true},
+		// frp 的代理名区分大小写，匹配也就必须区分。
+		{"大小写不同算两个代理", appRule{proxy: "Web-SSH"}, "web-ssh", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.rule.match(addr, hk, c.proxy); got != c.want {
+				t.Fatalf("match = %v，期望 %v", got, c.want)
+			}
+		})
+	}
+}
+
+// 不同代理配不同力度：靠"顺序 + 各自的条件"分流，第一条命中的取代全局。
+func TestPickAppRulePicksPerProxy(t *testing.T) {
+	addr := netip.MustParseAddr("203.0.113.7")
+	geo := &geoip.Info{Country: "HK"}
+	rules := []appRule{
+		{id: 1, name: "不限代理的兜底", countries: map[string]bool{"HK": true}},
+		{id: 2, name: "web-ssh 专用", proxy: "web-ssh"},
+	}
+	// 顺序在前的不限代理规则会先命中，所以"专用"规则要排在它前面 ——
+	// 这正是界面上顺序可调的意义：同一个来源在不同隧道上会落进不同的规则。
+	if got := pickAppRule(rules, addr, geo, "web-ssh"); got == nil || got.name != "不限代理的兜底" {
+		t.Fatalf("顺序在前的不限代理规则应当先命中，实际 %v", got)
+	}
+
+	reordered := []appRule{rules[1], rules[0]}
+	if got := pickAppRule(reordered, addr, geo, "web-ssh"); got == nil || got.name != "web-ssh 专用" {
+		t.Fatalf("专用规则排到前面之后应当先命中，实际 %v", got)
+	}
+	// 别的隧道不受这条专用规则影响，仍然走不限代理那条
+	if got := pickAppRule(reordered, addr, geo, "web-1"); got == nil || got.name != "不限代理的兜底" {
+		t.Fatalf("别的隧道不该命中 web-ssh 专用规则，实际 %v", got)
 	}
 }
 
@@ -240,12 +303,12 @@ func TestPickAppRuleUsesOrder(t *testing.T) {
 		{id: 2, name: "第二条", countries: map[string]bool{"HK": true}},
 		{id: 3, name: "第三条", countries: map[string]bool{"HK": true}},
 	}
-	got := pickAppRule(rules, netip.MustParseAddr("203.0.113.7"), hk)
+	got := pickAppRule(rules, netip.MustParseAddr("203.0.113.7"), hk, "")
 	if got == nil || got.name != "第二条" {
 		t.Fatalf("应当命中「第二条」，实际 %v", got)
 	}
 
-	if pickAppRule(rules, netip.MustParseAddr("203.0.113.7"), &geoip.Info{Country: "JP"}) != nil {
+	if pickAppRule(rules, netip.MustParseAddr("203.0.113.7"), &geoip.Info{Country: "JP"}, "") != nil {
 		t.Error("都不命中时应当返回 nil，交给全局策略")
 	}
 }
@@ -633,3 +696,66 @@ func TestRuleKeyStability(t *testing.T) {
 
 // 确保 portrange 被用到（受保护端口的合并结果），避免测试文件出现无用的 import。
 var _ = portrange.Ports
+
+// 不同代理不同力度：一条只对 web-ssh 生效的规则，端到端走一遍判定。
+//
+// 这里钉的是**整条链**：库 → compileRules → judge → 匹配。只测 appRule.match
+// 的话，中间任何一层忘了把代理名传下去（比如 judge 调用 matchAppRule 时少传
+// 一个参数），用例照样是绿的，而功能实际不存在。
+func TestJudgeRuleScopedToProxy(t *testing.T) {
+	m := newTestManager(t)
+	setPolicy(t, m, func(p *model.Policy) {
+		p.AutoBanEnabled = true
+		p.ObserveOnly = false
+		p.WindowSeconds = 3600
+		p.Threshold = 9999 // 全局阈值高到不可能触发，用来证明命中的是规则那份
+		p.BanDurations = "9999"
+	})
+
+	if err := m.store.ReplaceRateRules([]model.RateRule{{
+		Name: "web-ssh 专用", Enabled: true, ProxyName: "web-ssh",
+		WindowSeconds: 60, Threshold: 2, BanDurations: "120",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+
+	addr := netip.MustParseAddr("203.0.113.7")
+	conn := func(proxy string) Verdict {
+		return m.JudgeUserConn(addr, addr.String()+":1234", "u", proxy)
+	}
+
+	// 别的隧道不受这条规则影响：全局阈值是 9999，两次连接不会触发任何东西
+	if v := conn("web-1"); !v.Allow {
+		t.Fatalf("别的隧道不该被这条规则命中，实际 %+v", v)
+	}
+	if v := conn("web-1"); !v.Allow {
+		t.Fatalf("别的隧道第二次也不该被拦，实际 %+v", v)
+	}
+	if len(m.Bans()) != 0 {
+		t.Fatalf("不该产生封禁，实际 %+v", m.Bans())
+	}
+
+	// web-ssh 上按规则自己的阈值（2 次）触发
+	if v := conn("web-ssh"); !v.Allow {
+		t.Fatalf("第 1 次不该拦：%+v", v)
+	}
+	if v := conn("web-ssh"); v.Allow || v.Reason != "rate-exceeded" {
+		t.Fatalf("第 2 次应当按规则阈值触发封禁，实际 %+v", v)
+	}
+	bans := m.Bans()
+	if len(bans) != 1 {
+		t.Fatalf("应当产生 1 条封禁，实际 %d 条", len(bans))
+	}
+	if bans[0].RemainingSec <= 0 || bans[0].RemainingSec > 121 {
+		t.Errorf("封禁时长应来自规则自己的阶梯（120 秒），实际 %d 秒", bans[0].RemainingSec)
+	}
+
+	// 登录阶段没有代理名，带代理条件的规则不参与 —— 这是那一刻没有这个信息，
+	// 不是规则没配好。
+	if v := m.JudgeLogin(netip.MustParseAddr("198.51.100.9"), "u", "h"); !v.Allow {
+		t.Fatalf("登录阶段（无代理名）不该被代理规则拦，实际 %+v", v)
+	}
+}

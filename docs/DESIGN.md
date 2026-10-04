@@ -1062,6 +1062,40 @@ frps 的插件回调里只有 `NewUserConn` 带 `proxy_name`（连哪个隧道�
 列为空、封禁事件带代理名）、`store/store_test.go` 的
 `TestListEventsPageSearchesProxyName`（关键词能搜到代理名 —— 独立列的价值全在搜得到）。
 
+### D29. 代理（隧道）名是规则的一个匹配维度
+
+**需求**：细分规则能只对某个 frp 代理生效，不同代理用不同力度。
+
+`RateRule.ProxyName` 单个值、精确匹配：空 = 不限代理（老行为），非空 = 回调报上来的
+`proxy_name` 必须相等。只支持单值而不是列表 —— 一条规则绑一串名字的话，"这次命中是因为
+哪个"又说不清了；多个代理要不同参数就建多条规则，靠顺序分流。
+
+**它自己算一个匹配条件。** 只有代理名、没有地区和网段的规则是合法的，那正是"给这个隧道
+单独定一套参数"的写法。不把它算进条件集合，这种规则会被"没有任何匹配条件"那条检查拒掉，
+功能直接配不出来。
+
+**只能落应用层，且不能与端口共存。** 代理名来自 frps 的 `NewUserConn` 回调；带端口条件的
+规则下发到内核，内核只看源地址与目的端口，认不出隧道 —— 与"地区 + 端口"是同一类冲突的
+另一半，一起在 `Validate` 里挡掉（界面上同步拦，见 `ruleProblems`）。
+
+**登录阶段不命中。** `Login` 回调不带代理名（隧道还没建立），所以带这条件的规则在登录时
+一律不参与匹配。这是那一刻没有这个信息，不是"规则没配好"。IP 查询工具同理传空串 —— 查询
+请求只给了一个 IP，没有隧道这层上下文。
+
+**代理名进 `BanRef` 签名。** 改了代理名等于换了一批适用对象，旧的封禁依据不再成立，由它
+封的地址要跟着解封；改名字则不进签名（只改名字不该让人解封）。
+
+**候选值来自事件表，不是全集。** `GET /events/proxy-names` 按"最后一次出现"倒序取（字母序
+会把一堆 test-xxx 顶在最前面）。两个必须说清的后果：没被访问过的隧道不在列表里；事件保留期
+（默认 30 天）清掉之后旧隧道也会消失。所以界面上那一栏必须 `allow-create` 能手填，而且
+**不做校验** —— 名字不在候选里是正常的，写错的表现是永远不命中（与城市同一取舍）。
+
+**测试**：`model/raterule_test.go` 的 `TestRateRuleProxyNameContract`（只有代理名也合法、
+端口+代理被拒、代理名进签名）、`guard/raterule_test.go` 的 `TestAppRuleMatchProxyName`
+（Login 传空不命中、大小写敏感）、`TestJudgeRuleScopedToProxy`（端到端：别的隧道不受影响、
+本隧道按规则阈值触发、登录阶段不拦）、`api/policy_rules_http_test.go` 的往返与冲突用例。
+均经临时回退确认会 FAIL。
+
 ### D25. 封禁状态只以数据库为准，重启靠全量重建自愈
 
 三份状态的关系是**库（权威）→ 内存 `banState`（缓存）→ 内核规则（投影）**。
@@ -1773,6 +1807,7 @@ frpfirewall -data /var/lib/frpfirewall
 | POST | `/geoip/download` | 从上游下载指定库（`{name, mirror}`），校验后原子替换并热加载 |
 | GET | `/events` | 事件流，**页码分页**（`page` + `size`，见下方说明） |
 | GET | `/events/stats` | 聚合统计（趋势、Top IP、Top 地区） |
+| GET | `/events/proxy-names` | 最近出现过的代理名，给规则编辑器的「代理」一栏做候选（不是全集，可手填） |
 | GET | `/events/changes` | 规则变更审计 |
 | GET | `/frps/snippet` | 生成 frps 接入配置片段（TOML 与 JSON 两份） |
 | GET | `/frps/health` | 插件自检（供 frps 配置前确认连通） |

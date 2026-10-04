@@ -123,6 +123,36 @@
         </div>
       </el-form-item>
 
+      <el-form-item label="代理（隧道）">
+        <el-select
+          v-model="form.proxy_name"
+          filterable
+          allow-create
+          default-first-option
+          clearable
+          :disabled="portsFilled"
+          placeholder="留空 = 不限代理；可手填代理名后回车"
+          style="width: 100%"
+        >
+          <el-option
+            v-for="p in proxyOptions"
+            :key="p"
+            :label="p"
+            :value="p"
+          />
+        </el-select>
+        <div v-if="portsFilled" class="hint">
+          带端口条件的规则落在内核层，那里认不出 frp 的代理名 —— 需要按代理分流请去掉端口条件。
+        </div>
+        <div v-else class="hint">
+          只对<strong>这个代理</strong>生效。不同代理要不同力度，就建多条规则、把专用的排前面。
+          <br />
+          下拉里是<strong>最近出现过</strong>的代理名（来自事件日志，受保留期影响），
+          新建的隧道还没人来过时不在里面 —— 直接敲名字回车即可。
+          登录阶段还没有隧道，带这一条的规则那时候不生效。
+        </div>
+      </el-form-item>
+
       <el-form-item label="落点">
         <el-tag :type="LAYER_TAG_TYPE[layer]" size="small">{{ LAYER_LABEL[layer] }}</el-tag>
         <div class="hint">{{ LAYER_TIP[layer] }}</div>
@@ -233,6 +263,8 @@ const props = defineProps<{
   rule: RateRule | null
   countries: any[]
   provinces: any[]
+  /** 最近出现过的代理名，只是候选：手填的值同样有效 */
+  proxyNames?: string[]
 }>()
 
 const emit = defineEmits<{
@@ -264,6 +296,15 @@ const portsFilled = computed(() => String(form.ports ?? '').trim() !== '')
 
 const countryOptions = computed(() => props.countries || [])
 const provinceOptions = computed(() => props.provinces || [])
+
+// 当前填的值要并进选项里：它可能是手填的、也可能是保留期已经被清掉的旧隧道，
+// 两种情况都不在候选列表里。不加进来的话 Select 会把值显示成空（看着像没配），
+// 而规则其实存着代理名 —— 属于"界面骗人"那类问题。
+const proxyOptions = computed(() => {
+  const cur = String(form.proxy_name ?? '').trim()
+  const list = (props.proxyNames || []).filter((v) => v && v !== cur)
+  return cur ? [cur, ...list] : list
+})
 
 // 城市没有候选表（候选集开放，见后端 model.CanonicalCity 的说明），
 // 但把用户已经填过的城市回显成可选项，至少同一台机器上是同一套写法。
@@ -360,6 +401,9 @@ watch(portsFilled, (filled) => {
   form.window_seconds = 0
   form.threshold = 0
   steps.value = []
+  // 代理名同理：内核认不出隧道，留着会被后端直接拒绝。
+  // 清掉比让用户点保存时弹一句看不懂的报错好。
+  form.proxy_name = ''
 })
 
 function confirm() {

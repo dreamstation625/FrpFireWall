@@ -555,6 +555,41 @@ func (s *Store) ListEventsPage(category, keyword string, since *time.Time, page,
 	return &Page[model.Event]{Items: items, Total: total, Page: page, Size: size}, nil
 }
 
+// ListProxyNames 返回最近出现过的代理（隧道）名，最近出现的在前。
+//
+// 来源是事件表 —— 代理名只出现在 frps 的回调里，程序没有别的地方记它。
+// 这带来两个必须说清的后果：
+//
+//  1. **受事件保留期影响**：保留期是 30 天（可配）时，一个隧道三个月没被访问
+//     过，它的名字就会从这个列表里消失。所以界面上必须能手填，不能只给选。
+//  2. **没被访问过的隧道不在列表里**：新建了一个代理、还没有任何连接，这里
+//     查不到它 —— 同样靠手填兜住。
+func (s *Store) ListProxyNames(limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	var names []string
+	// 按"最后一次出现"排序而不是按字母：用户要找的是最近在动的那个隧道，
+	// 而字母序会把一堆 test-xxx 顶在前面。
+	err := s.db.Model(&model.Event{}).
+		Where("proxy_name <> ''").
+		Select("proxy_name").
+		Group("proxy_name").
+		Order("MAX(ts) DESC").
+		Limit(limit).
+		Pluck("proxy_name", &names).Error
+	if err != nil {
+		return nil, err
+	}
+	if names == nil {
+		names = []string{}
+	}
+	return names, nil
+}
+
 // EventStats 给概览页用的聚合统计。
 type EventStats struct {
 	TotalLoginFail int64            `json:"total_login_fail"`

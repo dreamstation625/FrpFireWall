@@ -111,6 +111,9 @@ export const api = {
   // 所以写入走 updatePolicy 的 rules 字段，没有单独的写接口。
   updatePolicy: (body: Record<string, unknown>) => http.put('/policy', body),
   listRateRules: () => http.get('/policy/rules'),
+  // 最近出现过的代理（隧道）名，只作候选 —— 手填的值同样有效。
+  proxyNames: (limit?: number) =>
+    http.get('/events/proxy-names', { params: limit ? { limit } : {} }),
 
   // ---- GeoIP ----
   geoLookup: (ip: string) => http.post('/geoip/lookup', { ip }),

@@ -50,13 +50,17 @@ func (s *Server) handleListRateRules(c *gin.Context) {
 // 由服务端决定（priority 取数组下标）。对应的往返测试是
 // TestRateRuleInputCoversAllWritableFields，加字段时它会提醒这里也要加。
 type rateRuleInput struct {
-	Name          string `json:"name"`
-	Enabled       *bool  `json:"enabled"`
-	Countries     string `json:"countries"`
-	Provinces     string `json:"provinces"`
-	Cities        string `json:"cities"`
-	Cidrs         string `json:"cidrs"`
-	Ports         string `json:"ports"`
+	Name      string `json:"name"`
+	Enabled   *bool  `json:"enabled"`
+	Countries string `json:"countries"`
+	Provinces string `json:"provinces"`
+	Cities    string `json:"cities"`
+	Cidrs     string `json:"cidrs"`
+	Ports     string `json:"ports"`
+	// ProxyName 代理（隧道）名，空 = 不限代理。
+	// 界面上既能从"最近出现过"的候选里选、也能手填，所以这里不做任何校验 ——
+	// 名字不存在于候选列表里是正常的（新建的隧道还没人来过）。
+	ProxyName     string `json:"proxy_name"`
 	Block         bool   `json:"block"`
 	PerSec        int    `json:"per_sec"`
 	Burst         int    `json:"burst"`
@@ -80,6 +84,7 @@ func (in rateRuleInput) toModel() model.RateRule {
 		Cities:        in.Cities,
 		CIDRs:         in.Cidrs,
 		Ports:         in.Ports,
+		ProxyName:     in.ProxyName,
 		Block:         in.Block,
 		PerSec:        in.PerSec,
 		Burst:         in.Burst,

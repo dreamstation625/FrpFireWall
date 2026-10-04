@@ -15,6 +15,13 @@ export interface RateRule {
   cities: string
   cidrs: string
   ports: string
+  /**
+   * frp 的代理（隧道）名，精确匹配，单个值。空 = 不限代理。
+   *
+   * 只能落在应用层：代理名来自 frps 的 NewUserConn 回调，登录阶段（Login）
+   * 还没有隧道，所以带这个条件的规则在登录时不命中。
+   */
+  proxy_name?: string
   /** 命中即拒绝这次连接，不再计数也不限速 */
   block: boolean
   per_sec: number
@@ -38,6 +45,7 @@ export function emptyRule(): RateRule {
     cities: '',
     cidrs: '',
     ports: '',
+    proxy_name: '',
     block: false,
     per_sec: 0,
     burst: 0,
@@ -55,6 +63,8 @@ const splitList = (s?: string) =>
     .filter(Boolean)
 
 export const hasPorts = (r: RateRule) => splitList(r.ports).length > 0
+/** 指定了代理（隧道）名。空 = 不限代理 */
+export const hasProxy = (r: RateRule) => String(r.proxy_name ?? '').trim() !== ''
 export const hasGeo = (r: RateRule) =>
   splitList(r.countries).length > 0 ||
   splitList(r.provinces).length > 0 ||
@@ -102,6 +112,7 @@ export function conditionParts(r: RateRule, countryLabel?: (code: string) => str
   if (cidrs.length) out.push(`来源：${cidrs.join('、')}`)
   const ports = splitList(r.ports)
   if (ports.length) out.push(`端口：${ports.join('、')}`)
+  if (hasProxy(r)) out.push(`代理：${String(r.proxy_name).trim()}`)
   return out
 }
 
@@ -132,7 +143,8 @@ export function actionParts(r: RateRule): string[] {
 export function ruleProblems(r: RateRule): string[] {
   const out: string[] = []
   if (!String(r.name ?? '').trim()) out.push('规则名不能为空')
-  const hasCond = hasPorts(r) || hasGeo(r) || splitList(r.cidrs).length > 0
+  // 代理名也算匹配条件：只有它、没有地区和网段，是"给这个隧道单独定一套参数"。
+  const hasCond = hasPorts(r) || hasGeo(r) || hasProxy(r) || splitList(r.cidrs).length > 0
   if (!hasCond) {
     out.push('还没有任何匹配条件，这条规则会命中所有流量；全量兜底请用下方的全局规则')
   }
@@ -140,6 +152,13 @@ export function ruleProblems(r: RateRule): string[] {
     out.push(
       '「地区」和「端口」不能出现在同一条规则里：地区只有 frps 插件能判（它拿不到被访问的端口），' +
         '端口只有系统防火墙能判。请清掉其中一边，或者拆成两条规则'
+    )
+  }
+  // 同一类冲突的另一半：内核认不出 frp 的隧道名。
+  if (hasPorts(r) && hasProxy(r)) {
+    out.push(
+      '「代理」和「端口」不能出现在同一条规则里：代理名只有 frps 插件能判，' +
+        '带端口条件的规则下发到系统防火墙、那里认不出代理。请清掉其中一边，或者拆成两条规则'
     )
   }
   if (hasPorts(r) && r.block) {

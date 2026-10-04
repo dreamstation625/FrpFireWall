@@ -273,6 +273,7 @@
       :rule="editingRule"
       :countries="countries"
       :provinces="provinces"
+      :proxy-names="proxyNames"
       @saved="onRuleSaved"
     />
   </div>
@@ -325,6 +326,8 @@ const form = reactive({
 const selectedCountries = ref<string[]>([])
 const countries = ref<any[]>([])
 const provinces = ref<any[]>([])
+// 最近出现过的代理名，给规则编辑器的「代理」一栏做候选。
+const proxyNames = ref<string[]>([])
 const countryAvailable = ref(false)
 const capability = ref<any>({})
 
@@ -480,10 +483,16 @@ function markClean() {
 // （端口合并、省份收敛、裸 IP 补掩码），不重拉的话基线立刻对不上，
 // 刚点完保存就显示"有未保存的修改"。
 async function loadRuleMeta() {
-  const [r, info]: any[] = await Promise.all([api.listRateRules(), api.systemInfo()])
+  const [r, info, pn]: any[] = await Promise.all([
+    api.listRateRules(),
+    api.systemInfo(),
+    // 候选拿不到不影响编辑：那一栏可以手填，只是少了下拉可选。
+    api.proxyNames().catch(() => null),
+  ])
   rules.value = (r?.rules || []) as RateRule[]
   guardProblems.value = info?.guard?.rule_problems || []
   capability.value = info?.capability || {}
+  proxyNames.value = (pn?.items || []) as string[]
 }
 
 async function load() {
