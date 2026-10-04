@@ -59,8 +59,8 @@
 
 | 后端 | 独占命名空间 |
 |---|---|
-| iptables | 三条自定义链：`FRPFIREWALL_GUARD`（主链）+ `FRPFIREWALL_BLACK`（全端口黑名单）+ `FRPFIREWALL_BLACK_FRP`（仅 frp 端口黑名单） |
-| nftables | 集合 `frpfirewall_black` / `frpfirewall_black6` / `frpfirewall_black_frp` / `frpfirewall_black6_frp` / `frpfirewall_rate`；规则靠 `comment "frpfirewall:*"` 标记归属 |
+| iptables | 三条自定义链：`FRPFIREWALL_GUARD`（主链）+ `FRPFIREWALL_BLACK`（全端口黑名单）+ `FRPFIREWALL_BLACK_FRP`（端口限定黑名单，`frp` 与自定义端口共用） |
+| nftables | 集合 `frpfirewall_black` / `frpfirewall_black6` / `frpfirewall_rate`，以及**每个端口集合一个**的 `frpfirewall_black_p_<hash>` / `frpfirewall_black6_p_<hash>`；规则靠 `comment "frpfirewall:*"` 标记归属 |
 
 只在 `INPUT` 链首插一条 `-j FRPFIREWALL_GUARD` 跳转。nftables 侧**不建自己的 base chain**，
 而是把规则 `insert` 到系统已有的 input 链最前面（原因见 D3）。
@@ -78,13 +78,14 @@ iptables 侧的受管结构：
 ```
 INPUT ─(第1条)─▶ FRPFIREWALL_GUARD
                    ├─ -j FRPFIREWALL_BLACK         ← 全端口黑名单，跳转在前
-                   ├─ -j FRPFIREWALL_BLACK_FRP     ← 仅 frp 端口黑名单（见 D14）
+                   ├─ -j FRPFIREWALL_BLACK_FRP     ← 端口限定黑名单（见 D14）
                    ├─ [限速规则]                   ← 可选
                    └─ -j RETURN
 FRPFIREWALL_BLACK
                    └─ -s <黑名单> -j DROP          ← 逐条，无 dport 限定
 FRPFIREWALL_BLACK_FRP
-                   └─ -s <黑名单> -p tcp -m multiport --dports <frp 端口> -j DROP   ← 逐条
+                   └─ -s <黑名单> -p tcp -m multiport --dports <端口集合> -j DROP   ← 逐条
+                                                      （一个端口集合一组地址，共用这一条链）
                       （UDP 同样一条，避免留下绕过路径）
 ```
 
@@ -416,10 +417,12 @@ IPv6 那条规则把 IPv4 的一起陪葬了。
 ### D14. 黑名单的封禁范围按条目选，默认全端口
 
 **需求**：黑名单原来只有一种行为 —— 该地址到本机的**全部端口**一律 DROP。实际使用中
-分成两类需求：一类是确认的纯攻击源，想彻底断开；另一类只想挡掉它对 frp 的访问，
-本机其它服务（尤其是同一来源还需要访问的）不该被牵累。
+分成三类需求：一类是确认的纯攻击源，想彻底断开；一类只想挡掉它对 frp 的访问，
+本机其它服务（尤其是同一来源还需要访问的）不该被牵累；还有一类更窄 —— 只想挡住
+它打某几个具体端口（例如某个被反复爆破的 Web 端口），其它端口照常。
 
-**决策：范围做成每条条目一个字段（`all` | `frp`），默认 `all`。**
+**决策：范围做成每条条目一个字段（`all` | `frp` | `custom`），默认 `all`；
+`custom` 额外带一个 `Ports` 字段。**
 
 - **为什么是每条而不是全局开关。** 一个全局开关表达不了"A 只扫 frp、B 是纯攻击源"
   这种必然共存的局面。更要紧的是，切全局开关会**一次性改写所有现有条目的含义** ——
@@ -429,33 +432,63 @@ IPv6 那条规则把 IPv4 的一起陪葬了。
   放宽到只封 frp 端口等于给暴力破解者留一条继续扫其它端口的路；需要放宽的场景
   走人工改条目范围。
 
-**内核落点**：两种范围落在不同的链 / 集合里，互不干扰。
+**内核落点**：`all` 一条链 / 一个集合，所有端口限定（`frp` 与 `custom`）落到另一处。
 
-| 后端 | 全端口 | 仅 frp 端口 |
+| 后端 | 全端口 | 端口限定（`frp` / `custom`） |
 |---|---|---|
-| iptables | `FRPFIREWALL_BLACK` | `FRPFIREWALL_BLACK_FRP` |
-| nftables | 集合 `frpfirewall_black` / `black6` | 集合 `frpfirewall_black_frp` / `black6_frp` |
+| iptables | 链 `FRPFIREWALL_BLACK` | 链 `FRPFIREWALL_BLACK_FRP`，`-m multiport --dports` |
+| nftables | 集合 `frpfirewall_black` / `black6` | 每个端口集合一个集合，`frpfirewall_black_p_<hash>` / `black6_p_<hash>` |
 
-链上的顺序必须是**全端口在前、仅 frp 端口在后**：`frp` 范围是全端口的子集，全端口
+链上的顺序必须是**全端口在前、端口限定在后**：端口限定是全端口的子集，全端口
 命中就 `DROP` 掉了，后面的规则永远不会被读到，多出来的只是一次比较。反过来放则
-全端口规则要等 frp 规则先走一遍。
+全端口规则要等端口限定规则先走一遍。
 
 这里有个 nft 特有的坑：`insert rule` **一律插到链首**，所以脚本里的书写先后与链上的
-实际顺序**相反**。想让链上是「全端口 → 仅 frp 端口」，脚本文本就得**倒着输出**。
+实际顺序**相反**。想让链上是「全端口 → 端口限定」，脚本文本就得**倒着输出**。
 `internal/firewall/nftables_test.go` 的 `insertOrder` 辅助函数专门还原这个语义，
 否则测试会以相反的期望通过。
 
+**iptables 侧所有端口限定共用一条链。** 规则形状完全相同（`-p tcp -m multiport
+--dports <集合> -j DROP`），DROP 之间没有先后之分，一条链就够了。链名沿用
+`FRPFIREWALL_BLACK_FRP` 的**值**（常量名改成了 `managedPortBlackChain`）：
+改名会让升级后的第一次同步找不到老链、把它当野链留在内核里。
+
+**nftables 侧每个端口集合一个集合。** 集合名不能直接拼端口文本（逗号是 nft 语法里的
+非法字符，归一化后还会碰撞），所以取端口集合的**稳定签名**再走 `fnv` 短哈希：
+`portSetName(bits, key) = 前缀 + hash(key)`，`key` 是归一化后的端口文本（如 `"7000,9100"`）。
+旧版本的固定名 `frpfirewall_black(_6)_frp` 只保留在"识别与回收"路径里
+（`isPortSetName` / `prunePortSets`），否则升级后那对集合会永远残留在表里。
+
+**分组 Key 必须是端口集合的签名。** `desired()` 按 `key := ports.String()` 归并：
+同一个端口集合天然合成一组，**不同集合必须分开**。合成一组会让 A 组的地址在 B 组的
+端口上也被封，而两组规则长得一模一样，光看规则本身发现不了。
+
 **范围对插件层是空操作。** 插件回调（`Login` / `NewUserConn`）本来就只作用于 frp 连接，
-`all` 与 `frp` 对它完全等价。所以插件的判定代码不需要知道范围存在 —— 这也是为什么
-范围只影响内核侧而不影响"能不能登录"。
+而且**拿不到端口**，所以 `all` / `frp` / `custom` 对它完全等价。插件只判定"这个地址
+在不在名单里"，`custom` 只用来精确控制内核封哪些端口。**兜底方向取更严的一侧**：
+`custom` 的条目在插件层照常整体拒绝，不会出现"名单显示封着、frp 却能连"。
 
 **兜底方向必须偏严。** `toBlockTargets` / `restoreBans` / `BanView` / 前端渲染，
-凡是读到空值或非法值的地方一律回落 `all`。回落 `frp` 等于把一条"封全端口"的条目
-悄悄放松成"只封 frp 端口"，是安全语义上的降级；宁可显示得严一点。
+凡是读到空值或非法值的地方一律回落 `all`：
+
+| 情况 | 处理 |
+|---|---|
+| `scope` 为空 / 非法 | `all` |
+| `scope=custom` 但端口为空或解析不出 | **退化成 `all` 下发**，不丢弃条目 |
+| `scope=frp` 但受保护端口为空（`bindPort=0` 且无代理端口） | 同上 |
+
+中间那行是刻意的：把一条本该封住的条目静默放掉，是这套系统里最难发现的错误 ——
+名单上它在、界面上它在，只有去数内核规则才会发现少了一条。接口层会先拦住空端口，
+能走到驱动层基本只可能是库里被手工改坏了。
+
+**非自定义范围一律清空 `Ports`。** 库里残留一份不参与生效的端口，属于"配置里写着、
+实际不生效"那类最难排查的问题：界面上完全看不出来，只有去数内核规则才会发现。
+接口层的 `normalizeScopePorts` 与前端保存逻辑都保证这一点。
 
 **同址归并。** 同一个地址可能同时来自手动黑名单与自动封禁，两处范围还可能不同。
-`desired()` 用 map 归并而不是拼接：全端口已经覆盖 frp 端口，同址再写一条 frp 规则
-纯属冗余，还会变成"为什么这里有两行"这种需要解释的问题。**冲突时严格范围胜出。**
+`desired()` 用 map 归并而不是拼接：全端口已经覆盖所有端口，同址再进任何端口限定组
+都是冗余，还会变成"为什么这里有两行"这种需要解释的问题。**冲突时严格范围胜出**
+（`fullPort` 优先）。
 
 **frp 端口集合 = `bindPort` + `proxyPorts`**，且 **TCP 与 UDP 都要封**：`bindPort` 是 TCP，
 但代理端口里可能有 UDP 服务，只封 TCP 会留下一条 UDP 绕过路径。iptables 的 `multiport`
@@ -465,11 +498,21 @@ IPv6 那条规则把 IPv4 的一起陪葬了。
 **更新语义：不带 scope 不能改范围。** 更新接口的 `scope` 用指针类型区分"没传"和
 "传了空串" —— 只改备注的请求不带该字段，若按普通字符串绑定就会得到 `""`、归一化成
 `all`，等于顺手把一条 `frp` 条目放宽成封全端口。改个备注不该有这种副作用。
+`ports` 同样用指针：换范围时要能把它改掉或清空。
 
-**导入格式向后兼容。** 第二列只有恰好是 `all` / `frp` 时才被当作范围，否则整体按备注
-处理，所以老版本导出的两列文件（`地址,备注`）能直接导入。代价是备注恰好写成这两个词
-时会被误认，属于刻意接受的取舍 —— 导出文件常被留档或拿去别的机器用，
-格式不兼容就是实打实的数据损失。
+**落库有个容易漏的地方**：`UpdateACL` 的更新列表与 `UpsertACL` 的冲突更新列都必须显式
+带上 `ports`。漏了的表现是接口老老实实把新端口回给前端、库里一个字节都没变，
+界面刷新一下又变回旧值 —— 中间完全看不出是哪一步丢的。
+
+**导入导出格式向后兼容。** 第二列只有恰好是 `all` / `frp` / `custom:端口` 时才被当作
+范围，否则整体按备注处理，所以老版本导出的两列文件（`地址,备注`）能直接导入。
+代价是备注恰好写成 `all` / `frp` 时会被误认，属于刻意接受的取舍 —— 导出文件常被留档
+或拿去别的机器用，格式不兼容就是实打实的数据损失。
+
+自定义端口的端口列表写在**范围列里**（`custom:8080;9000-9100`），不新开一列：逗号
+既是列分隔符、又是端口列表的分隔符，新开一列之后备注列一定会被端口串切开，
+而这种错在读文件时看不出来，只有导入之后发现备注少了一半才知道。因此
+**文件里用分号、库里用逗号**（`portrange.Set.StringSep(";")`），只在导出/导入两端转换。
 
 **已知缺口：手动黑名单不过滤 CDN 可信回源段。** `desired()` 只剔除系统保护地址与
 白名单地址，不看 `TrustedProxies`。自动封禁会因为它是可信回源而放过，但**手工加进去的
@@ -477,9 +520,11 @@ CDN 节点 IP 会照封不误** —— 封掉一个边缘节点就是掐死一�
 并不缓解这个问题（回源打的正是 frp 端口）。这一条当前靠界面提示与人工判断兜住，
 未做程序化拦截。
 
-**测试**：`iptables_test.go`（规则生成、顺序、端口归一化、预览与下发一致）、
-`nftables_test.go`（双栈、集合 flush、链上顺序还原）、`handlers_acl_test.go`
-（范围归一化、导入格式与导出回读闭环）。
+**测试**：`iptables_test.go`（规则生成、顺序、端口归一化、多分组各封各的端口、
+预览与下发一致）、`nftables_test.go`（双栈、按分组创建/回收集合、链上顺序还原）、
+`desired_test.go`（同集合合成一组、不同集合必须分开、坏行退化成全端口）、
+`handlers_acl_test.go` 与 `handlers_acl_http_test.go`（范围归一化、自定义端口落库、
+导入格式与导出回读闭环）。
 
 
 ### D15. 端口用区间表达，不展开成单个端口
@@ -522,8 +567,8 @@ CDN 节点 IP 会照封不误** —— 封掉一个边缘节点就是掐死一�
 **真机验证**（Debian 12 / nftables 1.0.6 / iptables 1.8.9）：
 
 ```
-tcp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp drop comment "frpfirewall:black-frp"
-udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp drop comment "frpfirewall:black-frp"
+tcp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_p_xxxxxxxx drop comment "frpfirewall:black-port:xxxxxxxx"
+udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_p_xxxxxxxx drop comment "frpfirewall:black-port:xxxxxxxx"
 ```
 
 两条规则覆盖 10001 个端口，且 `bind_port`（7020）与区间正确合并成一个表达式。
@@ -608,6 +653,50 @@ udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp drop comment "fr
 （停用状态落库、顺序、策略+规则同事务）。
 
 
+### D19. 受保护端口可以改，但改的只是"代理端口"那一半，且立即生效
+
+**需求**：受保护端口（`bindPort` ∪ 代理端口）既决定「仅 frp 端口」的封禁范围，
+也是全局限速兜底规则的落点。它在 frp 接入页只能看、不能改，与实际配置
+（`allowPorts` 常用一整个 `20000-30000`）一改就要去配置页改、还要重启，
+中间这段错位期里规则封的是已经不用的端口。
+
+**决策：受保护端口不新增字段，仍然 = `bindPort` ∪ 代理端口；frp 接入页直接编辑
+「代理端口」，保存后立即重算内核规则。**
+
+- **为什么不新开一个"受保护端口"字段。** 那会让同一件事有两个真相：改了这个
+  字段，"仅 frp 端口"封哪些端口、全局限速兜底打哪些端口就都跟它走了，而
+  `proxy_ports` 又还在配置页里能改。两个入口改同一件事，迟早会出现"界面上显示
+  A、实际生效 B"。代价是 **`bindPort` 恒定包含在内、去不掉** —— 它本来就是 frps
+  的接入端口，把它移出受保护范围只会让「仅 frp 端口」漏掉最该封的那一个。
+- **`bindPort` 只读。** 它属于 frps 自己的配置，在面板上改它不会让 frps 换端口，
+  只会让防火墙规则和实际监听的端口错位。接口层的写请求里根本没有这个字段。
+- **为什么这一项可以热更，而配置页仍然说"需要重启"。** 代理端口只影响内核规则里
+  那个端口集合（全局限速兜底 + 「仅 frp 端口」的分组），重算一次规则就够了；
+  `bindPort`、监听地址、TLS、日志这些要换进程状态，起步顺序也在启动时定死了。
+  所以权限边界按"这项需不需要重启"划，而不是按"在哪一页上"划。
+
+**实现上的三处约定**：
+
+1. **落库与生效分成两步，顺序不能反**：先 `SetSetting` 落库，成功了再
+   `guard.SetFrpsProxyPorts()` 改内存并触发一次重新对齐。反过来的话，落库失败时
+   内核规则已经被改过了，重启之后配置又回到旧值 —— 表现成"重启后封禁范围自己变了"。
+2. **`Manager` 里存一份代理端口的内存副本**（`frpsProxyPorts`），`protectPortsLocked()`
+   读它而不是读 `cfg.Frps.ProxyPorts`。`cfg` 是启动时那份快照，被驱动、guard 多个
+   组件共享，运行期就地改字段会让"这份配置是什么时候的"变得没法回答。
+   面板读的也是这份运行期值（`FrpsPorts()`），显示真正生效的东西。
+3. **配置页的 `restart_required` 要和运行期生效值比**，不是和 `cfg` 比。
+   不比的话，在 frp 接入页改完端口，配置页会一直标着"需要重启" —— 而它已经生效了，
+   用户会去重启一个完全不必要的服务，重启期间所有隧道都会断。
+
+**空值必须当场拒绝。** `FromSettings` 对空的 `proxy_ports` 是"当作没配过、回落成
+默认的 `80,443`"，所以接口放行一个空值的结果是：保存完看着生效了，重启之后又变回
+默认。这种"改了等于没改"比当场报错难查得多，所以在入口就拦住并说明原因。
+
+**测试**：`handlers_frps_test.go`（读-写-再读的闭环、落库值、报错后旧值不变、
+只改过端口时 `restart_required` 必须为 false）、`desired_test.go`
+（热更后受保护端口、分组 Key、全局限速兜底端口三处同时跟着变）。
+
+
 ## 3. 总体架构
 
 ```
@@ -686,7 +775,7 @@ FrpFireWall/
 │   ├── firewall/
 │   │   ├── driver.go      # Driver 接口 + 受管对象名常量
 │   │   ├── detect.go      # 系统与后端探测
-│   │   ├── iptables.go    # 三条自定义链实现（全端口 / 仅 frp 端口黑名单分链）
+│   │   ├── iptables.go    # 三条自定义链实现（全端口 / 端口限定分链）
 │   │   ├── iptables_test.go
 │   │   ├── nftables.go    # 集合 + 插系统 input 链的实现
 │   │   └── nftables_test.go   # 直接断言生成的 nft 脚本（桩命令测不出语法问题）
@@ -752,10 +841,10 @@ type Driver interface {
 # 基础结构（幂等，全部带 -w 拿 xtables 锁，避免与其它工具并发写）
 iptables -w -N FRPFIREWALL_GUARD 2>/dev/null || true
 iptables -w -N FRPFIREWALL_BLACK 2>/dev/null || true       # 全端口黑名单
-iptables -w -N FRPFIREWALL_BLACK_FRP 2>/dev/null || true   # 仅 frp 端口黑名单
+iptables -w -N FRPFIREWALL_BLACK_FRP 2>/dev/null || true   # 端口限定黑名单（frp / 自定义共用）
 iptables -w -C INPUT -j FRPFIREWALL_GUARD 2>/dev/null || iptables -w -I INPUT 1 -j FRPFIREWALL_GUARD
 
-# 主链只负责分流，不承载具体 IP；全端口的跳转排在仅 frp 端口之前
+# 主链只负责分流，不承载具体 IP；全端口的跳转排在端口限定之前
 iptables -w -A FRPFIREWALL_GUARD -j FRPFIREWALL_BLACK
 iptables -w -A FRPFIREWALL_GUARD -j FRPFIREWALL_BLACK_FRP
 iptables -w -A FRPFIREWALL_GUARD -j RETURN          # 限速规则存在时插在两者之间
@@ -764,16 +853,20 @@ iptables -w -A FRPFIREWALL_GUARD -j RETURN          # 限速规则存在时插�
 iptables -w -A FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 iptables -w -D FRPFIREWALL_BLACK -s 1.2.3.4 -j DROP
 
-# 只封 frp 端口：TCP 与 UDP 各一条（proxyPorts 里可能有 UDP 服务，
-# 只封 TCP 会留下一条绕过路径）；区间写成 lo:hi，超过 15 个区间时按 multiport 上限分片
+# 端口限定：TCP 与 UDP 各一条（proxyPorts 里可能有 UDP 服务，
+# 只封 TCP 会留下一条绕过路径）；区间写成 lo:hi，超过 15 个区间时按 multiport 上限分片。
+# frp 范围与自定义范围**共用这一条链**：规则形状完全相同，DROP 之间没有先后之分
 iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p tcp -m multiport --dports 7000,80,443,20000:30000 -j DROP
 iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p udp -m multiport --dports 7000,80,443,20000:30000 -j DROP
+# 另一个自定义端口集合的另一组地址，同样是往同一条链里追加
+iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.5 -p tcp -m multiport --dports 8080 -j DROP
 ```
 
 要点：
 - **不引入 ipset。** 封禁条数由封禁记录数约束，属于可接受范围；真要上千条时优先引导用户切到 nftables 后端。
-- **按范围分链，而不是在主链里给每条规则加 dport 条件**（见 D14）：两条链各自独立增删，
-  改一条条目的范围不会牵动另一条链的内容，也就不需要计算"这条该插在哪些规则前面"。
+- **按范围分链，而不是在主链里给每条规则加 dport 条件**（见 D14）：全端口与端口限定
+  各自独立增删，改一条条目的范围不会牵动另一条链的内容，也就不需要计算"这条该插在
+  哪些规则前面"。端口限定内部不再细分 —— 分组之间只是端口集合不同，链上谁先谁后都等价。
 - 白名单不落内核（见 D3），所以链里没有白名单相关规则。
 - IPv6 走 `ip6tables`，链名与结构完全相同。
 - 若系统用的是 `iptables-nft`（nft 后端），照样可用，但注意与 nftables 驱动**不要同时启用**，UI 上互斥。
@@ -787,15 +880,21 @@ iptables -w -A FRPFIREWALL_BLACK_FRP -s 1.2.3.4 -p udp -m multiport --dports 700
 # 形态一：系统有 inet/filter/input —— 一条链同时承载双栈
 nft -f - <<'EOF'
 add set inet filter frpfirewall_black     { type ipv4_addr; flags interval; }
-add set inet filter frpfirewall_black_frp { type ipv4_addr; flags interval; }
-add set inet filter frpfirewall_black6     { type ipv6_addr; flags interval; }
-add set inet filter frpfirewall_black6_frp { type ipv6_addr; flags interval; }
+add set inet filter frpfirewall_black6    { type ipv6_addr; flags interval; }
 add set inet filter frpfirewall_rate      { type ipv4_addr; flags interval; }
 
+# 端口限定的集合**每个端口集合一个**，名字由端口集合的签名派生（见 D14）：
+# 名字里不能直接放逗号，也不能只截断——不同集合撞名会让两组地址共用一套端口。
+# 下面假定 "7000,9100" 与 "8080" 两个分组，实际哈希值由 fnv 算出。
+add set inet filter frpfirewall_black_p_<hash1>  { type ipv4_addr; flags interval; }
+add set inet filter frpfirewall_black6_p_<hash1> { type ipv6_addr; flags interval; }
+add set inet filter frpfirewall_black_p_<hash2>  { type ipv4_addr; flags interval; }
+
 # 注意：这几行的书写顺序与链上顺序是**相反**的 —— insert 一律插到链首，
-# 所以想让链上是「全端口 → 仅 frp 端口」，脚本就得倒着输出（见 D14）。
+# 所以想让链上是「全端口 → 端口限定」，脚本就得倒着输出（见 D14）。
 # 下面按"脚本实际生成的顺序"列出，v6 与 udp 的对应行省略。
-insert rule inet filter input tcp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_frp  drop comment "frpfirewall:black-frp"
+insert rule inet filter input tcp dport { 7000,9100 } ip saddr @frpfirewall_black_p_<hash1> drop comment "frpfirewall:black-port:<hash1>"
+insert rule inet filter input tcp dport { 8080 }      ip saddr @frpfirewall_black_p_<hash2> drop comment "frpfirewall:black-port:<hash2>"
 insert rule inet filter input ip  saddr @frpfirewall_black      drop comment "frpfirewall:black"
 insert rule inet filter input ip6 saddr @frpfirewall_black6     drop comment "frpfirewall:black6"
 EOF
@@ -804,22 +903,25 @@ EOF
 执行完上面这个事务后，链上的实际顺序（链首 → 链尾）是：
 
 ```
-全端口(v4) → 全端口(v6) → 仅 frp 端口 tcp(v4) → tcp(v6) → udp(v4) → udp(v6) → 限速 → 原有规则…
+全端口(v4) → 全端口(v6) → 端口限定1 tcp(v4) → tcp(v6) → udp(v4) → udp(v6) → … → 限速 → 原有规则…
 ```
+
+集合名是**算出来的**，所以"读回实际状态"时必须先枚举前缀匹配的集合、再按名字里的签名
+反查端口，不能拿期望状态去拼名字比对 —— 反查这一步也正是回收旧集合的依据
+（升级前那对固定名 `frpfirewall_black(_6)_frp` 会作为无主集合被清掉）。
 
 ```bash
 # 形态二：系统是 table ip filter + table ip6 filter（ufw / docker /
 # iptables-nft 常见）—— 两个家族互不相通，必须各插各的链
 nft -f - <<'EOF'
 add set ip  filter frpfirewall_black     { type ipv4_addr; flags interval; }
-add set ip  filter frpfirewall_black_frp { type ipv4_addr; flags interval; }
-add set ip6 filter frpfirewall_black6     { type ipv6_addr; flags interval; }
-add set ip6 filter frpfirewall_black6_frp { type ipv6_addr; flags interval; }
+add set ip6 filter frpfirewall_black6    { type ipv6_addr; flags interval; }
 add set ip  filter frpfirewall_rate      { type ipv4_addr; flags interval; }
 
 insert rule ip  filter INPUT ip  saddr @frpfirewall_black      drop comment "frpfirewall:black"
 insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6     drop comment "frpfirewall:black6"
-# 仅 frp 端口的规则同样按各自家族插进各自的链，dport 表达式相同
+# 端口限定的规则同样按各自家族插进各自的链，dport 表达式相同，
+# 只是集合名换成 frpfirewall_black_p_<hash> / frpfirewall_black6_p_<hash>
 EOF
 ```
 
@@ -886,6 +988,16 @@ EOF
 **解封**：到期由定时器（1s tick 或最小堆）驱动，从 BanSet 移除 → reconcile 同步到防火墙。
 
 **手动封禁**与自动封禁统一进同一 BanSet，用 `source` 字段区分：`auto` / `manual` / `geoip`。手动封禁默认不自动过期（可设到期时间）。
+
+**`desired()` 是"名单 → 内核规则"的唯一翻译层。** 它先把所有条目（ACL 黑名单 + 活跃封禁）
+归一成「地址 + 范围 + 端口」，再分桶：`scope=all` 进全端口链 / 集合，其余按
+**端口集合的签名**分组，每组一份端口集合 + 一组地址（见 D14）。白名单与系统保护地址
+是在这一步"做减法"剔除的，而不是往内核写一条豁免规则 —— 所以白名单的语义精确地等于
+"不会被本程序封禁"，不会变成"放行全端口"（见 D3）。
+
+**受保护端口在锁内算一次。** 它既可能被 `frp` 范围的条目用到，又要参与全局限速的兜底
+规则；两次分别算的话中间可能被热更新改掉（见 D19），同一份期望状态里就会出现两组
+互相矛盾的端口。
 
 **重放与自愈**：启动时读 SQLite 中 `status=active` 的封禁记录 → 重建 BanSet → 全量 reconcile。这样即使程序宕机期间被手工清了规则，重启也能恢复。
 
@@ -1034,7 +1146,8 @@ CREATE TABLE acl_entries (
   kind         TEXT    NOT NULL,        -- 'white' | 'black'
   target       TEXT    NOT NULL,        -- IP 或 CIDR
   target_type  TEXT    NOT NULL,        -- 'ipv4' | 'ipv6' | 'cidr4' | 'cidr6'
-  scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp'，只对黑名单有意义（见 D14）
+  scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp' | 'custom'，只对黑名单有意义（见 D14）
+  ports        TEXT    NOT NULL DEFAULT '',     -- 仅 scope=custom 时有意义，归一化后逗号分隔（见 D14）
   remark       TEXT,
   source       TEXT    NOT NULL DEFAULT 'manual',  -- manual | geoip | system
   country      TEXT,                    -- 冗余的属地，便于列表展示
@@ -1049,7 +1162,8 @@ CREATE TABLE ban_records (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   target       TEXT    NOT NULL,
   target_type  TEXT    NOT NULL,
-  scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp'（见 D14）
+  scope        TEXT    NOT NULL DEFAULT 'all',  -- 'all' | 'frp' | 'custom'（见 D14）
+  ports        TEXT    NOT NULL DEFAULT '',     -- 仅 scope=custom 时有意义（见 D14）
   reason       TEXT,
   source       TEXT    NOT NULL,        -- auto | manual | geoip
   trigger_user TEXT,                    -- 触发封禁的 frp user
@@ -1216,15 +1330,15 @@ frpfirewall -data /var/lib/frpfirewall
 | POST | `/firewall/reconcile` | 手动触发一次同步 |
 | POST | `/firewall/preview` | 预览将要下发的规则（dry-run，不落盘） |
 | GET | `/acl/:kind` | 名单列表（kind=white/black），支持分页/筛选 |
-| POST | `/acl/:kind` | 新增 |
-| PUT | `/acl/:kind/:id` | 修改（备注/到期/范围；范围不传即保持原值，见 D14） |
+| POST | `/acl/:kind` | 新增。`scope` 取 `all` / `frp` / `custom`，`scope=custom` 时必须带 `ports`（空或非法一律 400，见 D14） |
+| PUT | `/acl/:kind/:id` | 修改（备注/到期/范围/端口；`scope` 与 `ports` 不传即保持原值，见 D14） |
 | DELETE | `/acl/:kind/:id` | 删除 |
 | POST | `/acl/:kind/batch` | 批量新增/删除 |
-| GET | `/acl/:kind/export` | 导出（txt / json） |
-| POST | `/acl/:kind/import` | 导入（去重、校验、预览后确认） |
+| GET | `/acl/:kind/export` | 导出（txt / json）。黑名单范围列支持 `custom:8080;9000-9100`，端口用分号分隔 |
+| POST | `/acl/:kind/import` | 导入（去重、校验、预览后确认）。`scope` 是本批默认范围，语法与导出文件的范围列相同，可写 `custom:端口` |
 | GET | `/bans` | 封禁列表（active/历史，含属地、来源） |
 | GET | `/bans/active` | 活跃封禁（读内存，含剩余时间） |
-| POST | `/bans` | 手动封禁 |
+| POST | `/bans` | 手动封禁。`scope=custom` 时必须带 `ports` |
 | DELETE | `/bans/:id` | 解封 |
 | POST | `/bans/batch-delete` | 批量解封 |
 | POST | `/bans/lookup` | 排障查询：某 IP 当前处于什么状态、命中几次 |
@@ -1245,6 +1359,8 @@ frpfirewall -data /var/lib/frpfirewall
 | GET | `/frps/snippet` | 生成 frps 接入配置片段（TOML 与 JSON 两份） |
 | GET | `/frps/health` | 插件自检（供 frps 配置前确认连通） |
 | GET | `/frps/config` | 可选的 frps 加固配置片段（TOML 与 JSON 两份） |
+| GET | `/frps/protect-ports` | 受保护端口三段：`bind_port`、`proxy_ports`、合并后的 `ports`（见 D19） |
+| PUT | `/frps/protect-ports` | 只改代理端口那一半，**保存后立即生效**（不需要重启）。空端口返回 400 |
 | POST | `/frps/handler` | **frps 插件入口**（非 JWT 鉴权，仅回环可访问） |
 
 事件流用游标分页而不是 offset：事件表只增不减，深翻页时 offset 要先扫过并丢弃
@@ -1263,11 +1379,11 @@ frpfirewall -data /var/lib/frpfirewall
 | 初始化 Setup | 首次访问引导页：凭启动时打印的一次性令牌设置用户名与密码 |
 | 概览 Dashboard | 当前后端徽标、受管规则数、活跃封禁数、拦截趋势图（ECharts）、Top 攻击 IP、Top 来源国家、系统健康状态 |
 | 防火墙配置 Firewall | 后端模式切换卡（含探测结果与冲突告警）、受管规则表、系统规则原文、「预览变更」抽屉、手动 reconcile |
-| 黑白名单 ACL | 白 / 黑 Tab、搜索分页、新增/编辑对话框、批量导入（先 dry-run 校验去重再提交）、导出。黑名单多一列「范围」（全端口 / 仅 frp 端口），白名单不显示该列（见 D14） |
-| 封禁记录 Bans | 活跃封禁表（剩余时间实时倒计时）、历史表（状态筛选）、手动封禁（可选封禁范围）、批量解封、排障查询 |
+| 黑白名单 ACL | 白 / 黑 Tab、搜索分页、新增/编辑对话框、批量导入（先 dry-run 校验去重再提交）、导出。黑名单多两列「范围」（全端口 / 仅 frp 端口 / 自定义端口）与「封禁端口」，白名单不显示这两列（见 D14）。范围选「自定义端口」时才出现端口输入框，导入对话框里的默认范围同理 |
+| 封禁记录 Bans | 活跃封禁表（剩余时间实时倒计时）、历史表（状态筛选）、手动封禁（可选封禁范围，选「自定义端口」时可填端口）、批量解封、排障查询 |
 | 频控策略 Policy | 分两张卡。**细分规则**：可排序的规则表（启用开关、规则名、落点标签、匹配条件、动作），支持新增/编辑/上移下移/删除；编辑对话框按「有没有填目的端口」动态切换可用字段 —— 填了端口就禁用地区/省份与封禁配置，并当场说明原因，而不是让用户保存时去吃后端的报错。**全局规则**：窗口秒数、阈值、阶梯时长编辑器（可增删/上移/永久档）、升级窗口、封禁粒度、fail-open/close、自动封禁与观察模式、地域封禁、连接速率限制。两张卡共用右上角一个「保存并生效」（见 D16）。编译不过的规则会在规则表上方用红框列出原因 |
 | IP 属地 GeoIP | 三个库的状态卡（加载状态/大小/更新时间，各带预估大小、「下载更新」按钮与「前往下载源仓库」链接）、加速源下拉（默认自动、选择记在 localStorage）、上传替换、IP 查询工具（属地 + 当前拦截状态 + 窗口命中数），未加载库时给出降级提示 |
-| frp 接入 Frps | 生成的 frps 配置片段（TOML / JSON 可切换、一键复制）、插件连通性检测、受保护端口展示、可选加固项、判定链路说明 |
+| frp 接入 Frps | 生成的 frps 配置片段（TOML / JSON 可切换、一键复制）、插件连通性检测、**受保护端口就地编辑**（`bindPort` 只读 + 代理端口可改，保存后立即生效、无需重启，见 D19）、可选加固项、判定链路说明 |
 | 事件日志 Events | 事件日志（类别/时间范围/关键字筛选 + 游标分页）与规则变更审计双 Tab |
 | 系统设置 Settings | 面板监听/TLS/账号、frps 对接、防护与日志、版本更新开关与来源；改启动期配置后如实提示需重启 |
 

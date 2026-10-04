@@ -9,6 +9,7 @@
 #   · 数据目录为空时会走一遍初始化流程（读 setup_token.txt 设置密码）
 #   · 数据目录已初始化时用固定测试密码登录，脚本可重复运行
 #   · 脚本会临时改写策略、细分规则与配置，结束时恢复（原有的细分规则会原样放回去）
+#     「受保护端口」也会临时改一次再改回去 —— 保存即生效，不改回来会一直生效下去
 set -u
 
 BASE="http://127.0.0.1:7930"
@@ -530,6 +531,52 @@ check "回填未清空更新检查开关" \
   "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.update.enabled)" \
   "$(printf '%s' "$CFGBODY" | jqf update.enabled)"
 
+# 受保护端口（bind_port ∪ proxy_ports）在 frp 接入页可以就地改，且**立即生效**。
+# 与上面那次 PUT /config 的区别只在生效时机，两者都保留是有意的：
+# 走 /config 是"改了启动期配置、需要重启"，走这里只重算内核规则、不用重启。
+# 下面这一小段改完会原样改回去，脚本可重复运行。
+PROT0=$(get -H "$AUTH" "$BASE/api/v1/frps/protect-ports")
+check_ok "受保护端口：bind_port" "$(printf '%s' "$PROT0" | jqf data.bind_port)"
+check "受保护端口：代理端口与配置一致" \
+  "$(printf '%s' "$PROT0" | jqf data.proxy_ports)" \
+  "$(printf '%s' "$CFG" | jqf data.config.frps.proxy_ports)"
+check_ok "受保护端口：合并结果非空" "$(printf '%s' "$PROT0" | jqf data.ports)"
+check "受保护端口改动前无需重启" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.restart_required)" "false"
+
+# 区间 + 乱序 + 重复，落库的是归一化后的文本
+PROT1=$(get -X PUT "$BASE/api/v1/frps/protect-ports" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"proxy_ports":"9000-9100, 8080, 8080"}')
+check "代理端口归一化后返回" "$(printf '%s' "$PROT1" | jqf data.proxy_ports)" "8080,9000-9100"
+# 立即生效：再读一次就是新值，不是启动时的快照
+check "代理端口已热更" \
+  "$(get -H "$AUTH" "$BASE/api/v1/frps/protect-ports" | jqf data.proxy_ports)" \
+  "8080,9000-9100"
+# 落了库：重启之后 FromSettings 读的就是这一份
+check "代理端口已落库" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.frps.proxy_ports)" \
+  "8080,9000-9100"
+# 这一项已经在生效了，配置页不该再标"需要重启" —— 否则用户会去重启一个
+# 完全不必要的服务，而重启期间所有隧道都会断。
+check "热更过的端口不提示重启" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.restart_required)" "false"
+
+# 空端口必须当场拒绝：FromSettings 会把空值当成"没配过"回落成默认的 80,443，
+# 于是保存完看着生效了、重启之后又变回去。
+check_err "代理端口为空被拒" \
+  "$(get -X PUT "$BASE/api/v1/frps/protect-ports" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"proxy_ports":""}' | jqf error)" "不能为空"
+check_err "代理端口写法非法被拒" \
+  "$(get -X PUT "$BASE/api/v1/frps/protect-ports" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"proxy_ports":"9000~9100"}' | jqf error)" "无法识别"
+
+# 还原
+printf '{"proxy_ports":"%s"}' "$(printf '%s' "$PROT0" | jqf data.proxy_ports)" > /tmp/prot0.json
+get -X PUT "$BASE/api/v1/frps/protect-ports" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/prot0.json > /dev/null
+check "代理端口已还原" \
+  "$(get -H "$AUTH" "$BASE/api/v1/frps/protect-ports" | jqf data.proxy_ports)" \
+  "$(printf '%s' "$PROT0" | jqf data.proxy_ports)"
+
 echo
 echo "########## 8c. 版本与更新检查 ##########"
 INFO=$(get -H "$AUTH" "$BASE/api/v1/system/info")
@@ -660,6 +707,40 @@ SCW=$(get -X POST "$BASE/api/v1/acl/white" -H "$AUTH" -H 'Content-Type: applicat
 check "白名单忽略范围" "$(printf '%s' "$SCW" | jqf data.scope)" "all"
 SCWID=$(printf '%s' "$SCW" | jqf data.id)
 
+# 自定义端口范围。插件回调拿不到被访问的目的端口，所以这一档完全靠"库里那一列"
+# 决定内核封哪些端口 —— 那一列丢了，整档就是空的，而界面/规则数都看不出来。
+# 因此这里既断言接口返回值，也回查一次列表（读的是库里的值，不是请求体拼出来的对象）。
+CUS=$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"198.51.100.20","scope":"custom","ports":"9000-9100, 8080 ,8080","remark":"冒烟-custom"}')
+check "自定义范围可新增" "$(printf '%s' "$CUS" | jqf data.scope)" "custom"
+check "自定义端口归一化" "$(printf '%s' "$CUS" | jqf data.ports)" "8080,9000-9100"
+CUSID=$(printf '%s' "$CUS" | jqf data.id)
+check "自定义端口条目可查出" \
+  "$(get -H "$AUTH" "$BASE/api/v1/acl/black?keyword=198.51.100.20&page=1&size=5" | jqf data.total)" "1"
+check "自定义端口读自库" \
+  "$(get -H "$AUTH" "$BASE/api/v1/acl/black?keyword=198.51.100.20&page=1&size=5" | jqr data.items | grep -c '"ports":"8080,9000-9100"')" "1"
+
+# 改端口：接口报的值和库里的值必须一致。
+# 曾经 UpdateACL 的更新列漏了 ports，接口老老实实回新值、库里一个字节都没变。
+check "改端口后接口返回新值" \
+  "$(get -X PUT "$BASE/api/v1/acl/black/$CUSID" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"ports":"8081"}' | jqf data.ports)" "8081"
+check "改端口已落库" \
+  "$(get -H "$AUTH" "$BASE/api/v1/acl/black?keyword=198.51.100.20&page=1&size=5" | jqr data.items | grep -c '"ports":"8081"')" "1"
+
+# 换回非自定义范围时端口必须清掉：库里残留一份不参与生效的端口，
+# 是"配置里写着、实际不生效"那类最难排查的问题。
+get -X PUT "$BASE/api/v1/acl/black/$CUSID" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"scope":"frp"}' > /dev/null
+check "换范围后端口被清空" \
+  "$(get -H "$AUTH" "$BASE/api/v1/acl/black?keyword=198.51.100.20&page=1&size=5" | jqr data.items | grep -c '"ports":""')" "1"
+
+check_err "自定义范围缺端口被拒" \
+  "$(get -X POST "$BASE/api/v1/acl/black" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"target":"198.51.100.21","scope":"custom"}' | jqf error)" "自定义端口不能为空"
+
+get -X DELETE "$BASE/api/v1/acl/black/$CUSID" -H "$AUTH" > /dev/null
+
 # 导入：第二列恰好是范围词才当范围，否则整体按备注（老格式因此仍可导入）
 SCIMP=$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"content":"198.51.100.12,frp,带范围\n198.51.100.13,只是备注","dry_run":true}')
@@ -667,6 +748,22 @@ check "导入行可覆盖范围" "$(printf '%s' "$SCIMP" | jqf data.added)" "2"
 check "导入非法范围行落默认值" \
   "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
     -d '{"content":"198.51.100.14,port","scope":"frp","dry_run":true}' | jqf data.added)" "1"
+
+# 自定义端口在导入里的写法：端口写在范围列里、用**分号**分隔（逗号是列分隔符，
+# 写逗号会把备注列切走 —— 这种错在读文件时看不出来）。
+check "导入支持自定义端口" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"198.51.100.15,custom:8080;9000-9100,只封两个端口","dry_run":true}' | jqf data.added)" "1"
+# 默认范围也能带端口，未写范围的行跟着它走
+check "导入默认范围可带端口" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"198.51.100.16\n198.51.100.17,frp","scope":"custom:8080","dry_run":true}' | jqf data.added)" "2"
+# 只写 custom 不带端口时不算范围写法，整体按备注处理：
+# 范围是自定义却没有端口的条目在内核里一条规则都生成不出来，
+# 而导入结果里它会显示成一条正常生效中的条目。
+check "光 custom 无端口按备注处理" \
+  "$(get -X POST "$BASE/api/v1/acl/black/import" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"content":"198.51.100.18,custom","dry_run":true}' | jqf data.added)" "1"
 
 get -X DELETE "$BASE/api/v1/acl/black/$SC1ID" -H "$AUTH" > /dev/null
 get -X DELETE "$BASE/api/v1/acl/black/$SC2ID" -H "$AUTH" > /dev/null
@@ -692,6 +789,21 @@ BID=$(printf '%s' "$BAN" | jqf data.id)
 check "解封" "$(get -X DELETE "$BASE/api/v1/bans/$BID" -H "$AUTH" | jqf data.message)" "已解封"
 check "解封后查询 banned=false" \
   "$(get -X POST "$BASE/api/v1/bans/lookup" -H "$AUTH" -H 'Content-Type: application/json' -d '{"target":"203.0.113.99"}' | jqf data.banned)" "false"
+
+# 手动封禁也支持自定义端口。端口只影响内核层封哪几个端口；插件回调拿不到端口，
+# 所以接入侧仍然是"该地址整体拒绝"—— 兜底方向取更严的一侧。
+check_err "自定义封禁缺端口被拒" \
+  "$(get -X POST "$BASE/api/v1/bans" -H "$AUTH" -H 'Content-Type: application/json' \
+    -d '{"target":"203.0.113.98","scope":"custom"}' | jqf error)" "自定义端口不能为空"
+CBAN=$(get -X POST "$BASE/api/v1/bans" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"target":"203.0.113.98","reason":"冒烟-custom","duration_sec":120,"scope":"custom","ports":"8080,9000-9100"}')
+check "自定义端口封禁接受范围" "$(printf '%s' "$CBAN" | jqf data.scope)" "custom"
+check "自定义端口封禁记下端口" "$(printf '%s' "$CBAN" | jqf data.ports)" "8080,9000-9100"
+# 活跃列表要带出端口，否则在列表上无从知道这条封的是哪几个端口
+check "活跃封禁列表带出端口" \
+  "$(get -H "$AUTH" "$BASE/api/v1/bans/active" | jqr data.items | grep -c '"ports":"8080,9000-9100"')" "1"
+check "解封自定义端口封禁" \
+  "$(get -X DELETE "$BASE/api/v1/bans/$(printf '%s' "$CBAN" | jqf data.id)" -H "$AUTH" | jqf data.message)" "已解封"
 
 echo
 echo "########## 11. frps 插件回调 ##########"

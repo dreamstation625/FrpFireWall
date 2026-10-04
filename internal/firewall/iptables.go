@@ -14,7 +14,7 @@ import (
 //
 //	INPUT ─(第1条)─▶ FRPFIREWALL_GUARD
 //	                   ├─ -j FRPFIREWALL_BLACK            ← 全端口黑名单
-//	                   ├─ -j FRPFIREWALL_BLACK_FRP        ← 仅 frp 端口的黑名单
+//	                   ├─ -j FRPFIREWALL_BLACK_FRP        ← 端口限定黑名单
 //	                   ├─ [限速规则]                 ← 可选
 //	                   └─ -j RETURN
 //	FRPFIREWALL_BLACK
@@ -22,8 +22,12 @@ import (
 //	FRPFIREWALL_BLACK_FRP
 //	                   └─ -s <黑名单> -p tcp -m multiport --dports ... -j DROP
 //
-// 两条黑名单子链的先后不影响结果（全端口是 frp 端口的超集），按"从严到宽"排
+// 两条黑名单子链的先后不影响结果（全端口是端口限定的超集），按"从严到宽"排
 // 只是为了让 `iptables -S` 的输出自解释。
+//
+// 端口限定子链（链名里的 FRP 是历史遗留，见 driver.go 的说明）里同时装着
+// 「仅 frp 端口」与「自定义端口」两类条目：它们的规则形状一样，都是地址加
+// dport，DROP 之间也没有先后之分，所以只用一条链。
 //
 // 为什么黑名单要单独一个子链：
 //
@@ -81,7 +85,7 @@ func (d *iptablesDriver) Capability() Capability {
 func (d *iptablesDriver) EnsureBase() error {
 	ctx := context.Background()
 	for _, f := range d.fams {
-		for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+		for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
 			if _, err := run(ctx, f.bin, "-N", chain); err != nil {
 				if !isAlreadyExists(err) {
 					return fmt.Errorf("创建链 %s 失败: %w", chain, err)
@@ -119,6 +123,15 @@ type iptRule struct {
 	Soft bool
 }
 
+// iptPortGroup 是一个端口限定分组在本协议栈上的落地形态：
+// 已按地址族筛过的地址 + 已归一化的端口。
+type iptPortGroup struct {
+	Key   string
+	Label string
+	Addrs []string
+	Ports portrange.Set
+}
+
 // iptRules 是一个协议栈本次要下发的全部规则。
 //
 // Sync 与 Preview 共用它。iptables 侧原本是两处各自手写规则拼装，加一个维度
@@ -129,25 +142,38 @@ type iptRules struct {
 	Guard []iptRule
 	// Black 是全端口封禁的地址（已按协议栈过滤）。
 	Black []string
-	// BlackFrp 是仅 frp 端口封禁的地址（已按协议栈过滤）。
-	BlackFrp []string
-	// FrpPorts 是 frp 端口，已归一化。
-	FrpPorts portrange.Set
+	// PortGroups 是端口限定封禁的分组（已按协议栈过滤并丢弃空组）。
+	PortGroups []iptPortGroup
 }
 
 func buildIPTablesRules(des Desired, bits int) iptRules {
 	r := iptRules{
-		Black:    filterByFamily(des.Blacklist, bits),
-		BlackFrp: filterByFamily(des.BlacklistFrp, bits),
-		// 驱动入口再归一化一次：直接手写 Set 字面量的调用方不会经过归一化，
-		// 而越界的端口会让整条命令被内核拒掉，连带同批正常规则一起失败。
-		FrpPorts: des.ProtectPorts.Normalize(),
+		Black: filterByFamily(des.Blacklist, bits),
 	}
 
-	// 顺序即优先级：全端口在前，仅 frp 端口在后。
+	// 空端口、以及在本协议栈下没有地址的分组直接丢掉：前者生成不出规则，
+	// 后者生成的规则匹配不到任何来源。两种情况都会让 `iptables -S` 里多出
+	// 一批读不懂的规则，而真正的"没生效"却要靠告警去发现（见 syncFamily）。
+	for _, g := range des.PortBlacklists {
+		addrs := filterByFamily(g.Prefixes, bits)
+		if len(addrs) == 0 {
+			continue
+		}
+		// 驱动入口再归一化一次：直接手写 Set 字面量的调用方不会经过归一化，
+		// 而越界的端口会让整条命令被内核拒掉，连带同批正常规则一起失败。
+		ports := g.Ports.Normalize()
+		if len(ports) == 0 {
+			continue
+		}
+		r.PortGroups = append(r.PortGroups, iptPortGroup{
+			Key: g.Key, Label: g.Label, Addrs: addrs, Ports: ports,
+		})
+	}
+
+	// 顺序即优先级：全端口在前，端口限定在后。
 	r.Guard = append(r.Guard,
 		iptRule{Args: []string{"-A", ManagedChain, "-j", managedBlackChain}},
-		iptRule{Args: []string{"-A", ManagedChain, "-j", managedBlackFrpChain}},
+		iptRule{Args: []string{"-A", ManagedChain, "-j", managedPortBlackChain}},
 	)
 
 	// 连接速率限制（per-IP），放在封禁判定之后、兜底 RETURN 之前。
@@ -173,26 +199,33 @@ func buildIPTablesRules(des Desired, bits int) iptRules {
 // 逗号后不能有空格：multiport 把整串当一个参数解析，多一个空格就是格式错误。
 func iptPorts(s portrange.Set) string { return renderPorts(s, ":", ",") }
 
-// frpBlockRules 展开"仅 frp 端口"封禁的全部规则。
+// portBlockRules 展开"只在指定端口上封禁"的全部分组的规则。
 //
 // 两种协议都封：frps 的 bindPort 是 TCP，但 proxyPorts 里可能配了 UDP 代理端口，
-// 只封 TCP 会留下一条用 UDP 绕过的路径。
+// 只封 TCP 会留下一条用 UDP 绕过的路径。自定义端口同样按两种协议封 —— 用户填的
+// 是"目的端口"，没有理由替他假定只有 TCP。
 //
 // 端口按「区间个数」切块：multiport 一次最多认 15 个端口或区间，而一个区间
 // 无论多宽都只占一个名额 —— 所以 20000-30000 是一条规则，不是一千多条。
-func frpBlockRules(addrs []string, ports portrange.Set) [][]string {
-	if len(ports) == 0 || len(addrs) == 0 {
+func portBlockRules(groups []iptPortGroup) [][]string {
+	total := 0
+	for _, g := range groups {
+		total += len(g.Addrs) * len(g.Ports.Chunks(multiportMax)) * 2
+	}
+	if total == 0 {
 		return nil
 	}
-	out := make([][]string, 0, len(addrs)*2)
-	for _, addr := range addrs {
-		for _, chunk := range ports.Chunks(multiportMax) {
-			for _, proto := range []string{"tcp", "udp"} {
-				out = append(out, []string{
-					"-A", managedBlackFrpChain, "-s", addr,
-					"-p", proto, "-m", "multiport", "--dports", iptPorts(chunk),
-					"-j", "DROP",
-				})
+	out := make([][]string, 0, total)
+	for _, g := range groups {
+		for _, addr := range g.Addrs {
+			for _, chunk := range g.Ports.Chunks(multiportMax) {
+				for _, proto := range []string{"tcp", "udp"} {
+					out = append(out, []string{
+						"-A", managedPortBlackChain, "-s", addr,
+						"-p", proto, "-m", "multiport", "--dports", iptPorts(chunk),
+						"-j", "DROP",
+					})
+				}
 			}
 		}
 	}
@@ -213,7 +246,7 @@ func (d *iptablesDriver) syncFamily(ctx context.Context, f ipFamily, des Desired
 	rules := buildIPTablesRules(des, f.bits)
 
 	// 先清空自己的链——只动受管命名空间，绝不碰系统其它规则。
-	for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+	for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
 		if _, err := run(ctx, f.bin, "-w", "-F", chain); err != nil {
 			return fmt.Errorf("清空 %s 失败: %w", chain, err)
 		}
@@ -238,18 +271,20 @@ func (d *iptablesDriver) syncFamily(ctx context.Context, f ipFamily, des Desired
 		}
 	}
 
-	// 仅 frp 端口的黑名单。
-	if len(rules.BlackFrp) > 0 && len(rules.FrpPorts) == 0 {
-		// 没有端口列表就构造不出端口条件。静默跳过会让"设了 frp 范围"看起来
-		// 生效了、实际一条规则都没有 —— 这种"以为封了其实没封"必须报出来。
-		d.warn(fmt.Sprintf(
-			"有 %d 个地址设为「仅 frp 端口」，但当前没有配置任何 frp 端口（bind_port / proxy_ports 均为空），这些条目暂未下发",
-			len(rules.BlackFrp)))
+	// 端口限定分组里没端口的那一类，生成不出 dport 条件。静默跳过会让"设了
+	// 端口限定范围"看起来生效了、实际一条规则都没有 —— 这种"以为封了其实没封"
+	// 必须报出来。按 Desired 里的原始分组报，不能用过滤后的（过滤时已经丢掉了）。
+	for _, g := range des.PortBlacklists {
+		if len(g.Ports.Normalize()) == 0 && len(g.Prefixes) > 0 {
+			d.warn(fmt.Sprintf(
+				"有 %d 个地址属于「%s」，但这一组没有配置任何端口，这些条目暂未下发",
+				len(g.Prefixes), g.Label))
+		}
 	}
-	for _, args := range frpBlockRules(rules.BlackFrp, rules.FrpPorts) {
+	for _, args := range portBlockRules(rules.PortGroups) {
 		full := append([]string{"-w"}, args...)
 		if _, err := run(ctx, f.bin, full...); err != nil {
-			return fmt.Errorf("写入 frp 端口黑名单失败: %w", err)
+			return fmt.Errorf("写入端口限定黑名单失败: %w", err)
 		}
 	}
 	return nil
@@ -327,7 +362,7 @@ func (d *iptablesDriver) DumpManaged() (*ManagedRules, error) {
 
 		for _, item := range []struct{ chain, label string }{
 			{managedBlackChain, "全端口"},
-			{managedBlackFrpChain, "仅 frp 端口"},
+			{managedPortBlackChain, "端口限定"},
 		} {
 			out, err := run(ctx, f.bin, "-w", "-S", item.chain)
 			if err != nil {
@@ -366,7 +401,7 @@ func (d *iptablesDriver) DumpSystem() (string, error) {
 
 // Preview 生成将要下发的规则文本，不落盘。
 //
-// 与 syncFamily 共用 buildIPTablesRules / frpBlockRules，保证"预览到的"
+// 与 syncFamily 共用 buildIPTablesRules / portBlockRules，保证"预览到的"
 // 就是"会下发的"。
 func (d *iptablesDriver) Preview(des Desired) (string, error) {
 	var b strings.Builder
@@ -375,10 +410,10 @@ func (d *iptablesDriver) Preview(des Desired) (string, error) {
 
 		fmt.Fprintf(&b, "# ===== %s（%s）=====\n", f.bin, f.name)
 		fmt.Fprintf(&b, "%s -N %s\n%s -N %s\n%s -N %s\n",
-			f.bin, ManagedChain, f.bin, managedBlackChain, f.bin, managedBlackFrpChain)
+			f.bin, ManagedChain, f.bin, managedBlackChain, f.bin, managedPortBlackChain)
 		fmt.Fprintf(&b, "%s -C INPUT -j %s || %s -I INPUT 1 -j %s\n", f.bin, ManagedChain, f.bin, ManagedChain)
 		fmt.Fprintf(&b, "%s -F %s\n%s -F %s\n%s -F %s\n",
-			f.bin, ManagedChain, f.bin, managedBlackChain, f.bin, managedBlackFrpChain)
+			f.bin, ManagedChain, f.bin, managedBlackChain, f.bin, managedPortBlackChain)
 
 		for _, rule := range rules.Guard {
 			fmt.Fprintf(&b, "%s %s\n", f.bin, strings.Join(rule.Args, " "))
@@ -386,14 +421,21 @@ func (d *iptablesDriver) Preview(des Desired) (string, error) {
 		for _, bl := range rules.Black {
 			fmt.Fprintf(&b, "%s -A %s -s %s -j DROP\n", f.bin, managedBlackChain, bl)
 		}
-		if len(rules.BlackFrp) > 0 && len(rules.FrpPorts) == 0 {
-			fmt.Fprintf(&b, "# 以下 %d 个地址设为「仅 frp 端口」，但未配置 frp 端口，无法下发：\n",
-				len(rules.BlackFrp))
-			for _, bl := range rules.BlackFrp {
+		for _, g := range des.PortBlacklists {
+			if len(g.Ports.Normalize()) > 0 {
+				continue
+			}
+			addrs := filterByFamily(g.Prefixes, f.bits)
+			if len(addrs) == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "# 以下 %d 个地址属于「%s」，但这一组没有端口，无法下发：\n",
+				len(addrs), g.Label)
+			for _, bl := range addrs {
 				fmt.Fprintf(&b, "#   %s\n", bl)
 			}
 		}
-		for _, args := range frpBlockRules(rules.BlackFrp, rules.FrpPorts) {
+		for _, args := range portBlockRules(rules.PortGroups) {
 			fmt.Fprintf(&b, "%s %s\n", f.bin, strings.Join(args, " "))
 		}
 		b.WriteString("\n")
@@ -405,7 +447,7 @@ func (d *iptablesDriver) Snapshot() (string, error) {
 	ctx := context.Background()
 	var b strings.Builder
 	for _, f := range d.fams {
-		for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+		for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
 			out, err := run(ctx, f.bin, "-w", "-S", chain)
 			if err != nil {
 				fmt.Fprintf(&b, "# %s %s: %v\n", f.bin, chain, err)
@@ -421,7 +463,7 @@ func (d *iptablesDriver) Snapshot() (string, error) {
 func (d *iptablesDriver) Restore(snapshot string) error {
 	ctx := context.Background()
 	for _, f := range d.fams {
-		for _, chain := range []string{ManagedChain, managedBlackChain, managedBlackFrpChain} {
+		for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
 			if _, err := run(ctx, f.bin, "-w", "-F", chain); err != nil {
 				return err
 			}
@@ -450,7 +492,7 @@ func (d *iptablesDriver) Restore(snapshot string) error {
 		if len(fields) >= 2 {
 			chain = fields[1]
 		}
-		if chain != ManagedChain && chain != managedBlackChain && chain != managedBlackFrpChain {
+		if chain != ManagedChain && chain != managedBlackChain && chain != managedPortBlackChain {
 			continue
 		}
 		if bin == "" {

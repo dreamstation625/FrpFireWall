@@ -23,8 +23,10 @@ import (
 type banState struct {
 	Prefix netip.Prefix
 	Target string
-	// Scope 封禁范围（all | frp）。自动封禁固定 all，手动封禁可指定。
-	Scope    string
+	// Scope 封禁范围（all | frp | custom）。自动封禁固定 all，手动封禁可指定。
+	Scope string
+	// Ports 只在 Scope == custom 时有值（见 blockTarget 的同名字段）。
+	Ports    portrange.Set
 	Reason   string
 	Source   string
 	User     string
@@ -54,8 +56,11 @@ func (b *banState) Remaining(now time.Time) time.Duration {
 // BanView 是给前端的封禁视图。
 type BanView struct {
 	Target string `json:"target"`
-	// Scope 封禁范围（all | frp）。
-	Scope        string     `json:"scope"`
+	// Scope 封禁范围（all | frp | custom）。
+	Scope string `json:"scope"`
+	// Ports 是 scope=custom 时的端口文本，其余范围为空的。前端直接展示，
+	// 不做结构转换 —— 与 RateRule.Ports 的口径一致。
+	Ports        string     `json:"ports"`
 	Reason       string     `json:"reason"`
 	Source       string     `json:"source"`
 	User         string     `json:"user"`
@@ -104,13 +109,17 @@ type Verdict struct {
 //   - 封禁状态机（阶梯时长、到期解封）
 //   - 期望状态与内核规则的对齐（Reconcile）
 //
-// blockTarget 是内存里的黑名单条目：地址 + 封禁范围。
+// blockTarget 是内存里的黑名单条目：地址 + 封禁范围（+ 自定义端口）。
 //
-// 范围只影响内核规则怎么写（全端口丢 / 只丢 frp 端口），不影响"是否命中"的判定 ——
-// 插件层本来就只作用于 frp 连接，两种范围对它没有区别。
+// 范围只影响内核规则怎么写（全端口丢 / 只在某些端口上丢），不影响"是否命中"的判定 ——
+// 插件层本来就只作用于 frp 连接，而且拿不到被访问的端口，几种范围对它没有区别。
+// 所以自定义端口与「仅 frp 端口」在判定路径上完全一样，区别只在内核规则的端口集合。
 type blockTarget struct {
 	Prefix netip.Prefix
 	Scope  string
+	// Ports 只在 Scope == custom 时有值。其余范围下端口要么是全局的（frp），
+	// 要么根本不带（all），存在条目上只会制造两个真相。
+	Ports portrange.Set
 }
 
 type Manager struct {
@@ -138,6 +147,14 @@ type Manager struct {
 	// ruleProblems 记录编译不过、被跳过的规则，界面要把它显示出来。
 	ruleProblems []string
 
+	// frpsProxyPorts 是运行期生效的 frp 代理端口。
+	//
+	// 单独存一份而不是每次读 m.cfg：m.cfg 是进程启动时的那一份，而代理端口可以
+	// 热改（frp 接入页直接编辑受保护端口），改完要立刻重新对齐内核规则。
+	// 只有这一项走热更路径 —— bind_port、监听地址这类要重启的配置仍以 m.cfg 为准，
+	// 免得出现"一半是新的、一半是旧的"这种没人能解释的状态。
+	frpsProxyPorts portrange.Set
+
 	lastSyncAt    time.Time
 	lastSyncErr   string
 	lastSyncRules int
@@ -163,6 +180,8 @@ func New(cfg *config.Config, st *store.Store, geo *geoip.Resolver, drv firewall.
 		windows: make(map[string]*hitWindow),
 		eventCh: make(chan *model.Event, 2048),
 		applyCh: make(chan struct{}, 1),
+		// 启动时的生效值。之后由 SetFrpsProxyPorts 热改。
+		frpsProxyPorts: cfg.Frps.ProxyPorts.Normalize(),
 	}
 }
 
@@ -267,7 +286,7 @@ func toPrefixes(rows []model.ACLEntry, now time.Time) []netip.Prefix {
 //
 // 范围缺失或非法一律按 all 处理。空值是真会出现的：AutoMigrate 加列前写入的
 // 老行、以及手工改过数据库的行。兜底方向必须是"更严"的那一侧 —— 把本该全端口
-// 封禁的条目降级成只封 frp 端口，等于不知不觉放松了封禁。
+// 封禁的条目降级成只在某些端口上封，等于不知不觉放松了封禁。
 func toBlockTargets(rows []model.ACLEntry, now time.Time) []blockTarget {
 	out := make([]blockTarget, 0, len(rows))
 	for _, r := range rows {
@@ -282,9 +301,30 @@ func toBlockTargets(rows []model.ACLEntry, now time.Time) []blockTarget {
 		if !model.ValidScope(scope) {
 			scope = model.ScopeAll
 		}
-		out = append(out, blockTarget{Prefix: p, Scope: scope})
+		ports, ok := parseScopePorts(scope, r.Ports)
+		if !ok {
+			scope, ports = model.ScopeAll, nil
+		}
+		out = append(out, blockTarget{Prefix: p, Scope: scope, Ports: ports})
 	}
 	return out
+}
+
+// parseScopePorts 解析条目的端口条件。
+//
+// ok 为 false 表示"这个范围本该有端口、但拿不到可用的" —— 调用方负责把它退化成
+// 全端口。兜底方向取更严的一侧是刻意的：一条写着"只封 8080"的条目如果因为端口
+// 字段被手工清空而变成"不封"，那是实打实的安全缺口，而且在界面上完全看不出来
+// （列表里它还显示着）。反向的代价是可能多封了几个端口，看得见、也解释得清。
+func parseScopePorts(scope, ports string) (portrange.Set, bool) {
+	if !model.ScopeNeedsPorts(scope) {
+		return nil, true
+	}
+	ps, err := portrange.Parse(ports)
+	if err != nil || len(ps) == 0 {
+		return nil, false
+	}
+	return ps, true
 }
 
 // rebuildBans 从数据库恢复活跃封禁。程序重启后靠它自愈。
@@ -309,10 +349,15 @@ func (m *Manager) rebuildBans() error {
 		if !model.ValidScope(scope) {
 			scope = model.ScopeAll
 		}
+		ports, ok := parseScopePorts(scope, r.Ports)
+		if !ok {
+			scope, ports = model.ScopeAll, nil
+		}
 		st := &banState{
 			Prefix:   p,
 			Target:   r.Target,
 			Scope:    scope,
+			Ports:    ports,
 			Reason:   r.Reason,
 			Source:   r.Source,
 			User:     r.TriggerUser,
@@ -356,7 +401,7 @@ func (m *Manager) Reconcile() error {
 
 	m.mu.Lock()
 	m.lastSyncAt = time.Now()
-	m.lastSyncRules = len(desired.Blacklist)
+	m.lastSyncRules = desiredRuleCount(desired)
 	if err != nil {
 		m.lastSyncErr = err.Error()
 	} else {
@@ -368,7 +413,7 @@ func (m *Manager) Reconcile() error {
 		_ = m.store.AddRuleChange(&model.RuleChange{
 			Backend: m.drv.Name(),
 			Action:  "sync",
-			Payload: fmt.Sprintf(`{"rules":%d}`, len(desired.Blacklist)),
+			Payload: fmt.Sprintf(`{"rules":%d}`, desiredRuleCount(desired)),
 			Result:  "failed",
 			Error:   truncate(err.Error(), 500),
 		})
@@ -376,6 +421,25 @@ func (m *Manager) Reconcile() error {
 	}
 	return nil
 }
+
+// desiredRuleCount 数出期望状态里被封的条目数（按地址计，不按内核规则条数）。
+//
+// 只数全端口那一份会漏掉端口限定的条目：界面上会显示"本次同步 3 条"，
+// 而实际封着十来个地址，排查时第一反应是"怎么少了"，方向直接跑偏。
+func desiredRuleCount(des firewall.Desired) int {
+	n := len(des.Blacklist)
+	for _, g := range des.PortBlacklists {
+		n += len(g.Prefixes)
+	}
+	return n
+}
+
+// 端口限定分组的标签，只用在告警与规则摘要里。
+// frp 那一组是固定名字；自定义分组的标签带上端口文本，否则几条告警长得一样，
+// 用户无法判断该去哪一条条目上改。
+const frpGroupLabel = "仅 frp 端口"
+
+func customGroupLabel(ports string) string { return "自定义端口 " + ports }
 
 // desired 计算内核侧的期望状态。
 //
@@ -386,14 +450,20 @@ func (m *Manager) desired() firewall.Desired {
 	defer m.mu.RUnlock()
 
 	now := time.Now()
+	// 受保护端口在同一把锁里算一次：它既可能被 frp 范围的条目用到，
+	// 又要参与限速规则，两次分别算的话中间可能被热更新改掉，结果自相矛盾。
+	protect := m.protectPortsLocked()
 
 	// 同一个地址可能同时来自手动黑名单与自动封禁，两处范围还可能不同。
-	// 这里用 map 归并而不是简单拼接：全端口已经覆盖了 frp 端口，同一地址再写
-	// 一条 frp 规则纯属冗余，还会变成"为什么这里有两行"这种需要解释的问题。
-	// 冲突时严格范围胜出。
-	scopeOf := make(map[netip.Prefix]string, len(m.black)+len(m.bans))
+	// 先把所有条目归集成"地址 + 范围 + 端口"，再按下面的规则分桶。
+	type scopedEntry struct {
+		prefix netip.Prefix
+		scope  string
+		ports  portrange.Set
+	}
+	entries := make([]scopedEntry, 0, len(m.black)+len(m.bans))
 
-	add := func(p netip.Prefix, scope string) {
+	collect := func(p netip.Prefix, scope string, ports portrange.Set) {
 		if IsSystemProtected(p.Addr()) {
 			return
 		}
@@ -403,50 +473,113 @@ func (m *Manager) desired() firewall.Desired {
 		if !model.ValidScope(scope) {
 			scope = model.ScopeAll
 		}
-		if prev, ok := scopeOf[p]; ok && prev == model.ScopeAll {
-			return // 已是全端口，别再降级成 frp
+		switch scope {
+		case model.ScopeFrp:
+			// 端口来自全局的受保护端口，不跟着条目走。
+			ports = protect
+		case model.ScopeCustom:
+			// 自定义范围没有端口就表达不出任何规则。退化成全端口而不是丢掉：
+			// 兜底方向必须是"更严"的那一侧 —— 把一条本该封住的条目静默放掉，
+			// 是没有办法从界面上看出来的错误。接口层会拦住空端口，能走到这里
+			// 基本只可能是库里被手工改坏了。
+			if ports = ports.Normalize(); len(ports) == 0 {
+				scope, ports = model.ScopeAll, nil
+			}
 		}
-		scopeOf[p] = scope
+		// frp 端口集合为空时同理退化（bind_port 被清成 0 且代理端口为空）。
+		if scope != model.ScopeAll && len(ports.Normalize()) == 0 {
+			scope, ports = model.ScopeAll, nil
+		}
+		entries = append(entries, scopedEntry{prefix: p, scope: scope, ports: ports})
 	}
 
 	for _, b := range m.black {
-		add(b.Prefix, b.Scope)
+		collect(b.Prefix, b.Scope, b.Ports)
 	}
 	for _, b := range m.bans {
 		if b.Expires.IsZero() || b.Expires.After(now) {
-			add(b.Prefix, b.Scope)
+			collect(b.Prefix, b.Scope, b.Ports)
 		}
 	}
 
-	blackAll := make([]string, 0, len(scopeOf))
-	blackFrp := make([]string, 0, 8)
-	for p, scope := range scopeOf {
-		if scope == model.ScopeFrp {
-			blackFrp = append(blackFrp, p.String())
-		} else {
-			blackAll = append(blackAll, p.String())
+	// 全端口优先：它已经覆盖了所有端口，同一地址再进任何端口限定组都是冗余，
+	// 而且会变成"这个地址为什么出现在两处"这种需要解释的问题。
+	// 冲突时严格范围胜出 —— 与以前「全端口 vs 仅 frp 端口」的取舍一致。
+	fullPort := make(map[netip.Prefix]bool, len(entries))
+	for _, e := range entries {
+		if e.scope == model.ScopeAll {
+			fullPort[e.prefix] = true
 		}
 	}
+
+	// 端口限定按端口集合分组：Key 由端口集合派生，因此同一个集合天然合为一组，
+	// 不同集合必须分开 —— 合成一组会让 A 组的地址在 B 组的端口上也被封，
+	// 而两组规则长得一模一样，光看规则本身发现不了。
+	groupOf := make(map[string]*firewall.PortBlacklist, 4)
+	usedByFrp := make(map[string]bool, 4)
+	members := make(map[string]map[netip.Prefix]bool, 4)
+	for _, e := range entries {
+		if e.scope == model.ScopeAll || fullPort[e.prefix] {
+			continue
+		}
+		key := e.ports.String()
+		if _, ok := groupOf[key]; !ok {
+			groupOf[key] = &firewall.PortBlacklist{Key: key, Ports: e.ports}
+			members[key] = make(map[netip.Prefix]bool, 4)
+		}
+		if e.scope == model.ScopeFrp {
+			usedByFrp[key] = true
+		}
+		members[key][e.prefix] = true
+	}
+
+	keys := make([]string, 0, len(groupOf))
+	for k := range groupOf {
+		keys = append(keys, k)
+	}
+	// 排序只为输出稳定：内核规则本身与顺序无关（都是 DROP），但两份内容相同的
+	// 期望状态应当生成完全一样的文本，否则每次比对都会看到"变化"。
+	sort.Strings(keys)
+
+	portGroups := make([]firewall.PortBlacklist, 0, len(keys))
+	for _, k := range keys {
+		g := groupOf[k]
+		// 标签只影响告警与规则摘要里的可读性，不参与判定。
+		// 一组里同时有 frp 条目和自定义条目时（自定义那份端口恰好等于受保护端口，
+		// 于是两者合成一组）优先显示"仅 frp 端口"——按端口集合分组本来就是有意的，
+		// 两种来源在这里本来就是同一件事。
+		g.Label = customGroupLabel(k)
+		if usedByFrp[k] {
+			g.Label = frpGroupLabel
+		}
+		for p := range members[k] {
+			g.Prefixes = append(g.Prefixes, p.String())
+		}
+		sort.Strings(g.Prefixes)
+		portGroups = append(portGroups, *g)
+	}
+
+	blackAll := make([]string, 0, len(fullPort))
+	for p := range fullPort {
+		blackAll = append(blackAll, p.String())
+	}
 	sort.Strings(blackAll)
-	sort.Strings(blackFrp)
 
 	white := make([]string, 0, len(m.white))
 	for _, p := range m.white {
 		white = append(white, p.String())
 	}
 
-	des := firewall.Desired{
-		Blacklist:    blackAll,
-		BlacklistFrp: blackFrp,
-		Whitelist:    white,
-		ProtectPorts: m.protectPortsLocked(),
-		RateLimits:   m.rateLimitsLocked(),
+	return firewall.Desired{
+		Blacklist:      blackAll,
+		PortBlacklists: portGroups,
+		Whitelist:      white,
+		RateLimits:     m.rateLimitsLocked(),
 	}
-	return des
 }
 
-// protectPortsLocked 返回速率限制与保护规则作用的端口集合。
-// 只保护 frp 相关端口，不做全线保护，避免误伤其它服务。
+// protectPortsLocked 返回受保护端口：frp 相关端口，全局限速与「仅 frp 端口」
+// 的黑名单都作用于此。不做全线保护，避免误伤其它服务。
 //
 // 用 Merge 而不是逐个 append：bindPort 常常就落在代理端口区间里面
 // （例如 bindPort 7000、allowPorts 20000-30000 之外的 7000-7100），
@@ -456,7 +589,28 @@ func (m *Manager) protectPortsLocked() portrange.Set {
 	if m.cfg.Frps.BindPort > 0 {
 		bind = portrange.Ports(m.cfg.Frps.BindPort)
 	}
-	return bind.Merge(m.cfg.Frps.ProxyPorts)
+	return bind.Merge(m.frpsProxyPorts)
+}
+
+// FrpsPorts 返回当前生效的 frp 端口，供面板展示"受保护端口"这一栏。
+//
+// 返回的是运行期生效值，不是 m.cfg 里那份启动快照 —— 代理端口可以热改，
+// 面板必须显示真正正在生效的东西，否则改完还要怀疑自己是不是记错了。
+func (m *Manager) FrpsPorts() (bindPort int, proxyPorts, protect portrange.Set) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg.Frps.BindPort, m.frpsProxyPorts, m.protectPortsLocked()
+}
+
+// SetFrpsProxyPorts 热更新 frp 代理端口，并立即重新对齐内核规则。
+//
+// 只改内存里这一份，不碰数据库：落库由接口层负责。分成两步是因为"改配置"和
+// "让配置生效"是两件事 —— 落库失败的话不该已经动过内核规则。
+func (m *Manager) SetFrpsProxyPorts(ports portrange.Set) {
+	m.mu.Lock()
+	m.frpsProxyPorts = ports.Normalize()
+	m.mu.Unlock()
+	m.scheduleApply()
 }
 
 // Preview 生成将要下发的规则文本。
@@ -538,6 +692,7 @@ func (m *Manager) Bans() []BanView {
 		v := BanView{
 			Target:    b.Target,
 			Scope:     scope,
+			Ports:     b.Ports.String(),
 			Reason:    b.Reason,
 			Source:    b.Source,
 			User:      b.User,
@@ -879,18 +1034,29 @@ func (m *Manager) matchAnyBlockLocked(list []blockTarget, addr netip.Addr) bool 
 
 // blockScopeLocked 返回地址命中的黑名单范围，未命中返回空串。调用方需持有锁。
 //
-// 命中多条时取最严格的那条（all 优先）。排障时要回答的是"这个地址实际被挡得
-// 有多死"，而不是"它命中了哪几条"；把范围最宽的那条报出来才不误导。
+// 命中多条时取覆盖最宽的那类：all > frp > custom。排障时要回答的是"这个地址
+// 实际被挡得有多死"，而不是"它命中了哪几条"。
+//
+// frp 排在 custom 前面是因为覆盖面：frp 那一组是 bindPort 加整段代理端口，
+// 通常比用户为单条条目随手填的几个端口宽；而 all 永远是最宽的那个，见到就返回。
+// 三种范围之间没有真正的包含关系（这是排序而不是包含判断），所以这里只是一个
+// 约定 —— 唯一的要求是稳定，别让同一种冲突有时报 frp、有时报 custom。
 func (m *Manager) blockScopeLocked(list []blockTarget, addr netip.Addr) string {
 	scope := ""
 	for _, b := range list {
 		if !b.Prefix.Contains(addr) {
 			continue
 		}
-		if b.Scope != model.ScopeFrp {
+		switch b.Scope {
+		case model.ScopeAll:
 			return model.ScopeAll
+		case model.ScopeFrp:
+			scope = model.ScopeFrp
+		case model.ScopeCustom:
+			if scope == "" {
+				scope = model.ScopeCustom
+			}
 		}
-		scope = model.ScopeFrp
 	}
 	return scope
 }

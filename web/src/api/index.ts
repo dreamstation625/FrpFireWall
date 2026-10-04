@@ -144,6 +144,11 @@ export const api = {
   frpsSnippet: () => http.get('/frps/snippet'),
   frpsHealth: () => http.get('/frps/health'),
   frpsConfig: () => http.get('/frps/config'),
+  // 受保护端口（bind_port ∪ proxy_ports）。写接口只改代理端口那一半，
+  // 保存后后端立即重算内核规则，不需要重启 —— 与 PUT /config 的区别只在生效时机。
+  frpsProtectPorts: () => http.get('/frps/protect-ports'),
+  updateFrpsProtectPorts: (body: Record<string, unknown>) =>
+    http.put('/frps/protect-ports', body),
 }
 
 export default api

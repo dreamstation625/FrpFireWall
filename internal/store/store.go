@@ -292,11 +292,15 @@ func (s *Store) CreateACL(e *model.ACLEntry) error {
 	return s.db.Create(e).Error
 }
 
-// UpsertACL 已存在同 (kind,target) 时更新备注、范围与到期时间，不报错。
+// UpsertACL 已存在同 (kind,target) 时更新范围、端口、备注与到期时间，不报错。
 func (s *Store) UpsertACL(e *model.ACLEntry) error {
 	return s.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "kind"}, {Name: "target"}},
-		DoUpdates: clause.AssignmentColumns([]string{"scope", "remark", "expires_at", "updated_at", "country", "province"}),
+		Columns: []clause.Column{{Name: "kind"}, {Name: "target"}},
+		// ports 必须在内：命中冲突时它是"这次改动的本体"，漏掉它的表现是
+		// 重新添加同一个地址后端口没变，而接口返回的却是新值 —— 界面刷新一下
+		// 就变回旧的，中间完全看不出是哪一步丢了。
+		DoUpdates: clause.AssignmentColumns(
+			[]string{"scope", "ports", "remark", "expires_at", "updated_at", "country", "province"}),
 	}).Create(e).Error
 }
 
@@ -312,6 +316,7 @@ func (s *Store) UpdateACL(e *model.ACLEntry) error {
 	return s.db.Model(&model.ACLEntry{}).Where("id = ?", e.ID).
 		Updates(map[string]any{
 			"scope":      e.Scope,
+			"ports":      e.Ports,
 			"remark":     e.Remark,
 			"expires_at": e.ExpiresAt,
 			"updated_at": time.Now(),

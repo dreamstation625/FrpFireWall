@@ -7,15 +7,22 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
-// 「仅 frp 端口」在 iptables 侧落成一个独立子链，规则必须带端口条件。
+// portGroup 构造一个已按地址族筛过的分组，省得每个用例都写一遍结构体。
+// Key 用端口文本，与 guard 侧的分组口径一致。
+func portGroup(addrs []string, ports portrange.Set) []iptPortGroup {
+	return []iptPortGroup{{Key: ports.String(), Addrs: addrs, Ports: ports}}
+}
+
+// 「仅在指定端口上封禁」在 iptables 侧落成一个独立子链，规则必须带端口条件。
 //
 // 这类错误不会报错、不会告警，只会静默少挡一部分流量，所以只能断言生成的规则。
-func TestFrpBlockRules(t *testing.T) {
+// 「仅 frp 端口」与「自定义端口」走的是同一段渲染逻辑，这里用前者做主力用例。
+func TestPortBlockRules(t *testing.T) {
 	t.Run("tcp 与 udp 各一条，端口去重后升序", func(t *testing.T) {
-		got := frpBlockRules([]string{"198.51.100.9"}, portrange.Ports(7100, 7000, 7000))
+		got := portBlockRules(portGroup([]string{"198.51.100.9"}, portrange.Ports(7100, 7000, 7000)))
 		want := []string{
-			"-A " + managedBlackFrpChain + " -s 198.51.100.9 -p tcp -m multiport --dports 7000,7100 -j DROP",
-			"-A " + managedBlackFrpChain + " -s 198.51.100.9 -p udp -m multiport --dports 7000,7100 -j DROP",
+			"-A " + managedPortBlackChain + " -s 198.51.100.9 -p tcp -m multiport --dports 7000,7100 -j DROP",
+			"-A " + managedPortBlackChain + " -s 198.51.100.9 -p udp -m multiport --dports 7000,7100 -j DROP",
 		}
 		if len(got) != len(want) {
 			t.Fatalf("规则数 %d，期望 %d：%v", len(got), len(want), got)
@@ -30,12 +37,12 @@ func TestFrpBlockRules(t *testing.T) {
 	// 区间写法是这一版的核心：一个宽区间必须仍然只生成一条规则。
 	// 如果哪天有人把它"顺手展开成一个个端口"，这条断言会立刻炸。
 	t.Run("区间写成 lo:hi，只占一条规则", func(t *testing.T) {
-		got := frpBlockRules([]string{"198.51.100.9"}, portrange.Span(20000, 30000))
+		got := portBlockRules(portGroup([]string{"198.51.100.9"}, portrange.Span(20000, 30000)))
 		if len(got) != 2 {
 			t.Fatalf("一个区间应生成 tcp/udp 各一条，实际 %d 条：%v", len(got), got)
 		}
 		for i, proto := range []string{"tcp", "udp"} {
-			want := "-A " + managedBlackFrpChain + " -s 198.51.100.9 -p " + proto +
+			want := "-A " + managedPortBlackChain + " -s 198.51.100.9 -p " + proto +
 				" -m multiport --dports 20000:30000 -j DROP"
 			if line := strings.Join(got[i], " "); line != want {
 				t.Errorf("实际: %s\n期望: %s", line, want)
@@ -48,7 +55,7 @@ func TestFrpBlockRules(t *testing.T) {
 		for p := 7000; p < 7020; p++ {
 			ports = append(ports, p)
 		}
-		got := frpBlockRules([]string{"198.51.100.9"}, portrange.Ports(ports...))
+		got := portBlockRules(portGroup([]string{"198.51.100.9"}, portrange.Ports(ports...)))
 
 		// 20 个连续端口归一化成一段 → tcp/udp 各一条，而不是 4 条。
 		if len(got) != 2 {
@@ -64,7 +71,7 @@ func TestFrpBlockRules(t *testing.T) {
 		for p := 7000; p < 7040; p += 2 { // 间隔取，避免被合并
 			ports = append(ports, p)
 		}
-		got := frpBlockRules([]string{"198.51.100.9"}, portrange.Ports(ports...))
+		got := portBlockRules(portGroup([]string{"198.51.100.9"}, portrange.Ports(ports...)))
 
 		// 20 段 → 2 块 × 2 种协议 = 4 条
 		if len(got) != 4 {
@@ -84,7 +91,7 @@ func TestFrpBlockRules(t *testing.T) {
 			base := 1000 + i*1000
 			set = set.Merge(portrange.Span(base, base+499))
 		}
-		got := frpBlockRules([]string{"198.51.100.9"}, set)
+		got := portBlockRules(portGroup([]string{"198.51.100.9"}, set))
 
 		if len(got) != 4 { // 2 块 × 2 协议
 			t.Fatalf("规则数 %d，期望 4：%v", len(got), got)
@@ -97,11 +104,40 @@ func TestFrpBlockRules(t *testing.T) {
 	})
 
 	t.Run("没有端口时不生成任何规则", func(t *testing.T) {
-		if got := frpBlockRules([]string{"198.51.100.9"}, nil); len(got) != 0 {
+		if got := portBlockRules(portGroup([]string{"198.51.100.9"}, nil)); len(got) != 0 {
 			t.Errorf("没有端口却生成了 %d 条规则：%v", len(got), got)
 		}
-		if got := frpBlockRules(nil, portrange.Ports(7000)); len(got) != 0 {
+		if got := portBlockRules(portGroup(nil, portrange.Ports(7000))); len(got) != 0 {
 			t.Errorf("没有地址却生成了 %d 条规则：%v", len(got), got)
+		}
+	})
+
+	// 两组不同端口各自成套，不能互相串门：A 组的地址只该出现在 A 组的端口上。
+	// 串了的表现是"某个地址在它没被配到的那组端口上也被封了"，而两组规则长得
+	// 一模一样，光看规则本身看不出来。
+	t.Run("多个端口分组各封各的端口", func(t *testing.T) {
+		groups := []iptPortGroup{
+			{Key: "7000", Label: "仅 frp 端口", Addrs: []string{"198.51.100.9"}, Ports: portrange.Ports(7000)},
+			{Key: "8080", Label: "自定义端口 8080", Addrs: []string{"203.0.113.7"}, Ports: portrange.Ports(8080)},
+		}
+		got := portBlockRules(groups)
+		if len(got) != 4 { // 2 组 × 2 协议
+			t.Fatalf("规则数 %d，期望 4：%v", len(got), got)
+		}
+		for _, args := range got {
+			line := strings.Join(args, " ")
+			switch dportsOf(t, args) {
+			case "7000":
+				if !strings.Contains(line, "-s 198.51.100.9 ") {
+					t.Errorf("7000 端口那一组的来源地址串了：%s", line)
+				}
+			case "8080":
+				if !strings.Contains(line, "-s 203.0.113.7 ") {
+					t.Errorf("8080 端口那一组的来源地址串了：%s", line)
+				}
+			default:
+				t.Errorf("出现了没配过的端口：%s", line)
+			}
 		}
 	})
 }
@@ -118,12 +154,14 @@ func dportsOf(t *testing.T, args []string) string {
 	return ""
 }
 
-// 主链的顺序即优先级：全端口封禁排在仅 frp 端口之前，RETURN 必须留在最后。
+// 主链的顺序即优先级：全端口封禁排在端口限定之前，RETURN 必须留在最后。
 func TestBuildIPTablesRulesOrder(t *testing.T) {
 	rules := buildIPTablesRules(Desired{
-		Blacklist:    []string{"203.0.113.7"},
-		BlacklistFrp: []string{"198.51.100.9"},
-		ProtectPorts: portrange.Ports(7000),
+		Blacklist: []string{"203.0.113.7"},
+		PortBlacklists: []PortBlacklist{{
+			Key: "7000", Label: "仅 frp 端口",
+			Prefixes: []string{"198.51.100.9"}, Ports: portrange.Ports(7000),
+		}},
 	}, 32)
 
 	seq := make([]string, 0, len(rules.Guard))
@@ -149,7 +187,7 @@ func TestBuildIPTablesRulesOrder(t *testing.T) {
 			switch fields[j+1] {
 			case managedBlackChain:
 				allIdx = i
-			case managedBlackFrpChain:
+			case managedPortBlackChain:
 				frpIdx = i
 			}
 		}
@@ -172,8 +210,7 @@ func TestBuildIPTablesRulesOrder(t *testing.T) {
 // 或者黑名单写失败却被当成可忽略。
 func TestBuildIPTablesRulesRateLimitIsSoft(t *testing.T) {
 	withRate := buildIPTablesRules(Desired{
-		ProtectPorts: portrange.Ports(7000),
-		RateLimits:   []RateLimitRule{{Key: "global", PerSec: 20, Ports: portrange.Ports(7000)}},
+		RateLimits: []RateLimitRule{{Key: "global", PerSec: 20, Ports: portrange.Ports(7000)}},
 	}, 32)
 
 	soft, hard := 0, 0
@@ -187,7 +224,7 @@ func TestBuildIPTablesRulesRateLimitIsSoft(t *testing.T) {
 	if soft != 1 {
 		t.Errorf("应当恰好有一条可降级的限速规则，实际 %d 条", soft)
 	}
-	if hard != 3 { // 跳转全端口 + 跳转 frp + RETURN
+	if hard != 3 { // 跳转全端口 + 跳转端口限定 + RETURN
 		t.Errorf("固定规则应为 3 条，实际 %d 条", hard)
 	}
 
@@ -199,21 +236,33 @@ func TestBuildIPTablesRulesRateLimitIsSoft(t *testing.T) {
 	}
 }
 
-// frp 端口取自 ProtectPorts，进规则前必须归一化：非法端口会让整条 iptables
-// 命令被拒绝，重复端口则是纯粹的噪音。
+// 分组里的端口进规则前必须归一化：非法端口会让整条 iptables 命令被拒绝，
+// 重复端口则是纯粹的噪音。
 func TestBuildIPTablesRulesNormalizesPorts(t *testing.T) {
 	// 走构造函数：越界值被丢掉、重复被去掉、升序。
-	rules := buildIPTablesRules(Desired{ProtectPorts: portrange.Ports(0, -1, 7000, 7000, 70001, 7100)}, 32)
-	if got := rules.FrpPorts.String(); got != "7000,7100" {
+	rules := buildIPTablesRules(Desired{PortBlacklists: []PortBlacklist{
+		{Key: "x", Prefixes: []string{"198.51.100.9"}, Ports: portrange.Ports(0, -1, 7000, 7000, 70001, 7100)},
+	}}, 32)
+	if got := rules.PortGroups[0].Ports.String(); got != "7000,7100" {
 		t.Errorf("端口归一化结果 %q，期望 7000,7100", got)
 	}
 
 	// 直接手写 Set 字面量的调用方不经过构造函数，驱动入口要兜住。
-	raw := buildIPTablesRules(Desired{ProtectPorts: portrange.Set{
-		{Lo: 7100, Hi: 7100}, {Lo: 7000, Hi: 7000}, {Lo: 7000, Hi: 7000},
+	raw := buildIPTablesRules(Desired{PortBlacklists: []PortBlacklist{
+		{Key: "x", Prefixes: []string{"198.51.100.9"}, Ports: portrange.Set{
+			{Lo: 7100, Hi: 7100}, {Lo: 7000, Hi: 7000}, {Lo: 7000, Hi: 7000},
+		}},
 	}}, 32)
-	if got := raw.FrpPorts.String(); got != "7000,7100" {
+	if got := raw.PortGroups[0].Ports.String(); got != "7000,7100" {
 		t.Errorf("驱动入口未归一化手写字面量，得到 %q", got)
+	}
+
+	// 端口全越界 → 归一化后为空 → 整组丢掉，不留一条匹配不到端口的规则。
+	empty := buildIPTablesRules(Desired{PortBlacklists: []PortBlacklist{
+		{Key: "x", Prefixes: []string{"198.51.100.9"}, Ports: portrange.Set{{Lo: 0, Hi: 0}}},
+	}}, 32)
+	if len(empty.PortGroups) != 0 {
+		t.Errorf("端口归一化后为空的分组应当被丢掉，实际留下 %d 组", len(empty.PortGroups))
 	}
 }
 
@@ -401,9 +450,11 @@ func TestIPTablesPreviewMatchesBuild(t *testing.T) {
 		fams:   []ipFamily{{name: "ipv4", bin: "iptables", bits: 32}},
 	}
 	des := Desired{
-		Blacklist:    []string{"203.0.113.7"},
-		BlacklistFrp: []string{"198.51.100.9"},
-		ProtectPorts: portrange.Ports(7000, 7100),
+		Blacklist: []string{"203.0.113.7"},
+		PortBlacklists: []PortBlacklist{{
+			Key: "7000,7100", Label: "仅 frp 端口",
+			Prefixes: []string{"198.51.100.9"}, Ports: portrange.Ports(7000, 7100),
+		}},
 	}
 
 	got, err := d.Preview(des)
@@ -414,10 +465,10 @@ func TestIPTablesPreviewMatchesBuild(t *testing.T) {
 		// 带换行收尾：否则 "-j FRPFIREWALL_BLACK" 会匹配上 "-j FRPFIREWALL_BLACK_FRP"
 		// 那一行，跳转没写出来也算通过。
 		"-A " + ManagedChain + " -j " + managedBlackChain + "\n",
-		"-A " + ManagedChain + " -j " + managedBlackFrpChain + "\n",
+		"-A " + ManagedChain + " -j " + managedPortBlackChain + "\n",
 		"-A " + managedBlackChain + " -s 203.0.113.7/32 -j DROP",
-		"-A " + managedBlackFrpChain + " -s 198.51.100.9/32 -p tcp -m multiport --dports 7000,7100 -j DROP",
-		"-A " + managedBlackFrpChain + " -s 198.51.100.9/32 -p udp -m multiport --dports 7000,7100 -j DROP",
+		"-A " + managedPortBlackChain + " -s 198.51.100.9/32 -p tcp -m multiport --dports 7000,7100 -j DROP",
+		"-A " + managedPortBlackChain + " -s 198.51.100.9/32 -p udp -m multiport --dports 7000,7100 -j DROP",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("预览缺少 %q\n--- 预览 ---\n%s", want, got)
@@ -433,8 +484,10 @@ func TestIPTablesPreviewRendersRange(t *testing.T) {
 	}
 
 	got, err := d.Preview(Desired{
-		BlacklistFrp: []string{"198.51.100.9"},
-		ProtectPorts: portrange.Span(20000, 30000),
+		PortBlacklists: []PortBlacklist{{
+			Key: "20000-30000", Label: "仅 frp 端口",
+			Prefixes: []string{"198.51.100.9"}, Ports: portrange.Span(20000, 30000),
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -448,7 +501,7 @@ func TestIPTablesPreviewRendersRange(t *testing.T) {
 	}
 }
 
-// 没配 frp 端口时下不出"仅 frp 端口"的规则。预览要把这件事说出来 ——
+// 分组没配端口时下不出规则。预览要把这件事说出来 ——
 // 否则用户看到地址列在黑名单里，会以为已经生效了。
 func TestIPTablesPreviewWarnsWhenNoPorts(t *testing.T) {
 	d := &iptablesDriver{
@@ -456,7 +509,9 @@ func TestIPTablesPreviewWarnsWhenNoPorts(t *testing.T) {
 		fams:   []ipFamily{{name: "ipv4", bin: "iptables", bits: 32}},
 	}
 
-	got, err := d.Preview(Desired{BlacklistFrp: []string{"198.51.100.9"}})
+	got, err := d.Preview(Desired{PortBlacklists: []PortBlacklist{{
+		Key: "", Label: "仅 frp 端口", Prefixes: []string{"198.51.100.9"},
+	}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +521,7 @@ func TestIPTablesPreviewWarnsWhenNoPorts(t *testing.T) {
 	if !strings.Contains(got, "198.51.100.9") {
 		t.Errorf("预览没有列出受影响的地址\n%s", got)
 	}
-	if strings.Contains(got, "-A "+managedBlackFrpChain+" -s") {
+	if strings.Contains(got, "-A "+managedPortBlackChain+" -s") {
 		t.Errorf("没有端口却生成了带端口的规则\n%s", got)
 	}
 }
@@ -490,7 +545,7 @@ func TestWideRangeDoesNotExplodeRuleCount(t *testing.T) {
 	wide := portrange.Span(20000, 30000)
 	addrs := []string{"198.51.100.1", "198.51.100.2"}
 
-	got := frpBlockRules(addrs, wide)
+	got := portBlockRules(portGroup(addrs, wide))
 	if len(got) != 4 { // 2 个地址 × 2 种协议
 		t.Fatalf("宽区间生成了 %d 条规则，期望 4：%v", len(got), got)
 	}

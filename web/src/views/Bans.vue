@@ -48,11 +48,17 @@
         </el-table-column>
         <el-table-column label="范围" width="118">
           <template #default="{ row }">
-            <el-tooltip :content="scopeTip(row.scope)" placement="top">
-              <el-tag size="small" :type="row.scope === 'frp' ? 'info' : 'warning'">
+            <el-tooltip :content="scopeTip(row.scope, row.ports)" placement="top">
+              <el-tag size="small" :type="scopeTagType(row.scope)">
                 {{ scopeLabel(row.scope) }}
               </el-tag>
             </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="封禁端口" min-width="120">
+          <template #default="{ row }">
+            <span v-if="row.scope === 'custom' && row.ports" class="mono">{{ row.ports }}</span>
+            <span v-else class="hint">—</span>
           </template>
         </el-table-column>
         <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
@@ -122,11 +128,17 @@
         </el-table-column>
         <el-table-column label="范围" width="118">
           <template #default="{ row }">
-            <el-tooltip :content="scopeTip(row.scope)" placement="top">
-              <el-tag size="small" :type="row.scope === 'frp' ? 'info' : 'warning'">
+            <el-tooltip :content="scopeTip(row.scope, row.ports)" placement="top">
+              <el-tag size="small" :type="scopeTagType(row.scope)">
                 {{ scopeLabel(row.scope) }}
               </el-tag>
             </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="封禁端口" min-width="120">
+          <template #default="{ row }">
+            <span v-if="row.scope === 'custom' && row.ports" class="mono">{{ row.ports }}</span>
+            <span v-else class="hint">—</span>
           </template>
         </el-table-column>
         <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
@@ -176,12 +188,12 @@
               {{ o.label }}
             </el-radio-button>
           </el-radio-group>
+          <div class="hint" style="margin-top: 6px">{{ scopeFormHint(banForm.scope) }}</div>
+        </el-form-item>
+        <el-form-item v-if="banForm.scope === 'custom'" label="封禁端口">
+          <el-input v-model="banForm.ports" placeholder="8080,9000-9100" />
           <div class="hint" style="margin-top: 6px">
-            {{
-              banForm.scope === 'frp'
-                ? '只拒绝该地址访问 frp 服务端口，本机其它端口不受影响。'
-                : '拒绝该地址访问本机的全部端口，含 SSH 与管理面板。确认不会误伤再选。'
-            }}
+            只影响内核层封哪些端口；frp 接入侧的拒绝仍按该地址整体生效。
           </div>
         </el-form-item>
         <el-form-item label="时长">
@@ -209,7 +221,7 @@
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
-import { SCOPE_OPTIONS, scopeLabel, scopeTip } from '@/utils/scope'
+import { SCOPE_OPTIONS, scopeFormHint, scopeLabel, scopeTagType, scopeTip } from '@/utils/scope'
 
 const active = ref<any[]>([])
 const history = ref<any[]>([])
@@ -225,7 +237,7 @@ const now = ref(Date.now())
 
 const banVisible = ref(false)
 const banning = ref(false)
-const banForm = reactive({ target: '', reason: '', duration: 0, scope: 'all' })
+const banForm = reactive({ target: '', reason: '', duration: 0, scope: 'all', ports: '' })
 
 let timer: number | undefined
 
@@ -316,13 +328,19 @@ async function batchUnban() {
 }
 
 function openBan() {
-  Object.assign(banForm, { target: '', reason: '', duration: 0, scope: 'all' })
+  Object.assign(banForm, { target: '', reason: '', duration: 0, scope: 'all', ports: '' })
   banVisible.value = true
 }
 
 async function submitBan() {
   if (!banForm.target) {
     ElMessage.warning('请填写地址')
+    return
+  }
+  // 自定义范围没有端口就等于"封了等于没封"：内核规则一条都生成不出来，
+  // 而列表里它会正常显示成一条生效中的封禁。后端也会拒绝，这里先拦一道省一次往返。
+  if (banForm.scope === 'custom' && !banForm.ports.trim()) {
+    ElMessage.warning('自定义范围需要至少一个端口')
     return
   }
   banning.value = true
@@ -332,6 +350,9 @@ async function submitBan() {
       reason: banForm.reason,
       duration_sec: banForm.duration,
       scope: banForm.scope,
+      // 非自定义范围传空串而不是省略字段：库里残留一份不参与生效的端口，
+      // 是"配置里写着、实际不生效"那类最难排查的问题。
+      ports: banForm.scope === 'custom' ? banForm.ports.trim() : '',
     })
     ElMessage.success('已封禁')
     banVisible.value = false

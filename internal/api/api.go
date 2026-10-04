@@ -189,6 +189,10 @@ func (s *Server) Routes() http.Handler {
 		auth.GET("/frps/snippet", s.handleFrpsSnippet)
 		auth.GET("/frps/health", s.handleFrpsHealth)
 		auth.GET("/frps/config", s.handleFrpsConfig)
+		// 受保护端口（bind_port ∪ 代理端口）。写接口只改代理端口那一半，
+		// 保存后立即重算内核规则，不需要重启。
+		auth.GET("/frps/protect-ports", s.handleGetFrpsProtectPorts)
+		auth.PUT("/frps/protect-ports", s.handleUpdateFrpsProtectPorts)
 	}
 
 	s.mountWeb(r)

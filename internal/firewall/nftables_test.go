@@ -324,19 +324,28 @@ func TestHalfStackWarning(t *testing.T) {
 	}
 }
 
-// 这一组锁死「仅 frp 端口」这条范围的产物。
+// 这一组锁死「端口限定」这条范围的产物。
 //
 // 它的失效方式很安静：规则少一条、或者端口漏一个，内核不会报任何错，界面上照样
 // 显示"已封禁"，只有真去连那个端口才发现没挡住。桩命令同样测不出来（桩不解析
 // 语法，只会点头），所以只能断言脚本文本。
-func TestRenderScriptFrpScope(t *testing.T) {
+//
+// 集合名现在由端口签名派生，所以断言里一律用 portSetName 现算，不把哈希写死：
+// 换派生算法不该让一组功能用例跟着变红，那只会让人学会"顺手改断言"。
+func TestRenderScriptPortScope(t *testing.T) {
 	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
 	ip4 := nftTarget{Family: "ip", Table: "filter", Chain: "INPUT"}
 
+	ports := portrange.Ports(7100, 7000, 7000) // 故意乱序并重复
+	key := ports.String()                      // "7000,7100"
+	set4, set6 := portSetName(32, key), portSetName(128, key)
+
 	des := Desired{
-		Blacklist:    []string{"203.0.113.7"},
-		BlacklistFrp: []string{"198.51.100.9", "2001:db8::5"},
-		ProtectPorts: portrange.Ports(7100, 7000, 7000), // 故意乱序并重复
+		Blacklist: []string{"203.0.113.7"},
+		PortBlacklists: []PortBlacklist{{
+			Key: key, Label: "仅 frp 端口",
+			Prefixes: []string{"198.51.100.9", "2001:db8::5"}, Ports: ports,
+		}},
 	}
 
 	t.Run("inet 双栈：每个协议栈各有 tcp 与 udp", func(t *testing.T) {
@@ -344,12 +353,12 @@ func TestRenderScriptFrpScope(t *testing.T) {
 		got := renderScript(stacks, des, nil, nil)
 
 		for _, want := range []string{
-			"add element inet filter frpfirewall_black_frp { 198.51.100.9/32 }",
-			"add element inet filter frpfirewall_black6_frp { 2001:db8::5/128 }",
+			"add element inet filter " + set4 + " { 198.51.100.9/32 }",
+			"add element inet filter " + set6 + " { 2001:db8::5/128 }",
 			// 端口归一化后升序；TCP 与 UDP 都要有，只封 TCP 会留下 UDP 绕过路径
-			"tcp dport { 7000, 7100 } ip saddr @frpfirewall_black_frp drop",
-			"udp dport { 7000, 7100 } ip saddr @frpfirewall_black_frp drop",
-			"tcp dport { 7000, 7100 } ip6 saddr @frpfirewall_black6_frp drop",
+			"tcp dport { 7000, 7100 } ip saddr @" + set4 + " drop",
+			"udp dport { 7000, 7100 } ip saddr @" + set4 + " drop",
+			"tcp dport { 7000, 7100 } ip6 saddr @" + set6 + " drop",
 			// 全端口那部分不受影响
 			"insert rule inet filter input ip saddr @frpfirewall_black drop",
 		} {
@@ -363,12 +372,15 @@ func TestRenderScriptFrpScope(t *testing.T) {
 	// 而不是一万个元素。哪天有人把它"顺手展开"，这条断言会立刻炸。
 	t.Run("区间写进集合字面量，不展开成逐个端口", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}}
+		wide := portrange.Span(20000, 30000).Merge(portrange.Ports(880, 8443))
 		got := renderScript(stacks, Desired{
-			BlacklistFrp: []string{"198.51.100.9"},
-			ProtectPorts: portrange.Span(20000, 30000).Merge(portrange.Ports(880, 8443)),
+			PortBlacklists: []PortBlacklist{{
+				Key: wide.String(), Label: "仅 frp 端口",
+				Prefixes: []string{"198.51.100.9"}, Ports: wide,
+			}},
 		}, nil, nil)
 
-		want := "tcp dport { 880, 8443, 20000-30000 } ip saddr @frpfirewall_black_frp drop"
+		want := "tcp dport { 880, 8443, 20000-30000 } ip saddr @" + portSetName(32, wide.String()) + " drop"
 		if !strings.Contains(got, want) {
 			t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
 		}
@@ -382,35 +394,74 @@ func TestRenderScriptFrpScope(t *testing.T) {
 		}
 	})
 
-	t.Run("集合始终 flush，避免改范围后残留", func(t *testing.T) {
+	// 分组还在、只是地址变少了（条目被删或被改走）时，必须先把集合清空再填。
+	// 少了这一步，旧地址会一直留在集合里继续被封着 —— 而界面上它已经被删了。
+	t.Run("分组存在时集合先 flush 再填", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}}
-		got := renderScript(stacks, Desired{}, nil, nil)
-		if !strings.Contains(got, "flush set inet filter frpfirewall_black_frp") {
-			t.Errorf("frp 集合没有被 flush：地址从该范围移走后元素会残留，那个端口会一直被挡着\n%s", got)
+		got := renderScript(stacks, des, nil, nil)
+		if !strings.Contains(got, "flush set inet filter "+set4) {
+			t.Errorf("端口限定集合没有被 flush：改范围后元素会残留\n%s", got)
+		}
+		// 全端口集合同样要 flush，哪怕这次是空的。
+		if !strings.Contains(got, "flush set inet filter "+setBlack) {
+			t.Errorf("全端口集合没有被 flush\n%s", got)
 		}
 	})
 
-	t.Run("没配 frp 端口时不生成引用集合的规则", func(t *testing.T) {
+	t.Run("没有端口时不生成引用集合的规则", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}}
-		got := renderScript(stacks, Desired{BlacklistFrp: []string{"198.51.100.9"}}, nil, nil)
+		got := renderScript(stacks, Desired{PortBlacklists: []PortBlacklist{{
+			Key: "", Label: "仅 frp 端口", Prefixes: []string{"198.51.100.9"},
+		}}}, nil, nil)
 
 		if strings.Contains(got, "dport") {
 			t.Errorf("没有端口却生成了带 dport 的规则\n%s", got)
 		}
-		if strings.Contains(got, "@"+setBlackFrp+" drop") {
-			t.Errorf("没有端口却生成了引用 frp 集合的规则，等于静默不生效\n%s", got)
+		if strings.Contains(got, "@"+setPortPrefix) {
+			t.Errorf("没有端口却生成了引用端口集合的规则，等于静默不生效\n%s", got)
+		}
+	})
+
+	// 一组端口一个集合，地址不能串：串了的表现是"某个地址在它没被配到的那组
+	// 端口上也被封了"，而两组规则长得一模一样，光看规则本身看不出来。
+	t.Run("多个端口分组各用各的集合", func(t *testing.T) {
+		stacks := []nftStack{{target: inet, bits: 32}}
+		frp := portrange.Ports(7000)
+		custom := portrange.Ports(8080)
+		got := renderScript(stacks, Desired{PortBlacklists: []PortBlacklist{
+			{Key: frp.String(), Label: "仅 frp 端口", Prefixes: []string{"198.51.100.9"}, Ports: frp},
+			{Key: custom.String(), Label: "自定义端口 8080", Prefixes: []string{"203.0.113.7"}, Ports: custom},
+		}}, nil, nil)
+
+		for _, want := range []string{
+			"add element inet filter " + portSetName(32, "7000") + " { 198.51.100.9/32 }",
+			"add element inet filter " + portSetName(32, "8080") + " { 203.0.113.7/32 }",
+			"tcp dport { 7000 } ip saddr @" + portSetName(32, "7000") + " drop",
+			"tcp dport { 8080 } ip saddr @" + portSetName(32, "8080") + " drop",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
+			}
+		}
+		// 两个分组必须落到两个不同的集合名上，否则 A 组的地址会在 B 组的端口上被封。
+		if portSetName(32, "7000") == portSetName(32, "8080") {
+			t.Error("不同端口集合派生出同一个集合名，地址会串组")
 		}
 	})
 
 	t.Run("某协议栈没有该类地址就不为它插规则", func(t *testing.T) {
 		stacks := []nftStack{{target: inet, bits: 32}, {target: inet, bits: 128}}
-		onlyV4 := Desired{BlacklistFrp: []string{"198.51.100.9"}, ProtectPorts: portrange.Ports(7000)}
+		onlyV4 := Desired{PortBlacklists: []PortBlacklist{{
+			Key: "7000", Label: "仅 frp 端口",
+			Prefixes: []string{"198.51.100.9"}, Ports: portrange.Ports(7000),
+		}}}
 		got := renderScript(stacks, onlyV4, nil, nil)
 
-		if !strings.Contains(got, "ip saddr @"+setBlackFrp+" drop") {
-			t.Errorf("IPv4 落点上缺少 frp 规则\n%s", got)
+		v4, v6 := portSetName(32, "7000"), portSetName(128, "7000")
+		if !strings.Contains(got, "ip saddr @"+v4+" drop") {
+			t.Errorf("IPv4 落点上缺少端口限定规则\n%s", got)
 		}
-		if strings.Contains(got, "ip6 saddr @"+setBlack6Frp+" drop") {
+		if strings.Contains(got, "ip6 saddr @"+v6+" drop") {
 			t.Errorf("IPv6 下没有任何该类地址，不该为它生成规则\n%s", got)
 		}
 	})
@@ -424,35 +475,37 @@ func TestRenderScriptFrpScope(t *testing.T) {
 	})
 }
 
-// 链上的实际顺序：全端口封禁在前，仅 frp 端口的在后。
+// 链上的实际顺序：全端口封禁在前，端口限定的在后。
 //
 // insert 一律插到链首，所以脚本文本里的先后与链上的顺序**相反** —— 脚本末尾那条
 // 插入后位置最靠前。要验证真实顺序就得把 insert 序列倒过来读；直接拿脚本顺序
 // 断言会得出完全相反的结论。
-func TestRenderScriptFrpRulesComeAfterAllPortRules(t *testing.T) {
+func TestRenderScriptPortRulesComeAfterAllPortRules(t *testing.T) {
 	inet := nftTarget{Family: "inet", Table: "filter", Chain: "input"}
 	stacks := []nftStack{{target: inet, bits: 32}}
 
 	got := renderScript(stacks, Desired{
-		Blacklist:    []string{"203.0.113.7"},
-		BlacklistFrp: []string{"198.51.100.9"},
-		ProtectPorts: portrange.Ports(7000),
+		Blacklist: []string{"203.0.113.7"},
+		PortBlacklists: []PortBlacklist{{
+			Key: "7000", Label: "仅 frp 端口",
+			Prefixes: []string{"198.51.100.9"}, Ports: portrange.Ports(7000),
+		}},
 	}, nil, nil)
 
-	all, frp := -1, -1
+	all, port := -1, -1
 	for i, line := range insertOrder(got) {
 		if strings.Contains(line, "@"+setBlack+" drop") {
 			all = i
 		}
-		if strings.Contains(line, "@"+setBlackFrp+" drop") {
-			frp = i
+		if strings.Contains(line, "@"+portSetName(32, "7000")+" drop") {
+			port = i
 		}
 	}
-	if all < 0 || frp < 0 {
+	if all < 0 || port < 0 {
 		t.Fatalf("两条规则都应当存在\n%s", got)
 	}
-	if all > frp {
-		t.Errorf("链上顺序应为「全端口 → 仅 frp 端口」，实际相反\n%s", got)
+	if all > port {
+		t.Errorf("链上顺序应为「全端口 → 端口限定」，实际相反\n%s", got)
 	}
 }
 

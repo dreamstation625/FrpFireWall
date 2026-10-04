@@ -8,6 +8,7 @@ import (
 
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/model"
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
 // Apply 触发一次异步重新对齐。改完名单或策略后调用。
@@ -128,7 +129,10 @@ func (m *Manager) triggerBan(addr netip.Addr, source, reason, user string, geo *
 }
 
 // BanManual 人工封禁。dur <= 0 表示永久；scope 为空按全端口处理。
-func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope string) (*model.BanRecord, error) {
+//
+// ports 只在 scope=custom 时用得上，其余范围忽略（接口层已经挡住了这种情况，
+// 这里再判一次是因为 guard 也可能被别的调用方直接调）。
+func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope string, ports portrange.Set) (*model.BanRecord, error) {
 	p, err := parsePrefixOrAddr(strings.TrimSpace(target))
 	if err != nil {
 		return nil, fmt.Errorf("地址格式不正确: %w", err)
@@ -140,7 +144,17 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope 
 		scope = model.ScopeAll
 	}
 	if !model.ValidScope(scope) {
-		return nil, fmt.Errorf("封禁范围只能是 %s 或 %s", model.ScopeAll, model.ScopeFrp)
+		return nil, fmt.Errorf("封禁范围只能是 %s / %s / %s",
+			model.ScopeAll, model.ScopeFrp, model.ScopeCustom)
+	}
+	// 自定义范围没端口就等于"封了等于没封"：内核规则一条都生成不出来，
+	// 而界面上它会正常显示成一条生效中的封禁。所以这里直接拒绝，不放行。
+	if model.ScopeNeedsPorts(scope) {
+		if ports = ports.Normalize(); len(ports) == 0 {
+			return nil, fmt.Errorf("「自定义端口」范围需要至少一个端口，例如 8080 或 9000-9100")
+		}
+	} else {
+		ports = nil
 	}
 	if reason == "" {
 		reason = "人工封禁"
@@ -170,6 +184,7 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope 
 		Target:     t,
 		TargetType: model.TargetTypeOf(t),
 		Scope:      scope,
+		Ports:      ports.String(),
 		Reason:     reason,
 		Source:     model.SourceManual,
 		HitCount:   1,
@@ -190,6 +205,7 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope 
 		Prefix:   p,
 		Target:   t,
 		Scope:    scope,
+		Ports:    ports,
 		Reason:   reason,
 		Source:   model.SourceManual,
 		RecordID: rec.ID,
@@ -212,6 +228,9 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope 
 	} else {
 		detail += "；时长：" + humanDuration(dur)
 	}
+	// 封禁范围必须进审计：事后追查"这个地址当时到底被封了什么"时，
+	// 只写"人工封禁"是答不出来的，而范围恰恰是最容易记错的一项。
+	detail += "；范围：" + scopeLabelFor(scope, ports)
 	m.pushEvent(&model.Event{
 		Category: model.EvtBan,
 		IP:       t,
@@ -343,6 +362,18 @@ func (m *Manager) banPrefix(addr netip.Addr, policy *model.Policy) netip.Prefix 
 		return netip.PrefixFrom(addr, 24).Masked()
 	}
 	return netip.PrefixFrom(addr, addr.BitLen())
+}
+
+// scopeLabelFor 把封禁范围渲染成给人看的文字，带自定义端口。
+func scopeLabelFor(scope string, ports portrange.Set) string {
+	switch scope {
+	case model.ScopeFrp:
+		return "仅 frp 端口"
+	case model.ScopeCustom:
+		return "自定义端口 " + ports.String()
+	default:
+		return "全部端口"
+	}
 }
 
 func sourceLabel(s string) string {

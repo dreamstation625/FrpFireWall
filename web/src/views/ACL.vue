@@ -24,7 +24,9 @@
       <template #default>
         封禁范围按条目单独设置：<b>全端口</b>会把该地址访问本机的所有端口一起拒绝（含 SSH、
         面板），挡得彻底，但误伤时代价也大；<b>仅 frp 端口</b>只拒绝 frp 服务端口上的连接，
-        影响面小，代价是对方仍能扫到本机其它端口。
+        影响面小，代价是对方仍能扫到本机其它端口；<b>自定义端口</b>只封指定的那几个端口。
+        范围只决定内核层丢哪些端口上的包，不影响判定本身 —— 插件回调拿不到端口，
+        自定义端口只用来精确控制内核封哪里。
       </template>
     </el-alert>
 
@@ -59,11 +61,19 @@
       <!-- 范围只对黑名单有意义，白名单不显示这一列 -->
       <el-table-column v-if="kind === 'black'" label="范围" width="118">
         <template #default="{ row }">
-          <el-tooltip :content="scopeTip(row.scope)" placement="top">
-            <el-tag size="small" :type="row.scope === 'frp' ? 'info' : 'warning'">
+          <!-- 带上 ports 一起看：范围是 custom 却没有端口时后端会退化成全端口下发，
+               提示语必须说同一件事，否则界面讲"只封这几个端口"、实际封了全部 -->
+          <el-tooltip :content="scopeTip(row.scope, row.ports)" placement="top">
+            <el-tag size="small" :type="scopeTagType(row.scope)">
               {{ scopeLabel(row.scope) }}
             </el-tag>
           </el-tooltip>
+        </template>
+      </el-table-column>
+      <el-table-column v-if="kind === 'black'" label="封禁端口" min-width="130">
+        <template #default="{ row }">
+          <span v-if="row.scope === 'custom' && row.ports" class="mono">{{ row.ports }}</span>
+          <span v-else class="hint">—</span>
         </template>
       </el-table-column>
       <el-table-column label="属地" min-width="150">
@@ -134,12 +144,12 @@
               {{ o.label }}
             </el-radio-button>
           </el-radio-group>
+          <div class="hint" style="margin-top: 6px">{{ scopeFormHint(form.scope) }}</div>
+        </el-form-item>
+        <el-form-item v-if="kind === 'black' && form.scope === 'custom'" label="封禁端口">
+          <el-input v-model="form.ports" placeholder="8080,9000-9100" />
           <div class="hint" style="margin-top: 6px">
-            {{
-              form.scope === 'frp'
-                ? '只拒绝该地址访问 frp 服务端口，本机其它端口不受影响。'
-                : '拒绝该地址访问本机的全部端口，含 SSH 与管理面板。确认不会误伤再选。'
-            }}
+            写单个端口（8080）或区间（9000-9100），多个用逗号分隔。
           </div>
         </el-form-item>
         <el-form-item label="有效期">
@@ -166,8 +176,13 @@
       </div>
       <div v-if="kind === 'black'" class="hint" style="margin-bottom: 10px">
         黑名单还可以在第二列写范围 <span class="mono">all</span> /
-        <span class="mono">frp</span>：<span class="mono">1.2.3.4,frp,备注</span>。
-        第二列只有恰好是这两个词时才当作范围，否则整体按备注处理，所以旧文件可以直接导入。
+        <span class="mono">frp</span> / <span class="mono">custom:端口</span>：
+        <span class="mono">1.2.3.4,frp,备注</span>、
+        <span class="mono">1.2.3.4,custom:8080;9000-9100</span>。
+        第二列只有恰好是这几种写法时才当作范围，否则整体按备注处理，所以旧文件可以直接导入。
+        <br />
+        注意端口列表在<strong>文件里要用分号</strong>分隔 —— 逗号是列分隔符，
+        写逗号会把备注列切走；上面那个输入框是单独一个字段，用逗号即可。
       </div>
       <el-form v-if="kind === 'black'" label-width="90px" style="margin-bottom: 10px">
         <el-form-item label="默认范围">
@@ -181,6 +196,12 @@
             </el-radio-button>
           </el-radio-group>
           <div class="hint" style="margin-top: 6px">未写范围的行按此处理。</div>
+        </el-form-item>
+        <el-form-item v-if="importScope === 'custom'" label="默认端口">
+          <el-input v-model="importPorts" placeholder="8080,9000-9100" />
+          <div class="hint" style="margin-top: 6px">
+            未写范围的行用这一份端口。某一行自己写了范围，端口就跟着那一行走。
+          </div>
         </el-form-item>
       </el-form>
       <!-- 占位符里的换行必须用 \n 转义：写 &#10; 会被解析成真实换行，
@@ -211,7 +232,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import api from '@/api'
-import { SCOPE_OPTIONS, scopeLabel, scopeTip } from '@/utils/scope'
+import { SCOPE_OPTIONS, scopeFormHint, scopeLabel, scopeTagType, scopeTip } from '@/utils/scope'
 
 const kind = ref('white')
 const rows = ref<any[]>([])
@@ -224,18 +245,19 @@ const total = ref(0)
 const editVisible = ref(false)
 const editing = ref(false)
 const saving = ref(false)
-const form = reactive({ id: 0, target: '', remark: '', expires: 0, scope: 'all' })
+const form = reactive({ id: 0, target: '', remark: '', expires: 0, scope: 'all', ports: '' })
 
 const importVisible = ref(false)
 const importing = ref(false)
 const importText = ref('')
 const importScope = ref('all')
+const importPorts = ref('')
 const importResult = ref<any>(null)
 
 // 黑名单多给一行带范围的示例，白名单保持原样
 const importPlaceholder = computed(() =>
   kind.value === 'black'
-    ? '1.2.3.4,frp,扫描源\n1.2.3.0/24,办公网\n# 注释行'
+    ? '1.2.3.4,frp,扫描源\n1.2.3.0/24,办公网\n1.2.3.4,custom:8080;9000-9100,只封两个端口\n# 注释行'
     : '1.2.3.4\n1.2.3.0/24,办公网\n# 注释行'
 )
 
@@ -266,7 +288,7 @@ function onTabChange() {
 
 function openCreate() {
   editing.value = false
-  Object.assign(form, { id: 0, target: '', remark: '', expires: 0, scope: 'all' })
+  Object.assign(form, { id: 0, target: '', remark: '', expires: 0, scope: 'all', ports: '' })
   editVisible.value = true
 }
 
@@ -278,7 +300,8 @@ function openEdit(row: any) {
     remark: row.remark || '',
     expires: 0,
     // 老条目可能是空串，回显成全端口而不是留空，避免用户以为没设置过
-    scope: row.scope === 'frp' ? 'frp' : 'all',
+    scope: row.scope === 'frp' || row.scope === 'custom' ? row.scope : 'all',
+    ports: row.ports || '',
   })
   editVisible.value = true
 }
@@ -288,6 +311,15 @@ async function save() {
     ElMessage.warning('请填写地址')
     return
   }
+  // 自定义范围必须有端口：没有端口内核一条规则都生成不出来，而列表里它会显示成
+  // 一条正常生效中的条目。后端也会拦，这里先拦一道是为了不白跑一趟。
+  if (kind.value === 'black' && form.scope === 'custom' && !form.ports.trim()) {
+    ElMessage.warning('自定义范围需要至少一个端口')
+    return
+  }
+  // 非自定义范围一律把端口清成空串，而不是"不传"：库里残留一份不参与生效的端口，
+  // 是"配置里写着、实际不生效"那类最难排查的问题。
+  const ports = form.scope === 'custom' ? form.ports.trim() : ''
   saving.value = true
   try {
     // 编辑时总是带上 scope：form.scope 已用行内原值回填，等价于"不改动"。
@@ -297,6 +329,7 @@ async function save() {
         remark: form.remark,
         expires_in_sec: form.expires,
         scope: form.scope,
+        ports,
       })
     } else {
       await api.createACL(kind.value, {
@@ -304,6 +337,7 @@ async function save() {
         remark: form.remark,
         expires_in_sec: form.expires,
         scope: form.scope,
+        ports,
       })
     }
     ElMessage.success('已保存')
@@ -330,8 +364,17 @@ async function remove(row: any) {
 function openImport() {
   importText.value = ''
   importScope.value = 'all'
+  importPorts.value = ''
   importResult.value = null
   importVisible.value = true
+}
+
+// 默认范围与行内写法共用一套语法，所以自定义范围要拼成 "custom:端口" 再传。
+// 这里用逗号分隔端口：它是独立的请求字段，不受"逗号是列分隔符"那条约束，
+// 后端两种分隔符都收。
+function defaultScopeField() {
+  if (importScope.value !== 'custom') return importScope.value
+  return `custom:${importPorts.value.trim()}`
 }
 
 async function doImport(dry: boolean) {
@@ -339,12 +382,16 @@ async function doImport(dry: boolean) {
     ElMessage.warning('请粘贴内容')
     return
   }
+  if (importScope.value === 'custom' && !importPorts.value.trim()) {
+    ElMessage.warning('自定义范围需要至少一个端口')
+    return
+  }
   importing.value = true
   try {
     const r: any = await api.importACL(kind.value, {
       content: importText.value,
       dry_run: dry,
-      scope: importScope.value,
+      scope: defaultScopeField(),
     })
     importResult.value = r
     if (!dry) {

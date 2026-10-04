@@ -78,17 +78,14 @@ func (s nftStack) set() string {
 	return setBlack
 }
 
-// setFrp 返回该协议栈用的「仅 frp 端口」集合名。
+// portSet 返回该协议栈上某个端口限定分组用的地址集合名。
 //
-// 和全端口黑名单分开成两个集合，而不是共用一个再靠规则区分：集合的元素本来就
+// 和全端口黑名单分开成两套集合，而不是共用一个再靠规则区分：集合的元素本来就
 // 不同（同一个地址可能只在其中一个里），共用的后果是"这条规则到底封哪些地址"
 // 得回头去看上层怎么填的。
-func (s nftStack) setFrp() string {
-	if s.isV6() {
-		return setBlack6Frp
-	}
-	return setBlackFrp
-}
+//
+// 每个分组各有一个集合，名字由端口签名派生 —— 详见 portSetName 的说明。
+func (s nftStack) portSet(key string) string { return portSetName(s.bits, key) }
 
 // setType 返回集合元素类型。
 func (s nftStack) setType() string {
@@ -106,13 +103,8 @@ func (s nftStack) comment() string {
 	return commentBlack
 }
 
-// commentFrp 返回该协议栈「仅 frp 端口」规则的归属标记。
-func (s nftStack) commentFrp() string {
-	if s.isV6() {
-		return commentBlack6Frp
-	}
-	return commentBlackFrp
-}
+// commentPort 返回该协议栈上某个端口限定分组的归属标记。
+func (s nftStack) commentPort(key string) string { return portComment(key) }
 
 // label 是给人看的协议栈名，用在展示与告警里。
 func (s nftStack) label() string {
@@ -193,11 +185,8 @@ func (d *nftablesDriver) EnsureBase() error {
 		if err := d.ensureSet(ctx, s, s.set(), s.setType(), false); err != nil {
 			return err
 		}
-		// 「仅 frp 端口」的集合也要提前建出来：Sync 里会对它做 flush，
-		// 集合不存在的话整份脚本会在事务里被拒 —— 那时连全端口规则都下不去。
-		if err := d.ensureSet(ctx, s, s.setFrp(), s.setType(), false); err != nil {
-			return err
-		}
+		// 端口限定分组的集合不在这里建：那时候还不知道有哪些分组（集合名由
+		// 端口签名派生），由 Sync 按期望状态补齐（见 ensurePortSets）。
 	}
 	d.ready = true
 	return nil
@@ -353,13 +342,27 @@ func (d *nftablesDriver) Sync(des Desired) error {
 	// 却会在 `nft list sets` 里越堆越多，排障时干扰判断。按前缀清掉不在本次期望里的。
 	d.pruneRateSets(ctx, rates)
 
-	// 「仅 frp 端口」的条目在没配端口时生成不出规则，会变成"看起来封了其实没封"。
-	// 这种情况必须报出来，不能静默。
-	if len(des.BlacklistFrp) > 0 && len(des.ProtectPorts.Normalize()) == 0 {
-		d.warn(fmt.Sprintf(
-			"有 %d 个地址设为「仅 frp 端口」，但当前没有配置任何 frp 端口（bind_port / proxy_ports 均为空），这些条目暂未下发",
-			len(des.BlacklistFrp)))
+	// 端口限定分组各需要一个地址集合，名字由端口签名派生。补在渲染脚本之前 ——
+	// 脚本里会对每个集合做 flush，集合不存在的话整份脚本会在事务里被拒，
+	// 那时连全端口规则都下不去。
+	groups := portGroups(des)
+	if err := d.ensurePortSets(ctx, groups); err != nil {
+		return err
 	}
+
+	// 「端口限定」的条目在没配端口时生成不出规则，会变成"看起来封了其实没封"。
+	// 这种情况必须报出来，不能静默。
+	for _, g := range des.PortBlacklists {
+		if len(g.Ports.Normalize()) == 0 && len(g.Prefixes) > 0 {
+			d.warn(fmt.Sprintf(
+				"有 %d 个地址属于「%s」，但这一组没有配置任何端口，这些条目暂未下发",
+				len(g.Prefixes), g.Label))
+		}
+	}
+
+	// 逻辑同上，只是对象换成端口限定的集合：分组改了端口或条目被删之后，
+	// 旧集合不再被任何规则引用，却会一直留在 nft list sets 里。
+	d.prunePortSets(ctx, groups)
 
 	script := renderScript(d.stacks, des, handles, rates)
 
@@ -373,6 +376,81 @@ func (d *nftablesDriver) Sync(des Desired) error {
 	return nil
 }
 
+// portGroups 取出真正能下发成规则的分组。
+//
+// 丢掉两类：端口为空的（写不出 dport）、地址为空的（没有来源）。留着一份
+// 空集合只会让 `nft list sets` 里多出几个永远空的集合，而"没生效"这件事
+// 应该由告警说清楚，不该藏在一堆空对象里。
+//
+// 顺带在驱动入口归一化一次端口，作为 Set 类型约定的兜底：直接手写 Set 字面量的
+// 调用方不会经过归一化，而落在 nft 里的越界端口会让整份脚本预检失败 ——
+// 预检失败是整份放弃，v4 规则会跟着 v6 一起陪葬。
+func portGroups(des Desired) []PortBlacklist {
+	out := make([]PortBlacklist, 0, len(des.PortBlacklists))
+	for _, g := range des.PortBlacklists {
+		if len(g.Prefixes) == 0 {
+			continue
+		}
+		ports := g.Ports.Normalize()
+		if len(ports) == 0 {
+			continue
+		}
+		g.Ports = ports
+		out = append(out, g)
+	}
+	return out
+}
+
+// ensurePortSets 保证每个分组在每张表里都有集合。
+//
+// 只能在这里补，不能在 EnsureBase 里预先建好 —— 集合名由端口签名派生，而
+// EnsureBase 拿不到期望状态，那时候根本不知道有哪些分组。
+func (d *nftablesDriver) ensurePortSets(ctx context.Context, groups []PortBlacklist) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	for _, s := range d.stacks {
+		for _, g := range groups {
+			if err := d.ensureSet(ctx, s, s.portSet(g.Key), s.setType(), false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// prunePortSets 删掉内核里不再需要的端口限定集合。
+//
+// 与 pruneRateSets 同理：集合本身不会自己消失，分组改了端口、条目被删之后旧集合
+// 会一直留着。不参与判决（规则每次全量重建），但会在 `nft list sets` 里越堆越多。
+// 这里还顺带回收老版本那两个固定名字的集合（见 isPortSetName）。
+//
+// 删不掉也不影响功能，所以忽略错误。
+func (d *nftablesDriver) prunePortSets(ctx context.Context, groups []PortBlacklist) {
+	keep := make(map[string]bool, len(groups)*len(d.stacks))
+	for _, s := range d.stacks {
+		for _, g := range groups {
+			keep[s.portSet(g.Key)] = true
+		}
+	}
+
+	// 按落点去重：inet 家族下两个协议栈共用同一张表，不去重就会把同一批集合
+	// 删两遍（第二遍必然失败）。
+	seen := make(map[nftTarget]bool, len(d.stacks))
+	for _, s := range d.stacks {
+		if seen[s.target] {
+			continue
+		}
+		seen[s.target] = true
+		for _, name := range d.listOwnSets(ctx, s, isPortSetName) {
+			if keep[name] {
+				continue
+			}
+			_, _ = run(ctx, "nft", "delete", "set", s.target.Family, s.target.Table, name)
+		}
+	}
+}
+
 // renderScript 生成一次 Sync 要提交的全部 nft 语句。
 //
 // 抽成纯函数是为了能被测：这类脚本只有在真实内核上才会被拒绝，而"生成了 ip6
@@ -383,10 +461,7 @@ func (d *nftablesDriver) Sync(des Desired) error {
 func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, rates []nftRatePlan) string {
 	var b strings.Builder
 
-	// 驱动入口再归一化一次，作为 Set 类型约定的兜底：直接手写 Set 字面量的
-	// 调用方不会经过归一化，而落在 nft 里的越界端口会让整份脚本预检失败 ——
-	// 预检失败是整份放弃，v4 规则会跟着 v6 一起陪葬。
-	ports := des.ProtectPorts.Normalize()
+	groups := portGroups(des)
 
 	// 1. 删掉旧的受管规则（同一个事务里会重新插入，所以没有空窗）。
 	//    按链去重：同一目标可能被两个协议栈共用（inet）。
@@ -405,7 +480,7 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 	// 2. 重填黑名单集合。每个协议栈有各自的集合：inet 下两个集合同表，
 	//    ip / ip6 下则分别在各自家族的表里。
 	//
-	//    frp 集合也必须 flush：地址从「仅 frp 端口」改成全端口、或者条目被删掉时，
+	//    端口限定的集合也必须 flush：地址从端口限定改成全端口、或者条目被删掉时，
 	//    残留的元素会继续封着那些端口。flush 一个空集合是合法的。
 	for _, s := range stacks {
 		for _, item := range []struct {
@@ -413,12 +488,19 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 			addrs []string
 		}{
 			{s.set(), filterByFamily(des.Blacklist, s.bits)},
-			{s.setFrp(), filterByFamily(des.BlacklistFrp, s.bits)},
 		} {
 			fmt.Fprintf(&b, "flush set %s %s %s\n", s.target.Family, s.target.Table, item.name)
 			if len(item.addrs) > 0 {
 				fmt.Fprintf(&b, "add element %s %s %s { %s }\n",
 					s.target.Family, s.target.Table, item.name, strings.Join(item.addrs, ", "))
+			}
+		}
+		for _, g := range groups {
+			name := s.portSet(g.Key)
+			fmt.Fprintf(&b, "flush set %s %s %s\n", s.target.Family, s.target.Table, name)
+			if addrs := filterByFamily(g.Prefixes, s.bits); len(addrs) > 0 {
+				fmt.Fprintf(&b, "add element %s %s %s { %s }\n",
+					s.target.Family, s.target.Table, name, strings.Join(addrs, ", "))
 			}
 		}
 	}
@@ -458,18 +540,22 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 		})
 	}
 
-	// 「仅 frp 端口」的规则只在真的用得着时才生成：没有端口就写不出 dport，
-	// 某个协议栈下没有这类地址则不必为它插一条空规则。
-	if exprs := nftFrpPortExprs(ports); len(exprs) > 0 {
-		for _, pe := range exprs {
-			for _, s := range stacks {
-				if len(filterByFamily(des.BlacklistFrp, s.bits)) == 0 {
-					continue
-				}
+	// 「端口限定」的规则只在真的用得着时才生成：没有端口就写不出 dport，
+	// 某个协议栈下没有这类地址则不必为它插一条永不匹配的规则。
+	for _, g := range groups {
+		exprs := nftPortExprs(g.Ports)
+		if len(exprs) == 0 {
+			continue
+		}
+		for _, s := range stacks {
+			if len(filterByFamily(g.Prefixes, s.bits)) == 0 {
+				continue
+			}
+			for _, pe := range exprs {
 				forward = append(forward, nftRule{
 					stack:   s,
-					expr:    fmt.Sprintf("%s %s saddr @%s drop", pe, s.proto(), s.setFrp()),
-					comment: s.commentFrp(),
+					expr:    fmt.Sprintf("%s %s saddr @%s drop", pe, s.proto(), s.portSet(g.Key)),
+					comment: s.commentPort(g.Key),
 				})
 			}
 		}
@@ -488,15 +574,16 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 // 逗号后的空格只是给预览文本看的，nft 两种写法都认。
 func nftPorts(s portrange.Set) string { return renderPorts(s, "-", ", ") }
 
-// nftFrpPortExprs 返回「仅 frp 端口」规则的端口匹配前缀，TCP 与 UDP 各一条。
+// nftPortExprs 返回端口限定规则的端口匹配前缀，TCP 与 UDP 各一条。
 //
 // 两种协议都要：frps 的 bindPort 是 TCP，而 proxyPorts 里可能配了 UDP 代理端口，
-// 只封 TCP 会留下一条用 UDP 绕过的路径。端口为空时返回 nil —— 调用方据此跳过，
+// 只封 TCP 会留下一条用 UDP 绕过的路径。自定义端口同理 —— 用户填的是目的端口，
+// 没理由替他假定只有 TCP。端口为空时返回 nil，调用方据此跳过，
 // 而不是生成一条匹配不存在的端口的规则。
 //
 // 区间直接写进集合字面量（`{ 80, 20000-30000 }`），nft 原生支持，
 // 所以 20000-30000 是一个元素，不是一万个。
-func nftFrpPortExprs(ports portrange.Set) []string {
+func nftPortExprs(ports portrange.Set) []string {
 	if len(ports) == 0 {
 		return nil
 	}
@@ -573,6 +660,7 @@ func (d *nftablesDriver) DumpManaged() (*ManagedRules, error) {
 	var b strings.Builder
 	// inet 家族下两个落点共用一条链，链内容只列一次，免得同一批规则重复出现。
 	listedChain := make(map[nftTarget]bool, len(d.stacks))
+	listedPortSets := make(map[nftTarget]bool, len(d.stacks))
 	for _, s := range d.stacks {
 		if !listedChain[s.target] {
 			listedChain[s.target] = true
@@ -587,14 +675,23 @@ func (d *nftablesDriver) DumpManaged() (*ManagedRules, error) {
 				}
 			}
 		}
-		// 两个集合分别报数：只报一个总数的话，界面看到"黑名单 12 个元素"
-		// 无从判断其中多少是全端口封、多少是只封 frp 端口。
+		// 集合逐个报数：只报一个总数的话，界面看到"黑名单 12 个元素"
+		// 无从判断其中多少是全端口封、多少是限定了端口。
 		res.Summary = append(res.Summary,
 			fmt.Sprintf("%s 黑名单（全端口）: 集合 %s 内 %d 个元素",
 				s.label(), s.set(), d.setSize(ctx, s, s.set())))
-		res.Summary = append(res.Summary,
-			fmt.Sprintf("%s 黑名单（仅 frp 端口）: 集合 %s 内 %d 个元素",
-				s.label(), s.setFrp(), d.setSize(ctx, s, s.setFrp())))
+
+		// 端口限定的集合名字是算出来的，只能从内核里列出来再逐个报。
+		// 报的是内核现状而不是期望状态 —— 显示"当前实际封着多少个地址"，
+		// 正是这个接口存在的意义。
+		if !listedPortSets[s.target] {
+			listedPortSets[s.target] = true
+			for _, name := range d.listOwnSets(ctx, s, isPortSetName) {
+				res.Summary = append(res.Summary,
+					fmt.Sprintf("%s 黑名单（端口限定）: 集合 %s 内 %d 个元素",
+						s.label(), name, d.setSize(ctx, s, name)))
+			}
+		}
 	}
 
 	res.Raw = b.String()
@@ -658,7 +755,13 @@ func (d *nftablesDriver) Preview(des Desired) (string, error) {
 
 	fmt.Fprintf(&b, "# --- 集合定义（首次创建）---\n")
 	for _, s := range stacks {
-		for _, name := range []string{s.set(), s.setFrp()} {
+		names := []string{s.set()}
+		// 端口限定分组的集合名由端口签名派生，只有拿得到期望状态才算得出来，
+		// 所以只能列在这里 —— 列出名字本身就是预览的一部分（内核里会是哪些对象）。
+		for _, g := range portGroups(des) {
+			names = append(names, s.portSet(g.Key))
+		}
+		for _, name := range names {
 			fmt.Fprintf(&b, "add set %s %s %s { type %s; flags interval; }\n",
 				s.target.Family, s.target.Table, name, s.setType())
 		}
@@ -683,11 +786,20 @@ func (d *nftablesDriver) Snapshot() (string, error) {
 	ctx := context.Background()
 	var b strings.Builder
 	listedChain := make(map[nftTarget]bool, len(d.stacks))
+	listedPortSets := make(map[nftTarget]bool, len(d.stacks))
 	for _, s := range d.stacks {
 		if out, err := run(ctx, "nft", "list", "set", s.target.Family, s.target.Table, s.set()); err == nil {
 			fmt.Fprintf(&b, "# set %s\n%s\n", s.set(), out)
 		}
-		// 限速集合一条规则一个，名字是算出来的，只能先列出来再逐个 dump。
+		// 端口限定与限速集合都是一条配置一个，名字是算出来的，只能先列出来再逐个 dump。
+		if !listedPortSets[s.target] {
+			listedPortSets[s.target] = true
+			for _, name := range d.listOwnSets(ctx, s, isPortSetName) {
+				if out, err := run(ctx, "nft", "list", "set", s.target.Family, s.target.Table, name); err == nil {
+					fmt.Fprintf(&b, "# set %s\n%s\n", name, out)
+				}
+			}
+		}
 		if s.bits == 32 {
 			for _, name := range d.listOwnRateSets(ctx, s) {
 				if out, err := run(ctx, "nft", "list", "set", s.target.Family, s.target.Table, name); err == nil {
@@ -719,6 +831,17 @@ func (d *nftablesDriver) Restore(snapshot string) error {
 		for _, h := range d.managedRuleHandles(ctx, s) {
 			_, _ = run(ctx, "nft", "delete", "rule", s.target.Family, s.target.Table, s.target.Chain,
 				"handle", strconv.Itoa(h))
+		}
+	}
+	// 端口限定与限速集合的名字都是算出来的，挨个列出来清。
+	seen := make(map[nftTarget]bool, len(d.stacks))
+	for _, s := range d.stacks {
+		if seen[s.target] {
+			continue
+		}
+		seen[s.target] = true
+		for _, name := range d.listOwnSets(ctx, s, isPortSetName) {
+			_, _ = run(ctx, "nft", "flush", "set", s.target.Family, s.target.Table, name)
 		}
 	}
 	// 限速集合只建在 IPv4 落点上（见 Sync 的说明）。
@@ -867,11 +990,11 @@ func nftRateExpr(r RateLimitRule, set string) (string, bool) {
 	return b.String(), true
 }
 
-// listOwnRateSets 列出内核里属于本程序的限速集合。
+// listOwnSets 列出某个落点里名字满足 match 的集合。
 //
 // 只认 nft -j 的输出：`nft list sets` 的文本格式会按列宽折行，
 // 用正则去啃迟早会栽在某个版本上（这套代码里已经栽过一次）。
-func (d *nftablesDriver) listOwnRateSets(ctx context.Context, s nftStack) []string {
+func (d *nftablesDriver) listOwnSets(ctx context.Context, s nftStack, match func(string) bool) []string {
 	out, err := run(ctx, "nft", "-j", "list", "sets")
 	if err != nil {
 		return nil
@@ -901,12 +1024,17 @@ func (d *nftablesDriver) listOwnRateSets(ctx context.Context, s nftStack) []stri
 		if st.Family != s.target.Family || st.Table != s.target.Table {
 			continue
 		}
-		if !isRateSetName(st.Name) {
+		if !match(st.Name) {
 			continue
 		}
 		names = append(names, st.Name)
 	}
 	return names
+}
+
+// listOwnRateSets 列出内核里属于本程序的限速集合。
+func (d *nftablesDriver) listOwnRateSets(ctx context.Context, s nftStack) []string {
+	return d.listOwnSets(ctx, s, isRateSetName)
 }
 
 // pruneRateSets 删掉内核里不再需要的限速集合。

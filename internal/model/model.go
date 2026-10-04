@@ -1,10 +1,13 @@
 package model
 
 import (
+	"fmt"
 	"net/netip"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
 // ACL 名单类型
@@ -23,12 +26,45 @@ const (
 	// ScopeAll 全端口：该地址到本机任意端口的入站全部丢弃。
 	ScopeAll = "all"
 	// ScopeFrp 仅 frp 端口：只丢弃 frp 服务端口（bindPort + proxyPorts）上的入站。
+	//
+	// 端口来自全局的受保护端口集合（见 DESIGN §4.6），条目自己不写端口。
 	ScopeFrp = "frp"
+	// ScopeCustom 自定义端口：只丢弃该条目 Ports 里列出的那些目的端口。
+	//
+	// 和 ScopeFrp 是两个方向：ScopeFrp 回答"别碰 frp 之外的东西"（端口由全局
+	// 配置算出来），ScopeCustom 回答"只动这几个端口"（端口随条目走）。
+	// 后者才是"既要限制这个地址访问某个服务、又不想把它的 frp 一起掐了"的落点 ——
+	// 拿 ScopeFrp 做不到这件事，它的端口集合是全局的，改它等于改所有条目。
+	//
+	// 注意插件层（frps 的 Login / NewUserConn 回调）拿不到被访问的端口，所以
+	// 自定义端口只作用于内核规则，不影响"这个地址能不能登录 frp" —— 见 D19。
+	ScopeCustom = "custom"
 )
 
 // ValidScope 判断范围取值是否合法。
 func ValidScope(s string) bool {
-	return s == ScopeAll || s == ScopeFrp
+	return s == ScopeAll || s == ScopeFrp || s == ScopeCustom
+}
+
+// ScopeNeedsPorts 判断该范围是否必须带端口列表。
+//
+// 单独一个判断函数而不是在调用处写 `scope == ScopeCustom`：范围与"要不要端口"
+// 的关系是同一个概念的两面，散在各处迟早出现"某个入口放过了没端口的 custom"。
+func ScopeNeedsPorts(scope string) bool { return scope == ScopeCustom }
+
+// ParseCustomPorts 解析自定义端口列表，返回规范化后的集合。
+//
+// 空列表**不是**错误被吞掉而是明确报错：范围选了自定义却一个端口都没填，
+// 落到内核上就是"一条规则都生成不出来"，表现成界面上封着、实际什么都没封。
+func ParseCustomPorts(ports string) (portrange.Set, error) {
+	ps, err := portrange.Parse(ports)
+	if err != nil {
+		return nil, err
+	}
+	if len(ps) == 0 {
+		return nil, fmt.Errorf("自定义端口不能为空：写单个端口（8080）或区间（9000-9100），多个用逗号分隔")
+	}
+	return ps, nil
 }
 
 // 封禁来源
@@ -70,10 +106,16 @@ type ACLEntry struct {
 	Kind       string `gorm:"uniqueIndex:uk_kind_target;size:8;not null" json:"kind"`
 	Target     string `gorm:"uniqueIndex:uk_kind_target;size:64;not null" json:"target"`
 	TargetType string `gorm:"size:8;not null" json:"target_type"` // ipv4 | ipv6 | cidr4 | cidr6
-	// Scope 封禁范围（all | frp）。只对黑名单有意义，白名单恒为 all。
+	// Scope 封禁范围（all | frp | custom）。只对黑名单有意义，白名单恒为 all。
 	// 默认 all 是有意为之：升级上来的存量条目保持原来的"全端口"行为，
 	// 不能因为加了这个字段就悄悄把别人原本封死的东西变松。
-	Scope     string     `gorm:"size:8;not null;default:all" json:"scope"`
+	Scope string `gorm:"size:8;not null;default:all" json:"scope"`
+	// Ports 是 ScopeCustom 下要封的目的端口，区间写法，如 "8080,9000-9100"。
+	//
+	// 只在 scope=custom 时有值：换成别的范围时接口层会把它清空。留一个不参与
+	// 生效的值在库里，等于制造"配置里写着、实际不生效"的陷阱 —— 这种错在界面上
+	// 完全看不出来，只有去数内核规则条数才会发现。
+	Ports     string     `gorm:"size:512;not null;default:''" json:"ports"`
 	Remark    string     `gorm:"size:255" json:"remark"`
 	Source    string     `gorm:"size:16;not null;default:manual" json:"source"`
 	Country   string     `gorm:"size:64" json:"country"`
@@ -88,8 +130,10 @@ type BanRecord struct {
 	ID         uint   `gorm:"primaryKey" json:"id"`
 	Target     string `gorm:"index;size:64;not null" json:"target"`
 	TargetType string `gorm:"size:8;not null" json:"target_type"`
-	// Scope 封禁范围（all | frp），与 ACLEntry 同义。默认 all。
-	Scope       string     `gorm:"size:8;not null;default:all" json:"scope"`
+	// Scope 封禁范围（all | frp | custom），与 ACLEntry 同义。默认 all。
+	Scope string `gorm:"size:8;not null;default:all" json:"scope"`
+	// Ports 是 ScopeCustom 下要封的目的端口，与 ACLEntry 同义。默认空。
+	Ports       string     `gorm:"size:512;not null;default:''" json:"ports"`
 	Reason      string     `gorm:"size:255" json:"reason"`
 	Source      string     `gorm:"index;size:16;not null" json:"source"`
 	TriggerUser string     `gorm:"size:64" json:"trigger_user"`

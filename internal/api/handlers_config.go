@@ -16,11 +16,25 @@ func (s *Server) storedConfig() (*config.Config, error) {
 	return config.FromSettings(m)
 }
 
-// settingsDiffer 比较两份配置是否有实质差异。
-func settingsDiffer(a, b *config.Config) bool {
-	sa, sb := a.ToSettings(), b.ToSettings()
-	for k, v := range sa {
-		if sb[k] != v {
+// effectiveSettings 是"当前进程里正在生效"的配置快照。
+//
+// 与启动时那份 s.cfg 唯一的区别在支持热改的字段上：目前只有 frp 代理端口
+// （PUT /frps/protect-ports 保存后立即生效）。不把这两者区分开的话，在 frp
+// 接入页改完端口，配置页会一直标着"需要重启"——而它其实已经在生效了。
+//
+// 不直接改 s.cfg 是有意的：那份配置被多个组件共享（驱动、guard 都拿着同一个
+// 指针），运行期就地改字段会让"这份配置是什么时候的"变得没法回答。
+func (s *Server) effectiveSettings() map[string]string {
+	m := s.cfg.ToSettings()
+	_, proxyPorts, _ := s.guard.FrpsPorts()
+	m[config.KeyProxyPorts] = proxyPorts.String()
+	return m
+}
+
+// settingsDiffer 比较入库的配置与当前进程生效值是否有实质差异。
+func settingsDiffer(cfg *config.Config, effective map[string]string) bool {
+	for k, v := range cfg.ToSettings() {
+		if effective[k] != v {
 			return true
 		}
 	}
@@ -37,7 +51,7 @@ func (s *Server) handleGetConfig(c *gin.Context) {
 	cfg.DataDir = s.cfg.DataDir
 	ok(c, gin.H{
 		"config":           cfg,
-		"restart_required": settingsDiffer(cfg, s.cfg),
+		"restart_required": settingsDiffer(cfg, s.effectiveSettings()),
 		"data_dir":         s.cfg.DataDir,
 	})
 }
@@ -75,7 +89,7 @@ func (s *Server) handleUpdateConfig(c *gin.Context) {
 	})
 
 	ok(c, gin.H{
-		"restart_required": settingsDiffer(&in, s.cfg),
+		"restart_required": settingsDiffer(&in, s.effectiveSettings()),
 		"message":          "配置已保存，重启服务后生效",
 	})
 }

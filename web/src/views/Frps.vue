@@ -35,15 +35,46 @@
             {{ o }}
           </el-tag>
         </el-descriptions-item>
-        <el-descriptions-item label="受保护端口">
-          <span class="mono">{{ protectedPorts }}</span>
+        <!-- 跨两列：这一行要能改，挤在半列里连端口串都看不全 -->
+        <el-descriptions-item label="受保护端口" :span="2">
+          <div class="protect-row">
+            <span class="protect-bind">
+              bindPort
+              <span class="mono">{{ bindPort ?? '—' }}</span>
+            </span>
+            <el-input
+              v-model="proxyPortsText"
+              size="small"
+              class="protect-input"
+              placeholder="80,443,20000-30000"
+              @keyup.enter="saveProtectPorts"
+            />
+            <el-button
+              size="small"
+              type="primary"
+              :loading="savingPorts"
+              :disabled="!portsDirty"
+              @click="saveProtectPorts"
+            >
+              保存
+            </el-button>
+            <el-button v-if="portsDirty" size="small" @click="resetPorts">还原</el-button>
+          </div>
+          <div class="hint" style="margin-top: 6px">
+            实际生效：<span class="mono">{{ effectivePorts }}</span>
+            <template v-if="portsDirty">
+              —— 改动后点保存立即生效，不需要重启（<span class="mono">bindPort</span> 始终
+              包含在内，改不了，它属于 frps 自己的配置）
+            </template>
+          </div>
         </el-descriptions-item>
       </el-descriptions>
 
       <div class="hint" style="margin-top: 10px">
         插件只监听回环地址，frps 必须与本程序同机。
-        防火墙规则只针对 <span class="mono">bind_port</span> 与
-        <span class="mono">proxy_ports</span> 下发。
+        防火墙规则只针对上面这个受保护端口集合下发：<span class="mono">bind_port</span> 与
+        <span class="mono">proxy_ports</span> 的并集。「仅 frp 端口」的封禁范围、
+        以及全局限速的兜底规则，用的都是它。
       </div>
     </div>
 
@@ -161,15 +192,17 @@ const hardeningText = computed(() => {
   return (fmt.value === 'json' ? c.hardening_json : c.hardening) || ''
 })
 
-const protectedPorts = computed(() => {
-  // proxy_ports 是一段文本（可能含区间），后端已经归一化过，
-  // 这里原样展示即可，不要自己解析——解析出来的形态会和实际下发的不一致。
-  const raw = String(info.value?.proxy_ports || '').trim()
-  const parts = raw ? raw.split(/[,\s]+/).filter(Boolean) : []
-  const bp = snippet.value?.bind_port ?? info.value?.bind_port
-  if (bp && !parts.includes(String(bp))) parts.unshift(String(bp))
-  return parts.length ? parts.join(', ') : '未配置'
-})
+// 受保护端口 = bindPort ∪ 代理端口。这里不再自己拼：后端把三段（bindPort、
+// 代理端口、合并后的受保护端口）一起回给界面，"改完端口后 7000 从哪来的"
+// 这个问题只有一个答案，两边各拼一次迟早会对不上。
+const bindPort = ref<number | null>(null)
+const proxyPortsText = ref('')
+// 上一次保存成功的值，用来判断有没有改动（决定"保存"按钮是否可点）
+const savedProxyPorts = ref('')
+const effectivePorts = ref('未配置')
+const savingPorts = ref(false)
+
+const portsDirty = computed(() => proxyPortsText.value.trim() !== savedProxyPorts.value)
 
 async function load() {
   loading.value = true
@@ -183,8 +216,49 @@ async function load() {
       // 加固项拿不到不影响主流程（接入片段才是必须的），降级成空即可
       cfg.value = null
     }
+    // 受保护端口单独取一次：写接口改的也是它，用同一个来源读写才不会出现
+    // "刚保存完却显示旧值"。拿不到就退回 systemInfo 里那份，页面照常可用。
+    try {
+      applyPorts(await (api.frpsProtectPorts() as any))
+    } catch {
+      applyPorts({
+        bind_port: snippet.value?.bind_port ?? info.value?.bind_port,
+        proxy_ports: info.value?.proxy_ports,
+        ports: info.value?.protect_ports,
+      })
+    }
   } finally {
     loading.value = false
+  }
+}
+
+function applyPorts(d: any) {
+  bindPort.value = d?.bind_port ?? null
+  proxyPortsText.value = String(d?.proxy_ports || '')
+  savedProxyPorts.value = proxyPortsText.value
+  effectivePorts.value = String(d?.ports || '') || '未配置'
+}
+
+function resetPorts() {
+  proxyPortsText.value = savedProxyPorts.value
+}
+
+async function saveProtectPorts() {
+  // 空值先在本地拦一道：后端会把空值当成"没配过"、重启后回落成默认端口，
+  // 也就是"保存完看着生效了、重启又变回去"。后端也会拒，这里只是少跑一趟、
+  // 并把话说得更直接。
+  if (!proxyPortsText.value.trim()) {
+    ElMessage.warning('代理端口不能为空：留空会被当作未配置，重启后会回落成默认值')
+    return
+  }
+  savingPorts.value = true
+  try {
+    // 只提交代理端口那一半：bindPort 由 frps 自己的配置决定，改这里不会让 frps
+    // 换端口，只会让防火墙规则和实际监听的端口错位。
+    applyPorts(await (api.updateFrpsProtectPorts({ proxy_ports: proxyPortsText.value.trim() }) as any))
+    ElMessage.success('受保护端口已更新并生效')
+  } finally {
+    savingPorts.value = false
   }
 }
 
@@ -277,6 +351,33 @@ onMounted(load)
 
 .flow-arrow {
   color: #a8b0bd;
+}
+
+/* 受保护端口的编辑行：bindPort 只读、代理端口可改，两者并排摆着才看得出
+   "受保护端口 = 这两部分的并集"这层关系 */
+.protect-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.protect-bind {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  height: 24px;
+  border: 1px solid #dfe5ef;
+  border-radius: 4px;
+  background: #f4f6fa;
+  color: #6b7480;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.protect-input {
+  width: 260px;
 }
 
 :deep(.el-descriptions__label) {

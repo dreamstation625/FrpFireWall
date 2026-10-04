@@ -10,10 +10,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/dreamstation625/FrpFireWall/internal/config"
 	"github.com/dreamstation625/FrpFireWall/internal/firewall"
 	"github.com/dreamstation625/FrpFireWall/internal/frpsplugin"
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/model"
+	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 	"github.com/dreamstation625/FrpFireWall/internal/version"
 )
 
@@ -37,24 +39,29 @@ func (s *Server) handleSystemInfo(c *gin.Context) {
 		}
 	}
 
+	bindPort, proxyPorts, protectPorts := s.guard.FrpsPorts()
+
 	ok(c, gin.H{
-		"version":        version.Version,
-		"commit":         version.Commit,
-		"build_time":     version.BuildTime,
-		"version_full":   version.String(),
-		"is_prerelease":  isPrerelease(),
-		"hostname":       host,
-		"os":             runtime.GOOS,
-		"arch":           runtime.GOARCH,
-		"started_at":     s.startedAt,
-		"uptime_sec":     int64(time.Since(s.startedAt).Seconds()),
-		"panel_listen":   s.cfg.Server.Listen,
-		"tls_enabled":    s.cfg.Server.TLS.Enabled,
-		"plugin_listen":  s.cfg.Frps.PluginListen,
-		"plugin_path":    s.cfg.Frps.PluginPath,
-		"data_dir":       s.cfg.DataDir,
-		"bind_port":      s.cfg.Frps.BindPort,
-		"proxy_ports":    s.cfg.Frps.ProxyPorts,
+		"version":       version.Version,
+		"commit":        version.Commit,
+		"build_time":    version.BuildTime,
+		"version_full":  version.String(),
+		"is_prerelease": isPrerelease(),
+		"hostname":      host,
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"started_at":    s.startedAt,
+		"uptime_sec":    int64(time.Since(s.startedAt).Seconds()),
+		"panel_listen":  s.cfg.Server.Listen,
+		"tls_enabled":   s.cfg.Server.TLS.Enabled,
+		"plugin_listen": s.cfg.Frps.PluginListen,
+		"plugin_path":   s.cfg.Frps.PluginPath,
+		"data_dir":      s.cfg.DataDir,
+		"bind_port":     bindPort,
+		// 代理端口与受保护端口取的是**运行期**值（guard 里那份），不是 s.cfg 里
+		// 启动时的快照：这一项可以在 frp 接入页热改，面板必须显示真正生效的东西。
+		"proxy_ports":    proxyPorts,
+		"protect_ports":  protectPorts,
 		"trusted_proxy":  s.cfg.Frps.TrustedProxies,
 		"guard":          s.guard.Stats(),
 		"capability":     cap,
@@ -152,11 +159,11 @@ func (s *Server) handleSwitchMode(c *gin.Context) {
 	})
 
 	ok(c, gin.H{
-		"backend":     newDrv.Name(),
-		"capability":  newDrv.Capability(),
-		"requested":   req.Backend,
-		"detect":      report,
-		"note":        "旧后端的受管规则不会自动清理，避免误删；如需清理可执行 scripts/frpfirewall-panic.sh",
+		"backend":    newDrv.Name(),
+		"capability": newDrv.Capability(),
+		"requested":  req.Backend,
+		"detect":     report,
+		"note":       "旧后端的受管规则不会自动清理，避免误删；如需清理可执行 scripts/frpfirewall-panic.sh",
 	})
 }
 
@@ -357,6 +364,86 @@ func (s *Server) handleFrpsConfig(c *gin.Context) {
 		"hardening":           frpsplugin.HardeningTOML(),
 		"hardening_json":      frpsplugin.HardeningJSON(),
 	})
+}
+
+// protectPortsPayload 是"受保护端口"这一栏的数据形状。
+//
+// 三个字段一起给，是因为界面右上角必须把这三件事同时讲清楚：
+// 受保护端口 = bind_port ∪ 代理端口。只回一个拼好的结果，用户改完端口
+// 会想问"7000 是从哪来的、为什么删不掉"。
+//
+// bind_port 只是读出来展示，不接受修改：它是 frps 自己的 bindPort，
+// 改这里不会让 frps 换端口，只会让防火墙规则和实际监听的端口错位。
+func protectPortsPayload(bindPort int, proxyPorts, protect portrange.Set) gin.H {
+	return gin.H{
+		"bind_port":   bindPort,
+		"proxy_ports": proxyPorts,
+		"ports":       protect,
+	}
+}
+
+// handleGetFrpsProtectPorts 返回当前生效的受保护端口。
+func (s *Server) handleGetFrpsProtectPorts(c *gin.Context) {
+	bindPort, proxyPorts, protect := s.guard.FrpsPorts()
+	ok(c, protectPortsPayload(bindPort, proxyPorts, protect))
+}
+
+// handleUpdateFrpsProtectPorts 保存代理端口，并立即生效。
+//
+// 与 PUT /config 的区别只在"生效时机"：代理端口只影响内核规则里那个端口集合
+// （全局限速的兜底规则、"仅 frp 端口"的黑名单），重算一次规则就够了，不需要
+// 重启进程。所以这里走热更，而 PUT /config 仍然老老实实说"需要重启"。
+//
+// 先落库再改内存：落库失败的话不该已经动过内核规则。
+func (s *Server) handleUpdateFrpsProtectPorts(c *gin.Context) {
+	var req struct {
+		ProxyPorts portrange.Set `json:"proxy_ports"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		// 带上底层原因：这里唯一有自由文本写法的就是端口，只说"格式不正确"
+		// 用户猜不出自己是多打了一个逗号还是端口越界了。
+		badRequest(c, "端口格式不正确："+err.Error())
+		return
+	}
+	if len(req.ProxyPorts) == 0 {
+		// 空值在 FromSettings 里被当成"没配过"、回落成默认的 80,443，
+		// 于是保存完看着生效了、重启之后又变回默认 —— 这种"改了等于没改"
+		// 比当场报错难查得多，所以在入口拦住。
+		badRequest(c, "代理端口不能为空：留空会被当作未配置，重启后回落成默认的 80,443。确实不想再保护任何代理端口时，请改用「全部端口」范围，或把这条封禁删掉")
+		return
+	}
+
+	cfg, err := s.storedConfig()
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	cfg.Frps.ProxyPorts = req.ProxyPorts
+	// 走一遍完整校验：这里只校验了代理端口，但规则与 PUT /config 完全一致，
+	// 免得以后加了端口相关约束只生效在其中一个入口上。
+	if err := cfg.Validate(); err != nil {
+		badRequest(c, err.Error())
+		return
+	}
+	portsText := cfg.Frps.ProxyPorts.String()
+	if err := s.store.SetSetting(config.KeyProxyPorts, portsText); err != nil {
+		serverErr(c, err)
+		return
+	}
+
+	s.guard.SetFrpsProxyPorts(cfg.Frps.ProxyPorts)
+
+	_ = s.store.AddEvent(&model.Event{
+		Category: model.EvtConfig,
+		IP:       c.ClientIP(),
+		Detail:   "修改 frp 代理端口：" + portsText,
+		Actor:    s.currentUser(c),
+	})
+
+	bindPort, proxyPorts, protect := s.guard.FrpsPorts()
+	res := protectPortsPayload(bindPort, proxyPorts, protect)
+	res["message"] = "受保护端口已更新并立即生效"
+	ok(c, res)
 }
 
 // ---- 辅助 ----

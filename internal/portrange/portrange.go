@@ -112,7 +112,14 @@ func (s Set) Chunks(n int) []Set {
 }
 
 // String 输出规范文本，例如 "80,443,20000-30000"。单端口不写成 "80-80"。
-func (s Set) String() string {
+func (s Set) String() string { return s.StringSep(",") }
+
+// StringSep 用指定分隔符输出规范文本，例如 "80;443;20000-30000"。
+//
+// 需要它是因为有些格式拿逗号当列分隔符（黑白名单导出文件就是 地址,范围,备注），
+// 端口列表再拿逗号分项，一列就会被切成两列 —— 而这类错在读文件时看不出，
+// 只有导入之后发现备注少了一半才知道。
+func (s Set) StringSep(sep string) string {
 	if len(s) == 0 {
 		return ""
 	}
@@ -124,7 +131,7 @@ func (s Set) String() string {
 		}
 		parts = append(parts, strconv.Itoa(r.Lo)+"-"+strconv.Itoa(r.Hi))
 	}
-	return strings.Join(parts, ",")
+	return strings.Join(parts, sep)
 }
 
 // MarshalJSON 把集合输出成文本形式。

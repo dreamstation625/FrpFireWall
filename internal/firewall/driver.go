@@ -44,25 +44,51 @@ const (
 	// 完全不需要关心规则在主链里的位置。
 	managedBlackChain = "FRPFIREWALL_BLACK"
 
-	// managedBlackFrpChain 是"仅 frp 端口"用的子链，规则带 dport 限定。
+	// managedPortBlackChain 是"只在指定端口上封禁"用的子链，规则带 dport 限定。
 	// 与上面那条分开成两条链而不是混在一条里，因为两者的规则形状不同
 	// （带不带端口条件），混在一起后按内容删除就得逐条比对整套参数。
-	managedBlackFrpChain = "FRPFIREWALL_BLACK_FRP"
+	//
+	// 所有端口限定分组共用这一条链，而不是每组一条：「仅 frp 端口」与「自定义
+	// 端口」渲染出来的规则形状完全一样（都是 -s 加 -p/-m multiport --dports），
+	// 同一条链里按顺序排下去即可 —— DROP 之间没有先后之分。
+	//
+	// 链名里的 FRP 是历史遗留（这个子链最初只装 frp 范围）。值刻意不改：
+	// 改名字得同时清掉老链、还要处理"升级后老链残留"的中间态，而链名只是排查
+	// 时看一眼的东西，不值得为它动内核里已有的对象。
+	managedPortBlackChain = "FRPFIREWALL_BLACK_FRP"
 
 	// commentPrefix 是识别"这条规则属于本程序"的标记前缀。
+	//
+	// 识别处只能用 Contains(commentPrefix)，绝不能写成 HasPrefix(line, commentBlack)：
+	// 下面几个值全都以 commentBlack 开头，前缀匹配会把端口限定的规则误判成全端口。
+	// 老版本的 frpfirewall:black-frp 也在这个前缀之内，所以升级时老的端口限定规则
+	// 照样能被识别出来删掉。
 	commentPrefix = "frpfirewall"
 	commentBlack  = "frpfirewall:black"
 	commentBlack6 = "frpfirewall:black6"
-	// 注意这两个值以 commentBlack 开头，所以识别处只能用 Contains(commentPrefix)，
-	// 不能写成 HasPrefix(line, commentBlack)，否则 frp 范围的规则会被误判成全端口。
-	commentBlackFrp  = "frpfirewall:black-frp"
-	commentBlack6Frp = "frpfirewall:black6-frp"
-	commentRate      = "frpfirewall:rate"
+	// commentPortPrefix 是"端口限定"规则的归属注释前缀，后面跟端口签名的摘要。
+	// 带摘要是为了让 `nft list chain` 一眼看出哪条规则对应哪一组端口 ——
+	// 多条端口限定规则长得一模一样，只有 dport 不同，光看规则本身分不出来。
+	commentPortPrefix = "frpfirewall:black-port:"
+	commentRate       = "frpfirewall:rate"
 	// nftables 集合名，统一加 frpfirewall_ 前缀避免与系统集合撞名。
-	setBlack     = "frpfirewall_black"
-	setBlack6    = "frpfirewall_black6"
+	setBlack  = "frpfirewall_black"
+	setBlack6 = "frpfirewall_black6"
+	// setBlackFrp / setBlack6Frp 是**老版本**「仅 frp 端口」用的固定集合名。
+	//
+	// 现在改成按端口签名派生名字（见 setPortPrefix），这两个名字只用于识别与回收：
+	// 不特判的话它们升级后会永远留在内核里 —— 不再被任何规则引用，却一直出现在
+	// `nft list sets` 的排查视野里。
 	setBlackFrp  = "frpfirewall_black_frp"
 	setBlack6Frp = "frpfirewall_black6_frp"
+
+	// nftables 侧每个端口限定分组一个地址集合，名字由端口签名派生。
+	//
+	// 必须派生而不是全局共用一个：集合里装的是地址，而"哪些地址被限制在哪些端口"
+	// 是分组的属性 —— 共用一个集合会让 A 组的地址在 B 组的端口上也被封。
+	// v4 / v6 用不同前缀：inet 家族下两个协议栈共用一张表，集合名不能撞。
+	setPortPrefix  = "frpfirewall_black_p_"
+	setPort6Prefix = "frpfirewall_black6_p_"
 
 	// nftables 侧每条限速规则一个动态集合，名字加这个前缀。
 	//
@@ -134,6 +160,37 @@ func isRateSetName(name string) bool { return strings.HasPrefix(name, "frpfirewa
 // 带上规则自己的后缀，是为了让 `nft list chain` 的输出能一眼看出哪条规则
 // 是哪条配置 —— 多条限速规则长得一模一样，只有速率不同，光看规则本身分不出来。
 func rateComment(key string) string { return commentRate + ":" + objSuffix(key) }
+
+// portSetName 返回某个端口限定分组在指定协议栈上的地址集合名。
+//
+// 名字取端口签名的哈希而不是签名本身：端口签名（"80,443"）里的逗号是非法字符，
+// 而 objSuffix 那种"只留字母数字"的归一化会制造碰撞 —— "80,443" 与单端口
+// 80443 归一后都是 "80443"，两个不同的端口集合共用一个集合名，效果是 A 组的
+// 地址在 B 组的端口上也被封了。哈希不保证零碰撞，但要求"故意构造出碰撞"，
+// 而归一化是随手就能撞上。
+func portSetName(bits int, key string) string {
+	if bits == 128 {
+		return setPort6Prefix + shortHash(key)
+	}
+	return setPortPrefix + shortHash(key)
+}
+
+// isPortSetName 判断一个集合名是不是端口限定分组用的集合。
+//
+// 连两个老名字一起认：老版本只有一份「仅 frp 端口」集合，名字是固定的
+// frpfirewall_black(_6)_frp，不符合新前缀。不特判的话升级之后它们既不会被
+// 引用、也不会被回收，只能永远留在 `nft list sets` 里。这与 isRateSetName
+// 少写一个下划线的用意相同。
+func isPortSetName(name string) bool {
+	switch name {
+	case setBlackFrp, setBlack6Frp:
+		return true
+	}
+	return strings.HasPrefix(name, setPortPrefix) || strings.HasPrefix(name, setPort6Prefix)
+}
+
+// portComment 返回一个端口限定分组的归属注释。
+func portComment(key string) string { return commentPortPrefix + shortHash(key) }
 
 // filterRateRules 按协议栈筛掉不适用的限速规则，并裁掉来源段里的另一种协议。
 //
@@ -215,23 +272,42 @@ func (r RateLimitRule) burst() int {
 	return r.PerSec * 2
 }
 
+// PortBlacklist 是一组"只在指定端口上丢弃"的地址。
+//
+// 「仅 frp 端口」与「自定义端口」在驱动层是同一回事 —— 都是「一组地址 + 一份
+// 端口集合」，区别只在上层怎么算出那份端口。所以驱动这边只有一个类型，
+// 以后再加一种按端口细分的封禁范围，两个驱动的渲染逻辑一个字都不用动。
+type PortBlacklist struct {
+	// Key 是这份端口集合的稳定标识，由上层给出。
+	//
+	// **同一个端口集合必须映射到同一个 Key**，反过来则不能有两个不同的 Key 对应
+	// 同一个端口集合：Key 是内核对象名（nft 集合名、规则注释）的来源，撞了就会出现
+	// 两套内容不同的规则共用一个集合，表现成"A 组的地址在 B 组的端口上也被封了"。
+	// 派生名字前还会再过一道哈希，所以 Key 只要求"同集合同 Key"，不要求可读。
+	Key string
+	// Label 是给人看的名字（"仅 frp 端口" / "自定义端口 8080"），只用在告警与
+	// 展示里 —— 内核对象名用的是 Key，别拿它去拼命令。
+	Label string
+	// Prefixes 是地址段（CIDR），不保证顺序，也不必已按协议栈过滤：
+	// 驱动自己会按落点筛。留白名单做减法由上层完成（见 guard.desired）。
+	Prefixes []string
+	// Ports 非空。空端口表达不出 dport 条件，上层不会这么传；
+	// 真传了驱动会跳过它并给出告警，而不是悄悄下一条"匹配不到任何端口"的规则。
+	Ports portrange.Set
+}
+
 // Desired 是上层期望的防火墙状态。驱动负责把它翻译成具体规则。
 type Desired struct {
 	// Blacklist 需要封禁的 IP / CIDR 列表，作用于该地址到本机的全部端口。
 	Blacklist []string
-	// BlacklistFrp 只封 frp 服务端口（即 ProtectPorts）的 IP / CIDR 列表。
+	// PortBlacklists 是"只在指定端口上封禁"的分组，每组一份端口集合。
 	//
-	// 单独一个字段而不是把端口条件塞进 Blacklist，是因为两种规则的写法差得远：
-	// 前者光凭地址就能表达，后者必须带上 dport。合成一个列表就得额外传一份
-	// "哪几条属于 frp 范围"的映射，不如让上层直接分好再送下来。
-	BlacklistFrp []string
+	// 分组而不是两个并列的字段（全端口那份在上面、端口限定那份在这里），是因为
+	// 端口限定的来源会越来越多（frp 端口、自定义端口、以后可能的其它预设），
+	// 每加一种就在 Desired 上开一个字段，驱动里就多一份渲染分支。
+	PortBlacklists []PortBlacklist
 	// Whitelist 豁免封禁的 IP / CIDR 列表（不是全端口放行，见驱动实现）。
 	Whitelist []string
-	// ProtectPorts 受保护的服务端口：BlacklistFrp 按它生成 dport。
-	//
-	// 用区间集合而不是 []int：frps 的 allowPorts 常常是一整个大区间，
-	// 展开成一个个端口会让下发的规则条数随区间宽度线性膨胀。
-	ProtectPorts portrange.Set
 	// RateLimits 要下发的内核限速规则，按优先级排列（前面的先生效）。
 	//
 	// 全局兜底规则也在这里面，由上层编译好 —— 驱动不需要区分。

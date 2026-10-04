@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/dreamstation625/FrpFireWall/internal/config"
 )
 
 // TestFrpsSnippetFormats /frps/snippet 同时下发 TOML 与 JSON 两份接入配置。
@@ -135,5 +137,108 @@ func TestFrpsConfigFormats(t *testing.T) {
 	}
 	if doc["maxPortsPerClient"] != float64(10) {
 		t.Errorf("maxPortsPerClient 应为 10，得到 %v", doc["maxPortsPerClient"])
+	}
+}
+
+// TestFrpsProtectPortsFlow 钉住"受保护端口可手动编辑"这条链路。
+//
+// 受保护端口 = bind_port ∪ 代理端口，写接口只改代理端口那一半：
+// 再引入一个独立的"受保护端口"字段会出现同一件事有两个真相，而全局限速的兜底
+// 规则、"仅 frp 端口"的黑名单都指着它，写岔了在界面上完全看不出来。
+//
+// bind_port 必须无条件包含在内：它是 frps 的接入端口，把它从受保护范围里去掉
+// 等于让"仅 frp 端口"的封禁漏掉最该封的那一个。
+func TestFrpsProtectPortsFlow(t *testing.T) {
+	h := newHarness(t)
+
+	code, r := h.call(http.MethodGet, "/api/v1/frps/protect-ports", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /frps/protect-ports 应 200，得到 %d %s", code, r.Error)
+	}
+	d := h.data(r)
+	if got := strOf(d, "proxy_ports"); got != "80,443" {
+		t.Fatalf("默认代理端口 = %q，期望 80,443", got)
+	}
+	if got := strOf(d, "ports"); got != "80,443,7000" {
+		t.Fatalf("默认受保护端口 = %q，期望 80,443,7000（bind_port 必须包含在内）", got)
+	}
+
+	// 写：乱序 + 重复 + 区间，后端负责归一化
+	code, r = h.call(http.MethodPut, "/api/v1/frps/protect-ports",
+		map[string]any{"proxy_ports": "9000-9100, 8080 ,8080"})
+	if code != http.StatusOK {
+		t.Fatalf("PUT /frps/protect-ports 应 200，得到 %d %s", code, r.Error)
+	}
+	d = h.data(r)
+	if got := strOf(d, "proxy_ports"); got != "8080,9000-9100" {
+		t.Errorf("归一化后的代理端口 = %q，期望 8080,9000-9100", got)
+	}
+	if got := strOf(d, "ports"); got != "7000,8080,9000-9100" {
+		t.Errorf("受保护端口 = %q，期望 7000,8080,9000-9100", got)
+	}
+
+	// 落了库：重启后 FromSettings 读的就是这个键，值必须能原样还原。
+	saved, err := h.srv.store.GetSetting(config.KeyProxyPorts)
+	if err != nil {
+		t.Fatalf("读回配置失败：%v", err)
+	}
+	if saved != "8080,9000-9100" {
+		t.Errorf("库里的代理端口 = %q，期望 8080,9000-9100", saved)
+	}
+
+	// 立即生效：再读一次拿到的是新值，不是启动时的快照
+	code, r = h.call(http.MethodGet, "/api/v1/frps/protect-ports", nil)
+	if code != http.StatusOK {
+		t.Fatalf("再次 GET 应 200，得到 %d %s", code, r.Error)
+	}
+	if got := strOf(h.data(r), "ports"); got != "7000,8080,9000-9100" {
+		t.Errorf("重新读取的受保护端口 = %q，说明没有热更", got)
+	}
+
+	// 热更过的字段不该再让配置页报"需要重启"：它已经在生效了。
+	// 报错会让用户去重启一个完全不必要的服务，重启期间所有隧道都会断。
+	code, r = h.call(http.MethodGet, "/api/v1/config", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /config 应 200，得到 %d %s", code, r.Error)
+	}
+	if need, _ := h.data(r)["restart_required"].(bool); need {
+		t.Error("只改过代理端口，却被判定为需要重启")
+	}
+}
+
+// TestFrpsProtectPortsRejectsBadInput 端口写错必须当场报错，不能静默落一个
+// "看起来配了、其实没生效"的值。
+func TestFrpsProtectPortsRejectsBadInput(t *testing.T) {
+	h := newHarness(t)
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		// 空值会被 FromSettings 当成"没配过"回落成默认的 80,443，
+		// 于是保存完看着生效了、重启之后又变回去。
+		{"缺字段", map[string]any{}},
+		{"空串", map[string]any{"proxy_ports": ""}},
+		{"只有分隔符", map[string]any{"proxy_ports": " , ; "}},
+		{"非法写法", map[string]any{"proxy_ports": "8080~9000"}},
+		{"越界端口", map[string]any{"proxy_ports": "70000"}},
+		{"写成布尔", map[string]any{"proxy_ports": true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, r := h.call(http.MethodPut, "/api/v1/frps/protect-ports", c.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("应 400，得到 %d %s", code, r.Error)
+			}
+		})
+	}
+
+	// 报错之后旧值必须原封不动：半路失败留下一份改了一半的配置是最坏的结果。
+	code, r := h.call(http.MethodGet, "/api/v1/frps/protect-ports", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET 应 200，得到 %d %s", code, r.Error)
+	}
+	if got := strOf(h.data(r), "proxy_ports"); got != "80,443" {
+		t.Errorf("一连串失败请求之后代理端口 = %q，期望仍是默认的 80,443", got)
 	}
 }
