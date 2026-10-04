@@ -328,6 +328,13 @@ type Capability struct {
 	// iptables 用 hashlimit，nftables 用动态 set，能力上都能做；
 	// 老内核/老版本不支持时会置 false，前端对应开关置灰。
 	RateLimit bool `json:"rate_limit"`
+	// CounterGranularity 是丢包计数能细到哪一层：addr = 按地址，
+	// group = 只能按规则/分组（nftables 的集合形态决定的，见 RuleCounter
+	// 的说明）。空串表示当前后端读不到计数。
+	//
+	// 前端据此决定怎么展示：group 档下"每个地址拦了多少包"这个问题本身就
+	// 没有答案，硬做成按地址只会给出一堆 0。
+	CounterGranularity string `json:"counter_granularity"`
 	// Reason 不支持时的原因说明。
 	Reason string `json:"reason"`
 }
@@ -337,6 +344,52 @@ type ManagedRules struct {
 	Backend string   `json:"backend"`
 	Summary []string `json:"summary"`
 	Raw     string   `json:"raw"`
+}
+
+// 计数条目的种类。Kind 决定 Key 是什么、界面怎么归组。
+const (
+	// CounterKindAddr 是"一个地址/网段"的计数。只有 iptables 能给到这个粒度
+	// —— 它每个地址一条规则，计数天然就是按规则的。
+	CounterKindAddr = "addr"
+	// CounterKindPort 是"端口限定分组"的计数。
+	//
+	// iptables 上仍然是按地址（规则里带 dport，一条规则一个地址），
+	// nftables 上则是整组：地址装在集合里、规则只有一条，见下面的 group。
+	CounterKindPort = "port"
+	// CounterKindGroup 是"整条规则"的计数，nftables 专用。
+	//
+	// nft 把全端口黑名单装进一个集合、用**一条**规则引用它，所以内核只在
+	// 规则上数数，数不出"哪个地址被拦了多少"。这是两种后端的能力差异，
+	// 不是实现偷懒 —— 要做到按地址只能放弃集合、给每个地址单插规则，
+	// 地址一多规则条数就爆炸，代价远大于收益。
+	CounterKindGroup = "group"
+	// CounterKindRate 是限速规则的计数：被速率限制丢掉的包。
+	CounterKindRate = "rate"
+)
+
+// RuleCounter 是一条受管规则当前累计丢掉的包数与字节数。
+//
+// 计数来自内核，不是本程序数的：程序只下发规则，数数是内核在协议栈里做的。
+// 由此带来两个必须知道的后果：
+//
+//  1. **只有被内核丢掉的包才算**。frp 登录阶段被插件拒绝的连接不经过内核，
+//     它记在事件日志里（login_blocked），不在这里出现。
+//  2. **规则被删掉或重建，计数就归零**。全量 Sync、切换后端、重启防火墙服务
+//     都会让数字回到 0，所以这是一个"自上次重建以来的累计值"，不是历史总量。
+//     需要跨重建的总量时，上层按采样点做增量累加（见 store.CounterSample）。
+type RuleCounter struct {
+	// Kind 见上面的常量。
+	Kind string `json:"kind"`
+	// Key 是条目在本程序内的稳定标识：iptables 上是地址（+端口），
+	// nftables 上是规则注释里的签名。不要拿它去拼命令。
+	Key string `json:"key"`
+	// Label 是给人看的名字，由上层按 Kind + Key 补全（驱动没有端口组的
+	// 名称信息），驱动侧留空。
+	Label string `json:"label"`
+	// Family 是协议栈：ip / ip6。同一个 Key 在两个协议栈下各有一条。
+	Family  string `json:"family"`
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
 }
 
 // Driver 是防火墙后端统一抽象。
@@ -354,6 +407,11 @@ type Driver interface {
 	DelBlock(target string) error
 	// DumpManaged 返回受管规则（结构化 + 原始文本），用于前端展示。
 	DumpManaged() (*ManagedRules, error)
+	// Counters 读取受管规则当前的丢包计数。
+	//
+	// 只读、不修改任何规则。后端读不到计数时返回空切片而不是错误 ——
+	// 计数是增强信息，读不到不该让调用方整条链路失败。
+	Counters() ([]RuleCounter, error)
 	// DumpSystem 返回系统完整规则（只读展示，绝不修改）。
 	DumpSystem() (string, error)
 	// Preview 只生成规则文本，不落盘，用于"预览变更"与 dry-run 校验。

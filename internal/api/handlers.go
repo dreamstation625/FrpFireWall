@@ -183,6 +183,25 @@ func (s *Server) handleManagedRules(c *gin.Context) {
 	ok(c, rules)
 }
 
+// handleCounters 返回内核丢包统计：当前读数 + 相对上一批的增幅 + 趋势。
+//
+// 读不到计数时**不报错**，返回带 unsupported 说明的空结果 —— 界面要能显示
+// "这个后端数不出数"，而不是弹一个红框。
+func (s *Server) handleCounters(c *gin.Context) {
+	hours := 24
+	if h := c.Query("hours"); h != "" {
+		if n, err := strconv.Atoi(h); err == nil && n > 0 && n <= 24*30 {
+			hours = n
+		}
+	}
+	snap, err := s.guard.CountersSnapshot(hours)
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	ok(c, snap)
+}
+
 func (s *Server) handleSystemRules(c *gin.Context) {
 	drv := s.driver()
 	if drv == nil {

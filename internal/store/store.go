@@ -76,6 +76,7 @@ func (s *Store) migrate() error {
 		&model.Policy{},
 		&model.RateRule{},
 		&model.Event{},
+		&model.CounterSample{},
 		&model.RuleChange{},
 		&model.FirewallProfile{},
 		&model.Setting{},
@@ -641,6 +642,72 @@ func (s *Store) EventStats(since time.Time) (*EventStats, error) {
 // PurgeEvents 清理超过保留期的事件，防止表无限增长。
 func (s *Store) PurgeEvents(before time.Time) (int64, error) {
 	tx := s.db.Where("ts < ?", before).Delete(&model.Event{})
+	return tx.RowsAffected, tx.Error
+}
+
+// ---------- 丢包计数采样 ----------
+
+// SaveCounterSamples 写入一批采样点。
+//
+// 调用方必须给这批行传**同一个** Ts：查"上一批"靠的是
+// `ts < 当前` 里的最大值，同一批里 Ts 不一致会把它自己也算成历史批次。
+func (s *Store) SaveCounterSamples(rows []model.CounterSample) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return s.db.CreateInBatches(rows, 200).Error
+}
+
+// LatestCounterBatch 返回不晚于 before 的**最近一批**采样点。
+//
+// 没有更早的批次时返回空切片（不是错误）：还没采过样就是这种情况，界面上按
+// "没有可比的历史"处理，增幅显示为 — 而不是把当前值整个当成增量。
+//
+// 边界用 `<=` 而不是 `<`：采样与查询可能落在系统时钟的同一个刻度上
+// （Windows 的时钟粒度约 15ms，两次 time.Now() 完全可以相等），
+// 用 `<` 会把刚采的那批排除掉，表现成"明明采过样却说没有基线"。
+func (s *Store) LatestCounterBatch(before time.Time) ([]model.CounterSample, error) {
+	// 先定位批次时间，再整批取回。分两步而不是一个 IN 子查询，是因为
+	// sqlite 对带 ORDER BY 的子查询优化得很差，两步反而更稳。
+	//
+	// 用 Pluck 而不是 Scan 到单个 time.Time：Scan 的单列基本类型目标在
+	// 不同驱动下行为不一致，Pluck 是"取一列"的正经写法。
+	var stamps []time.Time
+	if err := s.db.Model(&model.CounterSample{}).
+		Where("ts <= ?", before).Order("ts DESC").Limit(1).
+		Pluck("ts", &stamps).Error; err != nil {
+		return nil, err
+	}
+	if len(stamps) == 0 {
+		return nil, nil
+	}
+	ts := stamps[0]
+	if ts.IsZero() {
+		return nil, nil
+	}
+	out := make([]model.CounterSample, 0, 32)
+	if err := s.db.Where("ts = ?", ts).Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CounterSeries 返回时间窗内的全部采样点，由调用方聚合画图。
+//
+// 不在这里做 GROUP BY 求和：不同的界面要的聚合方式不一样（总量趋势 vs 单条目
+// 趋势），在 store 里定死一种就只能再加一个方法。数据量也可控 —— 每小时一批、
+// 每批条目数与封禁规模同量级。
+func (s *Store) CounterSeries(since time.Time) ([]model.CounterSample, error) {
+	out := make([]model.CounterSample, 0, 256)
+	if err := s.db.Where("ts >= ?", since).Order("ts ASC").Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PurgeCounterSamples 清理超过保留期的采样点。
+func (s *Store) PurgeCounterSamples(before time.Time) (int64, error) {
+	tx := s.db.Where("ts < ?", before).Delete(&model.CounterSample{})
 	return tx.RowsAffected, tx.Error
 }
 

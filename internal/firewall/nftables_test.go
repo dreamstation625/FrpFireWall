@@ -39,15 +39,15 @@ func TestRenderScriptFamilyPlacement(t *testing.T) {
 				{target: inet, bits: 128},
 			},
 			want: []string{
-				"insert rule inet filter input ip saddr @frpfirewall_black drop",
-				"insert rule inet filter input ip6 saddr @frpfirewall_black6 drop",
+				"insert rule inet filter input ip saddr @frpfirewall_black counter drop",
+				"insert rule inet filter input ip6 saddr @frpfirewall_black6 counter drop",
 			},
 		},
 		{
 			name:   "只有 ip 家族（故障现场）",
 			stacks: []nftStack{{target: ip4, bits: 32}},
 			want: []string{
-				"insert rule ip filter INPUT ip saddr @frpfirewall_black drop",
+				"insert rule ip filter INPUT ip saddr @frpfirewall_black counter drop",
 				"add element ip filter frpfirewall_black { 198.51.100.0/24, 203.0.113.7/32 }",
 			},
 			notWant: []string{"ip6"},
@@ -56,7 +56,7 @@ func TestRenderScriptFamilyPlacement(t *testing.T) {
 			name:   "只有 ip6 家族",
 			stacks: []nftStack{{target: ip6, bits: 128}},
 			want: []string{
-				"insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6 drop",
+				"insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6 counter drop",
 				"add element ip6 filter frpfirewall_black6 { 2001:db8::1/128 }",
 			},
 			notWant: []string{"ip saddr"},
@@ -68,8 +68,8 @@ func TestRenderScriptFamilyPlacement(t *testing.T) {
 				{target: ip6, bits: 128},
 			},
 			want: []string{
-				"insert rule ip filter INPUT ip saddr @frpfirewall_black drop",
-				"insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6 drop",
+				"insert rule ip filter INPUT ip saddr @frpfirewall_black counter drop",
+				"insert rule ip6 filter INPUT ip6 saddr @frpfirewall_black6 counter drop",
 			},
 		},
 	}
@@ -184,9 +184,9 @@ func TestRenderScriptRateRulesAreIsolated(t *testing.T) {
 	got := renderScript(stacks, des, nil, planRateRules(des.RateLimits))
 
 	for _, want := range []string{
-		`ip saddr { 203.0.113.0/24 } tcp dport { 20000-30000 } ct state new add @frpfirewall_rate_r1 { ip saddr limit rate over 5/second burst 10 packets } drop`,
-		`ip saddr { 198.51.100.0/24 } tcp dport { 880, 8443 } ct state new add @frpfirewall_rate_r2 { ip saddr limit rate over 50/second burst 100 packets } drop`,
-		`tcp dport { 7000 } ct state new add @frpfirewall_rate_global { ip saddr limit rate over 20/second burst 40 packets } drop`,
+		`ip saddr { 203.0.113.0/24 } tcp dport { 20000-30000 } ct state new add @frpfirewall_rate_r1 { ip saddr limit rate over 5/second burst 10 packets } counter drop`,
+		`ip saddr { 198.51.100.0/24 } tcp dport { 880, 8443 } ct state new add @frpfirewall_rate_r2 { ip saddr limit rate over 50/second burst 100 packets } counter drop`,
+		`tcp dport { 7000 } ct state new add @frpfirewall_rate_global { ip saddr limit rate over 20/second burst 40 packets } counter drop`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
@@ -302,8 +302,8 @@ func TestPreviewFallsBackToInetDoubleStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"insert rule inet filter input ip saddr @frpfirewall_black drop",
-		"insert rule inet filter input ip6 saddr @frpfirewall_black6 drop",
+		"insert rule inet filter input ip saddr @frpfirewall_black counter drop",
+		"insert rule inet filter input ip6 saddr @frpfirewall_black6 counter drop",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("缺少 %q\n%s", want, got)
@@ -356,11 +356,11 @@ func TestRenderScriptPortScope(t *testing.T) {
 			"add element inet filter " + set4 + " { 198.51.100.9/32 }",
 			"add element inet filter " + set6 + " { 2001:db8::5/128 }",
 			// 端口归一化后升序；TCP 与 UDP 都要有，只封 TCP 会留下 UDP 绕过路径
-			"tcp dport { 7000, 7100 } ip saddr @" + set4 + " drop",
-			"udp dport { 7000, 7100 } ip saddr @" + set4 + " drop",
-			"tcp dport { 7000, 7100 } ip6 saddr @" + set6 + " drop",
+			"tcp dport { 7000, 7100 } ip saddr @" + set4 + " counter drop",
+			"udp dport { 7000, 7100 } ip saddr @" + set4 + " counter drop",
+			"tcp dport { 7000, 7100 } ip6 saddr @" + set6 + " counter drop",
 			// 全端口那部分不受影响
-			"insert rule inet filter input ip saddr @frpfirewall_black drop",
+			"insert rule inet filter input ip saddr @frpfirewall_black counter drop",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
@@ -380,7 +380,7 @@ func TestRenderScriptPortScope(t *testing.T) {
 			}},
 		}, nil, nil)
 
-		want := "tcp dport { 880, 8443, 20000-30000 } ip saddr @" + portSetName(32, wide.String()) + " drop"
+		want := "tcp dport { 880, 8443, 20000-30000 } ip saddr @" + portSetName(32, wide.String()) + " counter drop"
 		if !strings.Contains(got, want) {
 			t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
 		}
@@ -436,8 +436,8 @@ func TestRenderScriptPortScope(t *testing.T) {
 		for _, want := range []string{
 			"add element inet filter " + portSetName(32, "7000") + " { 198.51.100.9/32 }",
 			"add element inet filter " + portSetName(32, "8080") + " { 203.0.113.7/32 }",
-			"tcp dport { 7000 } ip saddr @" + portSetName(32, "7000") + " drop",
-			"tcp dport { 8080 } ip saddr @" + portSetName(32, "8080") + " drop",
+			"tcp dport { 7000 } ip saddr @" + portSetName(32, "7000") + " counter drop",
+			"tcp dport { 8080 } ip saddr @" + portSetName(32, "8080") + " counter drop",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("缺少 %q\n--- 实际脚本 ---\n%s", want, got)
@@ -458,10 +458,10 @@ func TestRenderScriptPortScope(t *testing.T) {
 		got := renderScript(stacks, onlyV4, nil, nil)
 
 		v4, v6 := portSetName(32, "7000"), portSetName(128, "7000")
-		if !strings.Contains(got, "ip saddr @"+v4+" drop") {
+		if !strings.Contains(got, "ip saddr @"+v4+" counter drop") {
 			t.Errorf("IPv4 落点上缺少端口限定规则\n%s", got)
 		}
-		if strings.Contains(got, "ip6 saddr @"+v6+" drop") {
+		if strings.Contains(got, "ip6 saddr @"+v6+" counter drop") {
 			t.Errorf("IPv6 下没有任何该类地址，不该为它生成规则\n%s", got)
 		}
 	})
@@ -494,10 +494,10 @@ func TestRenderScriptPortRulesComeAfterAllPortRules(t *testing.T) {
 
 	all, port := -1, -1
 	for i, line := range insertOrder(got) {
-		if strings.Contains(line, "@"+setBlack+" drop") {
+		if strings.Contains(line, "@"+setBlack+" counter drop") {
 			all = i
 		}
-		if strings.Contains(line, "@"+portSetName(32, "7000")+" drop") {
+		if strings.Contains(line, "@"+portSetName(32, "7000")+" counter drop") {
 			port = i
 		}
 	}

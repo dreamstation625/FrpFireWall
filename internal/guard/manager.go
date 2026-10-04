@@ -248,6 +248,10 @@ func (m *Manager) Start(ctx context.Context) error {
 		} else if err := m.Reconcile(); err != nil {
 			m.log.Error("初始规则同步失败", "err", err)
 		}
+		// 先采一次：不采的话第一条趋势要等一小时后才出现，而"刚启动就想知道
+		// 拦了多少"是最常见的诉求。放在 Reconcile 之后 —— 规则都还没下发时
+		// 读到的是空表，采出来的是一批全是 0 的噪声。
+		m.sampleCounters()
 	}
 
 	go m.eventLoop(ctx)
@@ -931,6 +935,10 @@ func (m *Manager) tickLoop(ctx context.Context) {
 	defer sec.Stop()
 	clean := time.NewTicker(5 * time.Minute)
 	defer clean.Stop()
+	// 丢包计数采样。与 clean 分开：清理是"防止表无限长"的兜底，采样是
+	// 定时取数，两者节奏不一样，绑在一起改一个就会动到另一个。
+	sample := time.NewTicker(counterSampleInterval)
+	defer sample.Stop()
 
 	for {
 		select {
@@ -957,9 +965,12 @@ func (m *Manager) tickLoop(ctx context.Context) {
 			}
 		case <-sec.C:
 			m.expireBans()
+		case <-sample.C:
+			m.sampleCounters()
 		case <-clean.C:
 			m.pruneWindows()
 			m.purgeEvents()
+			m.purgeCounterSamples()
 		}
 	}
 }

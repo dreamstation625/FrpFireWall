@@ -75,6 +75,8 @@ export const api = {
 
   // ---- 防火墙 ----
   managedRules: () => http.get('/firewall/managed'),
+  // 丢包统计。hours 决定趋势窗口，服务端上限 720 小时（30 天）。
+  counters: (hours = 24) => http.get('/firewall/counters', { params: { hours } }),
   systemRules: () => http.get('/firewall/system'),
   preview: () => http.post('/firewall/preview'),
   reconcile: () => http.post('/firewall/reconcile'),

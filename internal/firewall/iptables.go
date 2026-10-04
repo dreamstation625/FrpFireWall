@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/dreamstation625/FrpFireWall/internal/portrange"
@@ -75,6 +76,8 @@ func (d *iptablesDriver) Capability() Capability {
 	}
 	if d.report.HasIPTables {
 		c.RateLimit = true // hashlimit 自 iptables 1.4 起都有
+		// 每个地址一条规则，所以计数能细到地址。
+		c.CounterGranularity = CounterKindAddr
 	} else {
 		c.Reason = "未找到 iptables 命令"
 	}
@@ -383,6 +386,107 @@ func (d *iptablesDriver) DumpManaged() (*ManagedRules, error) {
 
 	res.Raw = raw.String()
 	return res, nil
+}
+
+// Counters 读两条黑名单子链的丢包计数。
+//
+// 主链（FRPFIREWALL_GUARD）里的跳转规则不统计：它的计数只是"进了这条链多少
+// 包"，而里面真正 DROP 的是子链里的规则，两边数会重复。
+func (d *iptablesDriver) Counters() ([]RuleCounter, error) {
+	ctx := context.Background()
+	var out []RuleCounter
+	for _, f := range d.fams {
+		for _, item := range []struct {
+			chain string
+			kind  string
+		}{
+			{managedBlackChain, CounterKindAddr},
+			{managedPortBlackChain, CounterKindPort},
+		} {
+			// -L -n -v -x 是拿计数的唯一组合：-S 不带计数列、-v 才有 pkts/bytes、
+			// -x 关掉 K/M/G 的单位换算（不关的话读出来是 "12M" 这种字符串）。
+			res, err := run(ctx, f.bin, "-w", "-L", item.chain, "-n", "-v", "-x")
+			if err != nil {
+				// 链还不存在（没跑过 EnsureBase）不算错误，跳过这一族即可。
+				continue
+			}
+			out = append(out, parseIPTablesCounters(res, f.name, item.kind)...)
+		}
+	}
+	return out, nil
+}
+
+// parseIPTablesCounters 解析 `iptables -L <链> -n -v -x` 的输出。
+//
+// 输出是列式表格，前九列恒为：
+//
+//	pkts bytes target prot opt in out source destination
+//
+// 注意 in / out 是**两列**（平时都是 *），所以 source 在第 8 列、destination
+// 在第 9 列 —— 按"看起来有几个词"去数是很容易差一位的。后面才是 -m multiport
+// 之类的附加匹配（dports 就藏在里面）。定位 source 用列号而不是关键字搜索：
+// 地址后面的字段随规则形态变化，靠关键字找不稳。
+//
+// 抽成纯函数是为了能脱离内核单测 —— 本机跑不了 iptables，只能用真实格式的
+// 输出样本验证解析。
+func parseIPTablesCounters(raw, family, kind string) []RuleCounter {
+	out := make([]RuleCounter, 0, 8)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Chain ") || strings.HasPrefix(line, "pkts") {
+			continue
+		}
+		f := strings.Fields(line)
+		// 八列是下限：pkts bytes target prot opt in out source。
+		// destination 在没有端口匹配时也可能被省略，所以不要求第九列。
+		if len(f) < 8 {
+			continue
+		}
+		pkts, err1 := strconv.ParseUint(f[0], 10, 64)
+		octets, err2 := strconv.ParseUint(f[1], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue // 表头变体、或这行压根不是规则
+		}
+		// 只数 DROP：子链里将来若加 ACCEPT / RETURN，它们的计数不是"拦截量"。
+		if !strings.EqualFold(f[2], "DROP") {
+			continue
+		}
+		src := f[7]
+		// 不限来源的规则不是条目级封禁，算进按条目统计里会虚高一大截。
+		if src == "0.0.0.0/0" || src == "::/0" || src == "anywhere" {
+			continue
+		}
+		key, label := src, src
+		// destination 之后才是附加匹配：multiport dports ... / tcp dpt:7000
+		if len(f) > 9 {
+			if ports := iptablesPortFields(f[9:]); ports != "" {
+				key += "|" + ports
+				label += " 端口 " + ports
+			}
+		}
+		out = append(out, RuleCounter{
+			Kind: kind, Key: key, Label: label, Family: family,
+			Packets: pkts, Bytes: octets,
+		})
+	}
+	return out
+}
+
+// iptablesPortFields 从选项字段里摘出端口条件，没有就返回空串。
+//
+// `-L` 的输出里 multiport 长成 "multiport dports 7000,7001"，tcp 的则是
+// "tcp dpt:7000"。两种都要认，否则端口限定的条目会和全端口的撞成同一个 Key
+// —— 同一个地址在两条链里各有一条规则，Key 撞了就只能看到其中一个的计数。
+func iptablesPortFields(rest []string) string {
+	for i, s := range rest {
+		if (s == "dports" || s == "dport" || s == "sports") && i+1 < len(rest) {
+			return rest[i+1]
+		}
+		if after, ok := strings.CutPrefix(s, "dpt:"); ok && after != "" {
+			return after
+		}
+	}
+	return ""
 }
 
 func (d *iptablesDriver) DumpSystem() (string, error) {

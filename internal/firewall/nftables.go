@@ -135,6 +135,10 @@ func (d *nftablesDriver) Capability() Capability {
 		Supported: d.report.HasNFTables,
 		RateLimit: nftVersionAtLeast(d.report.NFTablesVersion, 0, 9, 3),
 	}
+	if c.Supported {
+		// 地址装在集合里、规则只有一条，所以计数只能到分组这一层。
+		c.CounterGranularity = CounterKindGroup
+	}
 	if !d.report.HasNFTables {
 		c.Reason = "未找到 nft 命令，Debian/Ubuntu 请执行 apt install nftables"
 	} else if !c.RateLimit {
@@ -531,11 +535,15 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 		comment string
 	}
 
+	// 每条规则都带 counter：nft 不像 iptables 那样默认数数，规则里没有
+	// counter 表达式内核就一个包都不记，界面上的"丢包统计"只能是 0。
+	// counter 必须放在 drop **之前** —— drop 是终止性语句，写在它后面的
+	// 表达式根本不会执行。
 	forward := make([]nftRule, 0, len(stacks)*3)
 	for _, s := range stacks {
 		forward = append(forward, nftRule{
 			stack:   s,
-			expr:    fmt.Sprintf("%s saddr @%s drop", s.proto(), s.set()),
+			expr:    fmt.Sprintf("%s saddr @%s counter drop", s.proto(), s.set()),
 			comment: s.comment(),
 		})
 	}
@@ -554,7 +562,7 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 			for _, pe := range exprs {
 				forward = append(forward, nftRule{
 					stack:   s,
-					expr:    fmt.Sprintf("%s %s saddr @%s drop", pe, s.proto(), s.portSet(g.Key)),
+					expr:    fmt.Sprintf("%s %s saddr @%s counter drop", pe, s.proto(), s.portSet(g.Key)),
 					comment: s.commentPort(g.Key),
 				})
 			}
@@ -696,6 +704,104 @@ func (d *nftablesDriver) DumpManaged() (*ManagedRules, error) {
 
 	res.Raw = b.String()
 	return res, nil
+}
+
+// Counters 读受管规则的丢包计数。
+//
+// 粒度只能到**规则**，到不了地址：地址装在集合里、规则只有一条，内核在规则上
+// 数数。要做到按地址只能放弃集合、给每个地址单插一条规则，地址一多规则条数
+// 就爆炸 —— 不值当。所以这里返回的条目是"全端口那一组""某个端口组""某条
+// 限速规则"这种分组级别的量。
+func (d *nftablesDriver) Counters() ([]RuleCounter, error) {
+	if !d.ready {
+		if err := d.EnsureBase(); err != nil {
+			return nil, err
+		}
+	}
+	ctx := context.Background()
+
+	var out []RuleCounter
+	// inet 家族下两个协议栈共用一条链，链只列一次，否则同一批规则会重复计数。
+	listed := make(map[nftTarget]bool, len(d.stacks))
+	for _, s := range d.stacks {
+		if listed[s.target] {
+			continue
+		}
+		listed[s.target] = true
+		res, err := run(ctx, "nft", "-a", "list", "chain", s.target.Family, s.target.Table, s.target.Chain)
+		if err != nil {
+			continue
+		}
+		out = append(out, parseNFTCounters(res)...)
+	}
+	return out, nil
+}
+
+// nftCounterRe / nftCommentRe 匹配 `nft list chain` 一条规则里的计数与归属注释。
+//
+// 只认同时带 comment 的规则：comment 是"这条规则属于本程序"的唯一标记，
+// 链里还有系统自己的规则，没有 comment 的一概不算我们的。
+var (
+	nftCounterRe = regexp.MustCompile(`counter packets (\d+) bytes (\d+)`)
+	nftCommentRe = regexp.MustCompile(`comment "([^"]*)"`)
+)
+
+// parseNFTCounters 解析 `nft -a list chain` 的输出。
+//
+// 抽成纯函数只为能单测：本机没有 nft，只有拿真实格式的输出样本喂进去这一条路。
+func parseNFTCounters(raw string) []RuleCounter {
+	out := make([]RuleCounter, 0, 8)
+	for _, line := range strings.Split(raw, "\n") {
+		cm := nftCommentRe.FindStringSubmatch(line)
+		if cm == nil || !strings.Contains(cm[1], commentPrefix) {
+			continue
+		}
+		// 没有 counter 表达式的规则数不出数：可能是老版本程序插进去的残留，
+		// 也可能是 counter 被手工去掉了。跳过而不是报 0 —— 报 0 会让人以为
+		// "这条规则在生效但一个包都没拦到"。
+		ct := nftCounterRe.FindStringSubmatch(line)
+		if ct == nil {
+			continue
+		}
+		pkts, err1 := strconv.ParseUint(ct[1], 10, 64)
+		octets, err2 := strconv.ParseUint(ct[2], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		comment := cm[1]
+		kind, label := nftCounterKind(comment)
+		out = append(out, RuleCounter{
+			Kind: kind, Key: comment, Label: label,
+			Family: nftCounterFamily(line), Packets: pkts, Bytes: octets,
+		})
+	}
+	return out
+}
+
+// nftCounterKind 按规则注释判断这条计数属于哪一类。
+func nftCounterKind(comment string) (kind, label string) {
+	switch {
+	case strings.HasPrefix(comment, commentPortPrefix):
+		return CounterKindPort, "端口限定"
+	case strings.HasPrefix(comment, commentRate):
+		return CounterKindRate, "限速"
+	case strings.HasPrefix(comment, commentBlack):
+		return CounterKindGroup, "全端口封禁"
+	}
+	return CounterKindGroup, "受管规则"
+}
+
+// nftCounterFamily 从规则表达式里认协议栈，认不出返回空串。
+//
+// 不能用链的家族：inet 家族下一条链里同时装着 ip 与 ip6 的规则。
+func nftCounterFamily(line string) string {
+	switch {
+	case strings.Contains(line, "ip6 saddr"):
+		return "ipv6"
+	case strings.Contains(line, "ip saddr"):
+		return "ipv4"
+	}
+	return ""
 }
 
 func (d *nftablesDriver) setSize(ctx context.Context, s nftStack, name string) int {
@@ -963,7 +1069,7 @@ func planRateRules(list []RateLimitRule) []nftRatePlan {
 //
 // nftables 没有 hashlimit 等价物，标准做法是用带 timeout 的动态集合计数：
 //
-//	tcp dport { 20000-30000 } ct state new add @frpfirewall_rate_x { ip saddr limit rate over 20/second burst 40 packets } drop
+//	tcp dport { 20000-30000 } ct state new add @frpfirewall_rate_x { ip saddr limit rate over 20/second burst 40 packets } counter drop
 //
 // 表达式只对 IPv4 有效（集合元素类型是 ipv4_addr），所以只用在 IPv4 落点上。
 //
@@ -985,7 +1091,8 @@ func nftRateExpr(r RateLimitRule, set string) (string, bool) {
 	} else {
 		b.WriteString("tcp ")
 	}
-	fmt.Fprintf(&b, "ct state new add @%s { ip saddr limit rate over %d/second burst %d packets } drop",
+	// counter 同样放在 drop 之前：drop 之后写的表达式不会被执行。
+	fmt.Fprintf(&b, "ct state new add @%s { ip saddr limit rate over %d/second burst %d packets } counter drop",
 		set, r.PerSec, r.burst())
 	return b.String(), true
 }

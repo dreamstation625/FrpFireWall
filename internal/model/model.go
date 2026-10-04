@@ -347,6 +347,30 @@ type Event struct {
 	Actor    string    `gorm:"size:64" json:"actor"`
 }
 
+// CounterSample 一次采样里某条受管规则的丢包计数快照。
+//
+// 存它是为了两件事：画趋势图，以及算"最近一小时新增多少"。计数本身来自内核、
+// 规则重建就归零，所以表里存的是**一个个读数**而不是累加出来的总量 ——
+// 总量由读的时候做差得出（差值为负说明这中间重建过规则，见 guard 的采样说明）。
+//
+// 一次采样写进来的所有行共用同一个 Ts，靠它把"同一批"区分开：查上一批就是
+// 找小于当前 Ts 的最大 Ts，不需要额外的批次号字段。
+type CounterSample struct {
+	ID      uint      `gorm:"primaryKey" json:"id"`
+	Ts      time.Time `gorm:"index:idx_cs_ts;not null" json:"ts"`
+	Backend string    `gorm:"size:16;not null" json:"backend"`
+	// Kind / Key / Family 与 firewall.RuleCounter 的三个字段一一对应，
+	// 是这条计数在两次采样之间对得上的唯一凭据。
+	Kind   string `gorm:"size:16;not null" json:"kind"`
+	Key    string `gorm:"size:160;index:idx_cs_key;not null" json:"key"`
+	Family string `gorm:"size:8" json:"family"`
+	// Label 冗余存一份：它来自当次采样时的端口分组名，分组被改名或删掉之后，
+	// 历史采样点仍要能说清自己是谁。
+	Label   string `gorm:"size:128" json:"label"`
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
+}
+
 // RuleChange 防火墙规则变更审计。
 type RuleChange struct {
 	ID      uint      `gorm:"primaryKey" json:"id"`

@@ -139,6 +139,7 @@ func (s *Server) Routes() http.Handler {
 
 		// ---- 防火墙 ----
 		auth.GET("/firewall/managed", s.handleManagedRules)
+		auth.GET("/firewall/counters", s.handleCounters)
 		auth.GET("/firewall/system", s.handleSystemRules)
 		auth.POST("/firewall/preview", s.handlePreview)
 		auth.POST("/firewall/reconcile", s.handleReconcile)
