@@ -1,6 +1,8 @@
 package api
 
 import (
+	"strconv"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/dreamstation625/FrpFireWall/internal/config"
@@ -18,9 +20,10 @@ func (s *Server) storedConfig() (*config.Config, error) {
 
 // effectiveSettings 是"当前进程里正在生效"的配置快照。
 //
-// 与启动时那份 s.cfg 唯一的区别在支持热改的字段上：目前只有 frp 代理端口
-// （PUT /frps/protect-ports 保存后立即生效）。不把这两者区分开的话，在 frp
-// 接入页改完端口，配置页会一直标着"需要重启"——而它其实已经在生效了。
+// 与启动时那份 s.cfg 唯一的区别在支持热改的字段上：目前是 frp 代理端口
+// （PUT /frps/protect-ports 保存后立即生效）与事件保留天数（保存系统配置后
+// 立即生效）。不把这两者区分开的话，在 frp 接入页改完端口、或在系统设置里
+// 改完保留天数，配置页会一直标着"需要重启"——而它们其实已经在生效了。
 //
 // 不直接改 s.cfg 是有意的：那份配置被多个组件共享（驱动、guard 都拿着同一个
 // 指针），运行期就地改字段会让"这份配置是什么时候的"变得没法回答。
@@ -28,6 +31,7 @@ func (s *Server) effectiveSettings() map[string]string {
 	m := s.cfg.ToSettings()
 	_, proxyPorts, _ := s.guard.FrpsPorts()
 	m[config.KeyProxyPorts] = proxyPorts.String()
+	m[config.KeyEventRetention] = strconv.Itoa(s.guard.EventRetention())
 	return m
 }
 
@@ -80,6 +84,11 @@ func (s *Server) handleUpdateConfig(c *gin.Context) {
 		serverErr(c, err)
 		return
 	}
+
+	// 事件保留期走热更路径：落库之后立刻换成新的运行期值，并按新保留期清一次
+	// 超期数据 —— 不必重启，也不必等下一个清理周期。其余字段（监听地址、TLS、
+	// 日志）仍然是"存下来、重启才生效"。
+	s.guard.SetEventRetention(in.Event.RetentionDays)
 
 	_ = s.store.AddEvent(&model.Event{
 		Category: model.EvtConfig,

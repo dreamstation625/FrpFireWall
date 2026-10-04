@@ -36,6 +36,7 @@ const (
 	KeyLogFile        = "cfg.log.file"
 	KeyUpdateEnabled  = "cfg.update.enabled"
 	KeyUpdateRepo     = "cfg.update.repo"
+	KeyEventRetention = "cfg.event.retention_days"
 
 	// KeyJWTSecret 是面板 token 的签名密钥，自动生成，不对外暴露。
 	KeyJWTSecret = "jwt_secret"
@@ -64,6 +65,7 @@ func (c *Config) ToSettings() map[string]string {
 		KeyLogFile:        c.Log.File,
 		KeyUpdateEnabled:  strconv.FormatBool(c.Update.Enabled),
 		KeyUpdateRepo:     c.Update.Repo,
+		KeyEventRetention: strconv.Itoa(c.Event.RetentionDays),
 	}
 }
 
@@ -117,6 +119,12 @@ func FromSettings(m map[string]string) (*Config, error) {
 	c.Update.Enabled = parseBool(m[KeyUpdateEnabled], c.Update.Enabled)
 	if v := strings.TrimSpace(m[KeyUpdateRepo]); v != "" {
 		c.Update.Repo = v
+	}
+	// 解析失败与负数一律保持默认。这里读的是库里的值，坏值不该让进程起不来
+	// （接口保存路径上的负数由 normalize 拦掉，会给用户一句能看懂的原因）。
+	// 0 是合法值，含义是永久保留，所以判断条件是 >= 0 而不是 > 0。
+	if v := parseInt(m[KeyEventRetention], -1); v >= 0 {
+		c.Event.RetentionDays = v
 	}
 
 	if err := c.normalize(); err != nil {

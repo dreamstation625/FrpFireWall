@@ -536,6 +536,37 @@ check "回填未清空更新检查开关" \
   "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.update.enabled)" \
   "$(printf '%s' "$CFGBODY" | jqf update.enabled)"
 
+# 事件保留期与端口相反：它走热更，**保存后立即生效**，不该提示"需要重启"。
+# 两个方向都要钉住 —— 提示错了的代价是用户白重启一次服务，或者更糟：
+# 提示"已生效"但实际要重启，于是新的保留期一直没起作用。
+check "事件保留期默认 30 天" \
+  "$(printf '%s' "$CFG" | jqf data.config.event.retention_days)" "30"
+printf '%s' "$CFGBODY" | mut event.retention_days=7 > /tmp/cfg_ret.json
+R=$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_ret.json)
+check "事件保留期改动立即生效、不提示重启" "$(printf '%s' "$R" | jqf data.restart_required)" "false"
+check "事件保留期已落库" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.event.retention_days)" "7"
+
+# 0 是合法值：含义是"永久保留"，也就是关掉自动清理。它被"非正数取默认"
+# 那类写法吃掉的后果是清理被悄悄关掉，而界面上显示的仍是 0，看不出来。
+printf '%s' "$CFGBODY" | mut event.retention_days=0 > /tmp/cfg_ret0.json
+R=$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_ret0.json)
+check "事件保留期 0 可保存" "$(printf '%s' "$R" | jqf data.restart_required)" "false"
+check "事件保留期 0 已落库" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.event.retention_days)" "0"
+
+# 负数必须被拒：静默归零等于顺手把自动清理关掉，而用户可能只是漏打一位。
+printf '%s' "$CFGBODY" | mut event.retention_days=-1 > /tmp/cfg_retbad.json
+check_err "事件保留期负数被拒" \
+  "$(get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_retbad.json | jqf error)" \
+  "保留"
+
+printf '%s' "$CFGBODY" > /tmp/cfg_retok.json
+get -X PUT "$BASE/api/v1/config" -H "$AUTH" -H 'Content-Type: application/json' -d @/tmp/cfg_retok.json > /dev/null
+check "事件保留期已还原" \
+  "$(get -H "$AUTH" "$BASE/api/v1/config" | jqf data.config.event.retention_days)" \
+  "$(printf '%s' "$CFGBODY" | jqf event.retention_days)"
+
 # 受保护端口（bind_port ∪ proxy_ports）在 frp 接入页可以就地改，且**立即生效**。
 # 与上面那次 PUT /config 的区别只在生效时机，两者都保留是有意的：
 # 走 /config 是"改了启动期配置、需要重启"，走这里只重算内核规则、不用重启。

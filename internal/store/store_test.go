@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/dreamstation625/FrpFireWall/internal/model"
 )
@@ -281,5 +282,50 @@ func TestListEventsPage(t *testing.T) {
 		t.Fatal(err)
 	} else if len(zero.Items) != 3 {
 		t.Errorf("page=0 应被当成第 1 页，得到 %d 条", len(zero.Items))
+	}
+}
+
+// 事件清理只删除保留线之前的那部分。
+//
+// 用 31 / 29 天而不是恰好 30 天来构造数据：SQLite 里 time.Time 是存成
+// datetime 文本的，边界上相等的那条会落到"删或留都对"的模糊地带，
+// 断言它只会让这条测试变成随机红。这里只钉住明确的两侧。
+func TestPurgeEventsRemovesOnlyExpired(t *testing.T) {
+	s := openTemp(t)
+	now := time.Now()
+
+	for i, ts := range []time.Time{
+		now.AddDate(0, 0, -31), // 超期，该删
+		now.AddDate(0, 0, -29), // 未超期，该留
+		now.Add(-time.Minute),  // 刚写入，该留
+	} {
+		if err := s.AddEvent(&model.Event{
+			Category: model.EvtLoginBlocked,
+			IP:       fmt.Sprintf("203.0.113.%d", i+1),
+			Ts:       ts,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := s.PurgeEvents(now.AddDate(0, 0, -30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("删除了 %d 条，期望 1 条", n)
+	}
+
+	left, err := s.ListEventsPage("", "", nil, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left.Total != 2 {
+		t.Fatalf("清理后剩 %d 条，期望 2 条", left.Total)
+	}
+	for _, e := range left.Items {
+		if e.IP == "203.0.113.1" {
+			t.Error("31 天前的那条没被清掉")
+		}
 	}
 }

@@ -242,7 +242,8 @@ sudo systemctl restart frps
 ## 配置
 
 没有配置文件。**所有配置都存在数据目录的 SQLite（`data/frpfirewall.db`）里**，
-在面板 **系统设置** 页修改，改动重启服务后生效。
+在面板 **系统设置** 页修改。多数改动重启服务后生效；**代理端口**与**事件保留天数**
+保存后立即生效。
 
 启动只需要指定数据目录：
 
@@ -262,6 +263,7 @@ frpfirewall -data /var/lib/frpfirewall
 | 总开关 | 开 | 关闭后只判定不写规则 |
 | 观察模式 | 关 | 只记录不封禁，上线前验证误伤 |
 | 日志级别 | `info` | `debug` / `info` / `warn` / `error` |
+| 事件保留 | 30 天 | 超过这个天数的事件由后台定时清理；填 `0` 表示永久保留、不清理。调小会立刻删除超期记录，不可恢复 |
 | 在线检查更新 | 开 | 关闭后面板不访问 GitHub，纯内网部署建议关掉 |
 | 检查来源 | `dreamstation625/FrpFireWall` | 查询 Release 的 GitHub 仓库（`owner/name`） |
 

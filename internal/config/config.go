@@ -30,6 +30,7 @@ type Config struct {
 	Guard  GuardConfig  `json:"guard"`
 	Log    LogConfig    `json:"log"`
 	Update UpdateConfig `json:"update"`
+	Event  EventConfig  `json:"event"`
 }
 
 type ServerConfig struct {
@@ -102,12 +103,28 @@ type UpdateConfig struct {
 	Repo string `json:"repo"`
 }
 
+// EventConfig 控制事件日志的留存。
+type EventConfig struct {
+	// RetentionDays 是事件日志的保留天数，超过这个天数的记录由后台清理。
+	//
+	// 0 表示永久保留，也就是关掉自动清理。这里取「一个数字的 0」而不是另加一个
+	// "启用清理" 开关，是有意的：两个字段能拼出「开关开着但天数是 0」这种没有
+	// 对应行为的组合，而单个数字只有一种解释。负数没有意义，保存时直接拒绝。
+	RetentionDays int `json:"retention_days"`
+}
+
 // DefaultListen 是面板的默认监听地址。
 //
 // 抽成常量是因为它出现在两处：Default() 与 normalize() 的空值兜底。
 // 两处写得不一致会出现「首次启动写 0.0.0.0，配置被清空后又变回
 // 127.0.0.1」这种查起来很费劲的行为。
 const DefaultListen = "0.0.0.0:7930"
+
+// DefaultEventRetentionDays 是事件日志的默认保留天数。
+//
+// 抽成常量是因为它出现在两处：Default() 与从库里读不到该键时的兜底。
+// 事件表只增不减，必须有个默认值顶上 —— 升级上来的老库里没有这个键。
+const DefaultEventRetentionDays = 30
 
 // Default 返回一份可用的默认配置。
 func Default() *Config {
@@ -138,6 +155,9 @@ func Default() *Config {
 		Update: UpdateConfig{
 			Enabled: true,
 			Repo:    version.DefaultRepo,
+		},
+		Event: EventConfig{
+			RetentionDays: DefaultEventRetentionDays,
 		},
 	}
 }
@@ -200,6 +220,13 @@ func (c *Config) normalize() error {
 		if c.Server.TLS.CertFile == "" || c.Server.TLS.KeyFile == "" {
 			return fmt.Errorf("启用 HTTPS 时必须同时填写证书与私钥路径")
 		}
+	}
+
+	// 负数没有可解释的行为，直接拒绝而不是静默归零：静默归零等于"顺手把自动
+	// 清理关掉了"，而用户本来可能只是想填个很小的保留期（比如漏打一个数字）。
+	if c.Event.RetentionDays < 0 {
+		return fmt.Errorf("事件保留天数不能为负数（当前 %d）；填 0 表示永久保留、不做自动清理",
+			c.Event.RetentionDays)
 	}
 
 	if c.Update.Repo == "" {

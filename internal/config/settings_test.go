@@ -126,3 +126,82 @@ func TestPortsJSONAcceptsLegacyShapes(t *testing.T) {
 		}
 	}
 }
+
+// 事件保留期的持久化。
+//
+// 重点是 0 能原样往返：它表示"永久保留"，落地时最容易被"非正数就取默认"
+// 这类写法吃掉，而吃掉的后果是自动清理被悄悄关掉 —— 界面上显示的还是 0，
+// 与行为一致，所以看不出来。
+func TestEventRetentionRoundTrip(t *testing.T) {
+	c := Default()
+	if c.Event.RetentionDays != DefaultEventRetentionDays {
+		t.Fatalf("默认保留天数 = %d，期望 %d", c.Event.RetentionDays, DefaultEventRetentionDays)
+	}
+	if got := c.ToSettings()[KeyEventRetention]; got != "30" {
+		t.Fatalf("落库文本 %q，期望 30", got)
+	}
+
+	for _, want := range []int{DefaultEventRetentionDays, 7, 0, 365} {
+		c.Event.RetentionDays = want
+		back, err := FromSettings(c.ToSettings())
+		if err != nil {
+			t.Fatalf("FromSettings(%d) 报错: %v", want, err)
+		}
+		if back.Event.RetentionDays != want {
+			t.Errorf("回读 = %d，期望 %d", back.Event.RetentionDays, want)
+		}
+	}
+}
+
+// 老库（升级上来的）里没有这个键，必须回落到默认的 30 天而不是 0 ——
+// 0 的含义是永久保留，会把自动清理关掉，事件表从此无限增长。
+func TestEventRetentionDefaultsWhenMissing(t *testing.T) {
+	m := Default().ToSettings()
+	delete(m, KeyEventRetention)
+
+	c, err := FromSettings(m)
+	if err != nil {
+		t.Fatalf("FromSettings 报错: %v", err)
+	}
+	if c.Event.RetentionDays != DefaultEventRetentionDays {
+		t.Fatalf("= %d，期望回落默认的 %d（0 会关掉自动清理）", c.Event.RetentionDays, DefaultEventRetentionDays)
+	}
+}
+
+// 库里被手工改成坏值时回落默认，不让进程起不来。
+// 接口保存路径上的负数由 normalize 拦，读库这条路径上必须自己兜住。
+func TestEventRetentionFallsBackOnBrokenValue(t *testing.T) {
+	for _, bad := range []string{"-1", "-30", "abc", "3.5", ""} {
+		m := Default().ToSettings()
+		m[KeyEventRetention] = bad
+
+		c, err := FromSettings(m)
+		if err != nil {
+			t.Fatalf("坏值 %q 不该让 FromSettings 报错: %v", bad, err)
+		}
+		if c.Event.RetentionDays != DefaultEventRetentionDays {
+			t.Errorf("坏值 %q 回读 = %d，期望默认 %d", bad, c.Event.RetentionDays, DefaultEventRetentionDays)
+		}
+	}
+}
+
+// 接口保存路径要拒负数，但要放行 0。
+//
+// 负数静默归零是个坏选择：0 恰好是"永久保留"，等于顺手把自动清理关掉了，
+// 而用户可能只是漏打了一位（300 → 00 之类的笔误）。
+func TestEventRetentionRejectsNegative(t *testing.T) {
+	c := Default()
+	c.Event.RetentionDays = -1
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("负数保留期应当被拒绝")
+	}
+	if !strings.Contains(err.Error(), "保留") {
+		t.Fatalf("错误信息没说清是哪个字段：%v", err)
+	}
+
+	c.Event.RetentionDays = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("0 是合法值（永久保留），不该报错: %v", err)
+	}
+}

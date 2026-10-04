@@ -94,6 +94,14 @@
         <el-form-item label="日志文件">
           <el-input v-model="form.log.file" placeholder="留空输出到标准输出" />
         </el-form-item>
+        <el-form-item label="事件保留天数">
+          <el-input-number v-model="form.event.retention_days" :min="0" :max="3650" />
+          <span class="unit">天，0 表示永久保留</span>
+          <div class="tip">
+            超过这个天数的事件由后台定时清理。保存后立即生效，
+            <span class="warn">调小会立刻删除超期的历史记录，不可恢复</span>
+          </div>
+        </el-form-item>
         <el-form-item label="数据目录">
           <el-input :model-value="dataDir" disabled />
           <div class="tip">由启动参数 -data 决定，包含数据库与属地库文件</div>
@@ -151,6 +159,7 @@ const form = reactive<any>({
   guard: { enabled: true, dry_run: false },
   log: { level: 'info', file: '' },
   update: { enabled: true, repo: '' },
+  event: { retention_days: 30 },
 })
 
 const proxyPortsText = ref('')
@@ -190,6 +199,7 @@ async function load() {
     form.guard = c.guard || form.guard
     form.log = c.log || form.log
     form.update = c.update || form.update
+    form.event = c.event || form.event
     dataDir.value = r.data_dir || ''
     restartRequired.value = !!r.restart_required
 
@@ -223,6 +233,7 @@ async function save() {
       guard: form.guard,
       log: form.log,
       update: form.update,
+      event: form.event,
     }
     const r: any = await api.updateConfig(body)
     if (r?.restart_required) {
@@ -261,6 +272,11 @@ onMounted(load)
   margin-left: 8px;
   font-size: 12.5px;
   color: #8a919f;
+}
+
+/* 不可逆操作的提示：这一句混在普通 tip 里会被当成套话划过去 */
+.warn {
+  color: #e6a23c;
 }
 
 .actions {

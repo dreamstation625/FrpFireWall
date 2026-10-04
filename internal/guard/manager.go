@@ -155,6 +155,12 @@ type Manager struct {
 	// 免得出现"一半是新的、一半是旧的"这种没人能解释的状态。
 	frpsProxyPorts portrange.Set
 
+	// eventRetention 是运行期生效的事件保留天数，0 表示永久保留。
+	//
+	// 与 frpsProxyPorts 同一个道理：m.cfg 是启动时的快照，而保留期可以在系统设置
+	// 里热改，改完要立刻按新值清一次，不能被 m.cfg 里那份旧值拦住。
+	eventRetention int
+
 	lastSyncAt    time.Time
 	lastSyncErr   string
 	lastSyncRules int
@@ -182,6 +188,8 @@ func New(cfg *config.Config, st *store.Store, geo *geoip.Resolver, drv firewall.
 		applyCh: make(chan struct{}, 1),
 		// 启动时的生效值。之后由 SetFrpsProxyPorts 热改。
 		frpsProxyPorts: cfg.Frps.ProxyPorts.Normalize(),
+		// 同上，之后由 SetEventRetention 热改。
+		eventRetention: cfg.Event.RetentionDays,
 	}
 }
 
@@ -905,12 +913,42 @@ func (m *Manager) pruneWindows() {
 	}
 }
 
-// purgeEvents 清理超过保留期的事件。
+// purgeEvents 按当前生效的保留期清理过期事件。
+//
+// 保留期为 0 表示永久保留，此时什么都不做 —— 不为了删 0 条去扫一遍表。
 func (m *Manager) purgeEvents() {
-	before := time.Now().AddDate(0, 0, -30)
-	if n, err := m.store.PurgeEvents(before); err == nil && n > 0 {
-		m.log.Info("清理历史事件", "removed", n)
+	days := m.EventRetention()
+	if days <= 0 {
+		return
 	}
+	before := time.Now().AddDate(0, 0, -days)
+	if n, err := m.store.PurgeEvents(before); err == nil && n > 0 {
+		m.log.Info("清理历史事件", "removed", n, "retention_days", days)
+	}
+}
+
+// SetEventRetention 热改事件保留天数（0 表示永久保留），并立刻清一次。
+//
+// 立刻清而不是等下一个 5 分钟清理周期：用户刚把 30 改成 7，界面上那些更老的
+// 记录若还挂着，他没法判断是没生效还是没到清理时间。清完刷新就能看到结果。
+//
+// 这是个写操作，且由接口请求同步触发 —— 清理走的是 ts 上的索引，量级可控
+// （事件表本身就是按这个保留期在裁剪的，不会积累到需要很久才能删完）。
+func (m *Manager) SetEventRetention(days int) {
+	if days < 0 {
+		days = 0
+	}
+	m.mu.Lock()
+	m.eventRetention = days
+	m.mu.Unlock()
+	m.purgeEvents()
+}
+
+// EventRetention 返回运行期生效的事件保留天数（0 表示永久保留）。
+func (m *Manager) EventRetention() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.eventRetention
 }
 
 // pushEvent 异步入队一条事件。队列满时直接丢弃，绝不阻塞判定路径。
