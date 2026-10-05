@@ -160,6 +160,7 @@ import api from '@/api'
 import CounterPanel from '@/components/CounterPanel.vue'
 import TablePager from '@/components/TablePager.vue'
 import { useColumnWidths } from '@/utils/table'
+import { autoCheckServerIP } from '@/utils/serverip'
 import { useSystemStore } from '@/stores/system'
 
 const cwTopIPs = useColumnWidths('dashboard-top-ips')
@@ -291,6 +292,9 @@ function onResize() {
 
 onMounted(() => {
   load()
+  // 自动探一次服务器出口 IP，未放行时提示加入白名单。
+  // 不 await：探测要走外部回显服务，慢的时候不该拖住首屏。
+  autoCheckServerIP()
   window.addEventListener('resize', onResize)
 })
 

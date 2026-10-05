@@ -1189,6 +1189,21 @@ func (m *Manager) resetWindowsForLocked(ip string) {
 	}
 }
 
+// Whitelisted 判断地址是否被白名单覆盖（含被某个 CIDR 条目罩住的情况）。
+//
+// 刻意复用判定路径用的那份内存名单，而不是现查一次库：界面上"已放行 / 未放行"
+// 与"实际会不会拦"必须是同一个结论，各写一遍迟早会对不上（过期、停用、
+// 地区条目这些边角最容易分叉）。
+//
+// 注意它只看 IP/CIDR 条目：地区白名单（国家 / 省份 / 城市）要拿属地去比，
+// 而"服务器出口 IP 是否被放行"这个问题下，属地匹配的语义太松（等于整个国家
+// 放行），不该拿它得出"已放行"的结论。
+func (m *Manager) Whitelisted(addr netip.Addr) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.matchAnyLocked(m.white, addr)
+}
+
 // matchAnyLocked 判断地址是否命中某个前缀集合。调用方需持有锁。
 func (m *Manager) matchAnyLocked(list []netip.Prefix, addr netip.Addr) bool {
 	for _, p := range list {

@@ -37,6 +37,53 @@
     </div>
 
     <div class="page-card panel">
+      <div class="panel-head">
+        <div class="section-title">服务器出口 IP</div>
+        <el-button size="small" :loading="ipLoading" @click="detectIP">检测</el-button>
+      </div>
+      <div class="tip" style="margin-bottom: 10px">
+        这里不会自动检测 —— 探测要向第三方回显服务发一次请求，只在点「检测」时发生。
+        服务器地址放进白名单可以避免异常封禁（回源流量、本机对外访问被自己的规则拦掉）。
+      </div>
+
+      <template v-if="ipInfo?.ip">
+        <div class="ip-line">
+          <span class="ip-value">{{ ipInfo.ip }}</span>
+          <el-tag size="small" :type="ipInfo.whitelisted ? 'success' : 'warning'">
+            {{ ipInfo.whitelisted ? '已在白名单' : '未加入白名单' }}
+          </el-tag>
+        </div>
+        <div class="tip">
+          来源 {{ ipInfo.source || '—' }}，检测于 {{ fmtTime(ipInfo.checked_at) }}
+        </div>
+        <div v-if="!ipInfo.whitelisted" style="margin-top: 10px">
+          <el-button size="small" type="primary" @click="addIP(ipInfo.ip)">
+            加入白名单
+          </el-button>
+        </div>
+      </template>
+      <div v-else-if="ipInfo?.error" class="tip warn">
+        检测失败：{{ ipInfo.error }}
+      </div>
+      <div v-else class="tip">尚未检测</div>
+
+      <div class="manual-ip">
+        <el-input
+          v-model="manualIP"
+          size="small"
+          placeholder="手动填写服务器 IP"
+          style="width: 200px"
+        />
+        <el-button size="small" :disabled="!manualIPOk" @click="addIP(manualIP)">
+          加入白名单
+        </el-button>
+        <span class="tip">
+          自动探测不到（机器在 NAT 后、回显服务不通）时直接填实际的公网地址
+        </span>
+      </div>
+    </div>
+
+    <div class="page-card panel">
       <div class="section-title">frps 对接</div>
       <el-form label-width="150px" style="max-width: 720px">
         <el-form-item label="插件监听地址">
@@ -134,9 +181,15 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import {
+  addToWhitelist,
+  detectPublicIP,
+  isIPv4,
+  type PublicIP,
+} from '@/utils/serverip'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -164,6 +217,55 @@ const form = reactive<any>({
 
 const proxyPortsText = ref('')
 const trustedText = ref('')
+
+// ---- 服务器出口 IP ----
+//
+// 这一块刻意不在打开页面时自动检测：探测要向第三方回显服务发一次请求，
+// 用户在设置页翻配置时不该平白触发它。概览页进页面时会自动探一次，
+// 那里才是"该提醒的时候提醒"的地方。
+const ipInfo = ref<PublicIP | null>(null)
+const ipLoading = ref(false)
+const manualIP = ref('')
+const manualIPOk = computed(() => isIPv4(manualIP.value))
+
+async function detectIP() {
+  ipLoading.value = true
+  try {
+    ipInfo.value = await detectPublicIP(true)
+    if (!ipInfo.value?.ip && !ipInfo.value?.error) {
+      ElMessage.warning('没有探测到地址')
+    }
+  } finally {
+    ipLoading.value = false
+  }
+}
+
+async function addIP(ip: string) {
+  if (!isIPv4(ip)) {
+    ElMessage.error('请填一个 IPv4 地址')
+    return
+  }
+  try {
+    const added = ip.trim()
+    await addToWhitelist(added)
+    ElMessage.success('已加入白名单')
+    // 只改本地状态，不重新探测：探测要再打一次第三方，而这里唯一的变化
+    // 就是"它已被放行"，没必要为此再暴露一次服务器地址。
+    if (ipInfo.value && ipInfo.value.ip === added) {
+      ipInfo.value = { ...ipInfo.value, whitelisted: true }
+    }
+    if (manualIP.value.trim() === added) {
+      manualIP.value = ''
+    }
+  } catch {
+    // 失败原因由 axios 拦截器统一提示（多半是地址已在名单里）
+  }
+}
+
+function fmtTime(t?: string) {
+  if (!t) return '—'
+  return new Date(t).toLocaleString('zh-CN', { hour12: false })
+}
 
 function splitList(s: string) {
   return s
@@ -277,6 +379,39 @@ onMounted(load)
 /* 不可逆操作的提示：这一句混在普通 tip 里会被当成套话划过去 */
 .warn {
   color: #e6a23c;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.panel-head .section-title {
+  margin: 0;
+}
+
+.ip-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ip-value {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.manual-ip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.manual-ip .tip {
+  margin: 0;
 }
 
 .actions {

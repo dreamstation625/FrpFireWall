@@ -15,6 +15,7 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/firewall"
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/guard"
+	"github.com/dreamstation625/FrpFireWall/internal/myip"
 	"github.com/dreamstation625/FrpFireWall/internal/store"
 	"github.com/dreamstation625/FrpFireWall/internal/update"
 )
@@ -45,6 +46,9 @@ type Server struct {
 
 	// 版本更新检查（带缓存，不下载任何东西）
 	updater *update.Checker
+
+	// 服务器公网出口 IP 探测（带缓存，只在被调用时才出网）
+	myip *myip.Resolver
 
 	startedAt time.Time
 	webFS     fs.FS
@@ -78,6 +82,7 @@ func New(
 		drv:       drv,
 		report:    report,
 		updater:   update.New(update.WithRepo(cfg.Update.Repo)),
+		myip:      myip.New(),
 		startedAt: time.Now(),
 		webFS:     webFS,
 		loginLim:  newLoginLimiter(),
@@ -132,6 +137,8 @@ func (s *Server) Routes() http.Handler {
 		auth.POST("/system/firewall/mode", s.handleSwitchMode)
 		auth.GET("/system/update", s.handleUpdateStatus)
 		auth.POST("/system/update/check", s.handleUpdateCheck)
+		// 服务器公网出口 IP。默认吃 60 秒缓存，refresh=1 强制重新探测。
+		auth.GET("/system/public-ip", s.handlePublicIP)
 
 		// ---- 配置 ----
 		auth.GET("/config", s.handleGetConfig)

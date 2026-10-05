@@ -72,6 +72,10 @@ export const api = {
     http.post('/system/update/check', { force }, { timeout: 40000 }),
   switchBackend: (backend: string) =>
     http.post('/system/firewall/mode', { backend }),
+  // 服务器公网出口 IP。refresh=true 才真正去问回显服务，否则吃服务端
+  // 60 秒缓存 —— 每次进概览都打一次第三方既慢又平白暴露服务器地址。
+  publicIp: (refresh = false) =>
+    http.get('/system/public-ip', { params: refresh ? { refresh: 1 } : {} }),
 
   // ---- 防火墙 ----
   managedRules: () => http.get('/firewall/managed'),

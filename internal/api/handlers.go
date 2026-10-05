@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"os"
 	"runtime"
 	"strconv"
@@ -92,6 +93,33 @@ func (s *Server) handleSystemDetect(c *gin.Context) {
 	}
 
 	ok(c, rep)
+}
+
+// handlePublicIP 返回服务器对外的公网 IPv4，顺带回答它是否已在白名单里。
+//
+// whitelisted 由服务端算而不是前端拿 IP 去比对名单：名单里可能是 CIDR，
+// "1.2.3.4 在 1.2.3.0/24 里"这种判断不该在浏览器里重写一遍（还要考虑
+// 停用、过期、地区条目）。
+//
+// 探测不到不是错误：机器没有外网、回显服务全挂都很常见，返回 ip 为空 +
+// error 说明原因，由界面决定怎么提示。
+func (s *Server) handlePublicIP(c *gin.Context) {
+	force := c.Query("refresh") == "1"
+	res := s.myip.Lookup(c.Request.Context(), force)
+
+	out := gin.H{
+		"ip":          res.IP,
+		"source":      res.Source,
+		"checked_at":  res.CheckedAt,
+		"whitelisted": false,
+	}
+	if addr, err := netip.ParseAddr(res.IP); err == nil {
+		out["whitelisted"] = s.guard.Whitelisted(addr)
+	}
+	if res.Err != "" {
+		out["error"] = res.Err
+	}
+	ok(c, out)
 }
 
 // handleSwitchMode 切换防火墙后端。
