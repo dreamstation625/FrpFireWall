@@ -183,7 +183,7 @@ func (s *Server) handleManagedRules(c *gin.Context) {
 	ok(c, rules)
 }
 
-// handleCounters 返回内核丢包统计：当前读数 + 相对上一批的增幅 + 趋势。
+// handleCounters 返回内核拦截统计：当前读数 + 相对上一批的增幅 + 趋势。
 //
 // 读不到计数时**不报错**，返回带 unsupported 说明的空结果 —— 界面要能显示
 // "这个后端数不出数"，而不是弹一个红框。

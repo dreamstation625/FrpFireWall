@@ -13,9 +13,10 @@ import (
 const (
 	// counterSampleInterval 是采样间隔。
 	//
-	// 一小时：更密的话表增长快、信息量却不增加（丢包是慢变量）；更疏的话
-	// "最近一小时新增"就没有可比的前一批。
-	counterSampleInterval = time.Hour
+	// 五分钟：太疏的话"刚刚发生的拦截"要等很久才在趋势图上冒出来（用户
+	// 实际反馈过一小时一次不够），太密的话表增长快、信息量却不增加
+	// （丢包是慢变量）。7 天保留期下 2016 批是能接受的规模。
+	counterSampleInterval = 5 * time.Minute
 	// counterRetention 是采样点的保留期。7 天 = 168 个点，画趋势足够，
 	// 表也不会无限长。
 	counterRetention = 7 * 24 * time.Hour
@@ -47,7 +48,7 @@ type CounterSnapshot struct {
 	Items       []CounterView `json:"items"`
 	// TotalPackets 是当前所有条目的丢包累计（内核口径，重建会归零）。
 	TotalPackets uint64 `json:"total_packets"`
-	// Series 是趋势：每个采样点一个"这一小时新增了多少包"。
+	// Series 是趋势：每个采样点一个"这一批新增了多少包"。
 	//
 	// 存的是增量而不是累计值：累计值会随规则重建掉回 0，画成折线会看到
 	// 莫名其妙的断崖，而断崖的真实含义只是"重建过规则"。
@@ -90,7 +91,7 @@ func (m *Manager) CountersSnapshot(hours int) (*CounterSnapshot, error) {
 		return snap, nil
 	}
 	if len(list) == 0 && cap.CounterGranularity == "" {
-		snap.Unsupported = "当前后端读不到丢包计数"
+		snap.Unsupported = "当前后端读不到拦截计数"
 	}
 
 	// 上一批采样：算增幅用。同一条目按 kind+key+family 对号。
@@ -145,7 +146,7 @@ func counterKey(kind, key, family string) string {
 	return kind + "\x00" + key + "\x00" + family
 }
 
-// counterSeries 把采样点折算成"每小时新增多少"的序列。
+// counterSeries 把采样点折算成"每批新增多少"的序列。
 //
 // 按条目分别算增量再求和，而不是先把每批求和再做差：后者在一个条目被解封
 // （它消失）或新封（它出现）时，总量会凭空跳变，看起来像丢包量突变。

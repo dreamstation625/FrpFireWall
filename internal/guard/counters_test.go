@@ -46,7 +46,7 @@ func newTestManagerWithDriver(t *testing.T, drv firewall.Driver) (*Manager, *fak
 // 增幅的语义是"自最近一次采样以来新增多少"，不是"最近一个完整采样周期"。
 //
 // 基线取**最近那批**而不是倒数第二批：取倒数第二批的话，界面上显示的永远是
-// 一个小时前的增量，刚被扫的那一下要等一小时才看得见，而"现在正在挨打吗"
+// 上一个采样周期的增量，刚被扫的那一下要等下一个周期才看得见，而"现在正在挨打吗"
 // 才是这张表要回答的问题。
 func TestCounterSnapshotDelta(t *testing.T) {
 	m := newTestManager(t)

@@ -248,7 +248,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		} else if err := m.Reconcile(); err != nil {
 			m.log.Error("初始规则同步失败", "err", err)
 		}
-		// 先采一次：不采的话第一条趋势要等一小时后才出现，而"刚启动就想知道
+		// 先采一次：不采的话第一条趋势要等一个采样间隔后才出现，而"刚启动就想知道
 		// 拦了多少"是最常见的诉求。放在 Reconcile 之后 —— 规则都还没下发时
 		// 读到的是空表，采出来的是一批全是 0 的噪声。
 		m.sampleCounters()

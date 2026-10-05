@@ -733,7 +733,7 @@ func (s *Store) LatestCounterBatch(before time.Time) ([]model.CounterSample, err
 // CounterSeries 返回时间窗内的全部采样点，由调用方聚合画图。
 //
 // 不在这里做 GROUP BY 求和：不同的界面要的聚合方式不一样（总量趋势 vs 单条目
-// 趋势），在 store 里定死一种就只能再加一个方法。数据量也可控 —— 每小时一批、
+// 趋势），在 store 里定死一种就只能再加一个方法。数据量也可控 —— 每 5 分钟一批、
 // 每批条目数与封禁规模同量级。
 func (s *Store) CounterSeries(since time.Time) ([]model.CounterSample, error) {
 	out := make([]model.CounterSample, 0, 256)
