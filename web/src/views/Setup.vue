@@ -61,6 +61,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { markInitialized } from '@/router'
+import { markGuidePending } from '@/utils/guide'
 
 const router = useRouter()
 const auth = useAuthStore()
@@ -89,6 +90,8 @@ async function submit() {
       password: form.password,
     })
     markInitialized()
+    // 进主框架后自动弹一次教学引导（标记由 MainLayout 消费）
+    markGuidePending()
     ElMessage.success('初始化完成')
     router.push('/dashboard')
   } catch {

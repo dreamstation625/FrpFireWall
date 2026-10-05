@@ -78,7 +78,7 @@
       </div>
     </div>
 
-    <div class="page-card panel mt">
+    <div class="page-card panel mt" data-guide="frps-config">
       <div class="panel-head">
         <span class="section-title">{{ cfgFile }} 需要增加的配置</span>
         <div class="head-actions">

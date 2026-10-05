@@ -1,5 +1,5 @@
 <template>
-  <div class="page-card panel">
+  <div class="page-card panel" data-guide="counter-panel">
     <div class="panel-head">
       <span class="section-title">防火墙拦截统计</span>
       <div>

@@ -11,7 +11,7 @@
 
     <el-row :gutter="12" class="mt">
       <el-col :span="16">
-        <div class="page-card panel">
+        <div class="page-card panel" data-guide="dash-trend">
           <div class="panel-head">
             <span class="section-title">登录拦截趋势</span>
             <el-radio-group v-model="hours" size="small" @change="load">

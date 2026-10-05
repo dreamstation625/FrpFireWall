@@ -1,5 +1,5 @@
 <template>
-  <div class="page-card panel">
+  <div class="page-card panel" data-guide="acl-table">
     <el-tabs v-model="kind" @tab-change="onTabChange">
       <el-tab-pane label="白名单" name="white" />
       <el-tab-pane label="黑名单" name="black" />

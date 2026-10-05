@@ -1,6 +1,6 @@
 <template>
   <div>
-    <el-tabs v-model="tab" class="page-card panel" @tab-change="onTabChange">
+    <el-tabs v-model="tab" class="page-card panel" data-guide="events-panel" @tab-change="onTabChange">
       <el-tab-pane label="事件日志" name="events">
         <div class="filters">
           <el-select v-model="category" size="small" style="width: 140px" @change="reload">

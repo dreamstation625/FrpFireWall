@@ -1,6 +1,6 @@
 <template>
   <div v-loading="loading">
-    <div class="page-card panel" style="margin-bottom: 16px">
+    <div class="page-card panel" style="margin-bottom: 16px" data-guide="policy-rules">
       <div class="panel-head">
         <span class="section-title">细分规则</span>
         <div>

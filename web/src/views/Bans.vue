@@ -1,6 +1,6 @@
 <template>
   <div>
-    <div class="page-card panel">
+    <div class="page-card panel" data-guide="bans-active">
       <div class="panel-head">
         <span class="section-title">
           当前活跃封禁

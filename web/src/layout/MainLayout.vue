@@ -6,7 +6,7 @@
         <div class="brand-sub">frps 服务端防火墙</div>
       </div>
 
-      <el-menu :default-active="activeMenu" router class="menu">
+      <el-menu :default-active="activeMenu" router class="menu" data-guide="nav-menu">
         <el-menu-item v-for="m in menuItems" :key="m.path" :index="m.path">
           <el-icon><component :is="m.icon" /></el-icon>
           <span>{{ m.title }}</span>
@@ -57,6 +57,17 @@
 
         <el-button :icon="Refresh" text size="small" @click="reload">刷新</el-button>
 
+        <!-- 教学引导的唯一入口：初始化完成后会自动开一次，之后从这里重开 -->
+        <el-button
+          data-guide="guide-entry"
+          :icon="QuestionFilled"
+          text
+          size="small"
+          @click="startGuide"
+        >
+          引导
+        </el-button>
+
         <el-dropdown @command="onUserCommand">
           <span class="user">
             <el-icon><UserFilled /></el-icon>
@@ -65,6 +76,7 @@
           </span>
           <template #dropdown>
             <el-dropdown-menu>
+              <el-dropdown-item command="guide">教学引导</el-dropdown-item>
               <el-dropdown-item command="password">修改密码</el-dropdown-item>
               <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
             </el-dropdown-menu>
@@ -94,6 +106,8 @@
       </template>
     </el-dialog>
 
+    <GuideTour v-model="guideVisible" :steps="guideSteps" @finish="markGuideDone" />
+
     <UpdateDialog
       v-model="updateVisible"
       :version="sys.info?.version"
@@ -106,19 +120,26 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowDown,
   Menu,
+  QuestionFilled,
   Refresh,
   UserFilled,
 } from '@element-plus/icons-vue'
 import api from '@/api'
+import GuideTour from '@/components/GuideTour.vue'
 import UpdateDialog from '@/components/UpdateDialog.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useSystemStore } from '@/stores/system'
+import {
+  consumeGuidePending,
+  guideSteps,
+  markGuideDone,
+} from '@/utils/guide'
 
 const route = useRoute()
 const router = useRouter()
@@ -213,7 +234,18 @@ const pwdVisible = ref(false)
 const pwdLoading = ref(false)
 const pwdForm = reactive({ old: '', next: '' })
 
+// ---- 教学引导 ----
+const guideVisible = ref(false)
+
+function startGuide() {
+  guideVisible.value = true
+}
+
 function onUserCommand(cmd: string) {
+  if (cmd === 'guide') {
+    startGuide()
+    return
+  }
   if (cmd === 'password') {
     pwdForm.old = ''
     pwdForm.next = ''
@@ -250,6 +282,12 @@ async function submitPassword() {
 onMounted(async () => {
   await sys.load()
   autoCheckUpdate()
+  // 初始化完成（setup 页打的标记）后自动走一遍引导。放在 sys.load 之后：
+  // 引导会切路由，页面数据在手才不会讲一半卡住。
+  if (consumeGuidePending()) {
+    await nextTick()
+    startGuide()
+  }
 })
 </script>
 
