@@ -624,8 +624,27 @@ else
   printf '  %s %-50s stop@%s iptables@%s\n' \
     "$(red FAIL)" "先停服务、后动内核规则（调用顺序）" "${STOP_LINE:-无}" "${IPT_LINE:-无}"; FAIL=$((FAIL + 1))
 fi
-ck "救援脚本发起了删 ipv4 链（桩，不验效果）" "$(grep -c 'iptables -w -F FRPFIREWALL_BLACK' "$LOG")" "1"
-ck "救援脚本发起了删 ipv6 链（桩，不验效果）" "$(grep -c 'ip6tables -w -X FRPFIREWALL_GUARD' "$LOG")" "1"
+# 断言里的链名必须**锚到行尾**（`$`）：受管链有三条，而
+# FRPFIREWALL_BLACK 是 FRPFIREWALL_BLACK_FRP 的前缀 —— 不锚定的话
+# 「清空 FRPFIREWALL_BLACK_FRP」那条也会被算进 FRPFIREWALL_BLACK 的计数，
+# 表现成 got=2 want=1（2026-10-05 救援脚本补上删第三条链时踩到过）。
+ck "救援脚本清空了 FRPFIREWALL_BLACK" "$(grep -cE '^iptables -w -F FRPFIREWALL_BLACK$' "$LOG")" "1"
+ck "救援脚本清空了 FRPFIREWALL_BLACK_FRP" "$(grep -cE '^iptables -w -F FRPFIREWALL_BLACK_FRP$' "$LOG")" "1"
+ck "救援脚本清空了 FRPFIREWALL_GUARD" "$(grep -cE '^iptables -w -F FRPFIREWALL_GUARD$' "$LOG")" "1"
+ck "救援脚本删除了 FRPFIREWALL_BLACK_FRP" "$(grep -cE '^iptables -w -X FRPFIREWALL_BLACK_FRP$' "$LOG")" "1"
+ck "救援脚本发起了删 ipv6 链（桩，不验效果）" "$(grep -cE '^ip6tables -w -X FRPFIREWALL_GUARD$' "$LOG")" "1"
+
+# 清空必须全部排在删除之前：链上还有引用时 iptables -X 会直接报错，
+# 三条链互相引用（GUARD 跳 BLACK / BLACK_FRP），顺序反了就一条都删不掉。
+LAST_FLUSH="$(grep -nE '^iptables -w -F FRPFIREWALL_' "$LOG" | tail -1 | cut -d: -f1)"
+FIRST_DEL="$(grep -nE '^iptables -w -X FRPFIREWALL_' "$LOG" | head -1 | cut -d: -f1)"
+if [ -n "$LAST_FLUSH" ] && [ -n "$FIRST_DEL" ] && [ "$LAST_FLUSH" -lt "$FIRST_DEL" ]; then
+  printf '  %s %-50s -F@%s < -X@%s\n' \
+    "$(green PASS)" "先清空全部受管链、再删除（顺序）" "$LAST_FLUSH" "$FIRST_DEL"; PASS=$((PASS + 1))
+else
+  printf '  %s %-50s -F@%s -X@%s\n' \
+    "$(red FAIL)" "先清空全部受管链、再删除（顺序）" "${LAST_FLUSH:-无}" "${FIRST_DEL:-无}"; FAIL=$((FAIL + 1))
+fi
 
 run_sh uninstall
 ck "重复卸载仍然成功" "$?" "0"
