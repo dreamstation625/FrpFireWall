@@ -1,7 +1,28 @@
-# 排障
+# 🧭 排障指南
+
+[← 项目首页](../README.md) · [文档中心](README.md) · [功能详解](FEATURES.md)
 
 按「现象 → 定位 → 处理」组织。先定位再动手，尤其是监听地址这类问题：
 猜错方向的话，改半天改的是根本没生效的那一处。
+
+## 先按现象定位
+
+| 现象 | 优先检查 | 跳转 |
+| --- | --- | --- |
+| 面板完全打不开 | 服务状态、实际监听地址、启动参数覆盖 | [面板打不开](#面板打不开) |
+| 升级后外网仍无法访问 | 旧数据库监听值与 systemd drop-in | [旧版本监听地址](#旧版本升级后的监听地址) |
+| 忘记管理员密码 | 在本机重置密码字段，再凭新令牌初始化 | [密码恢复](#忘记面板密码) |
+| 某个 IP 被拦或未按预期拦截 | 排障查询与固定判定顺序 | [判定链路](#某个地址为什么被拦--没被拦) |
+| 下发规则后 SSH / 隧道异常 | 先停服务，再预览并清理受管规则 | [紧急救援](#误封导致连不上) |
+
+服务状态与最近日志：
+
+```bash
+sudo systemctl status frpfirewall --no-pager
+sudo journalctl -u frpfirewall -n 100 --no-pager
+```
+
+## 本页导航
 
 - [面板打不开](#面板打不开)
 - [忘记面板密码](#忘记面板密码)
@@ -33,6 +54,8 @@ ss -lntp | grep 7930
 systemctl cat frpfirewall | grep ExecStart
 ```
 
+<a id="旧版本升级后的监听地址"></a>
+
 ### ⚠️ 从 0.0.1-pre.02 及更早升上来的，监听地址不会自动变
 
 那些版本的默认值就是 `127.0.0.1:7930`，而且首次启动时会把它写进数据库。升级只
@@ -52,7 +75,8 @@ sudo tee /etc/systemd/system/frpfirewall.service.d/10-listen.conf >/dev/null <<'
 ExecStart=
 ExecStart=/usr/local/bin/frpfirewall -data /var/lib/frpfirewall -listen 0.0.0.0:7930
 EOF
-sudo systemctl daemon-reload && sudo systemctl restart frpfirewall
+sudo systemctl daemon-reload
+sudo systemctl restart frpfirewall
 
 # 办法三：进了面板之后，在「系统设置 → 监听地址」改成 0.0.0.0:7930 保存并
 #         重启，值就落进数据库了；之后上面的覆盖文件可以删掉
@@ -86,10 +110,15 @@ ls -l /etc/systemd/system/frpfirewall.service.d/
 
 把数据库 `settings` 表里的 `admin_password_hash` 置空后重启，会重新进入初始化流程：
 
+以下命令在服务器本机执行，需要管理员权限与 `sqlite3` 工具。先停止服务并备份数据库，
+同时清除残留初始化令牌，确保下次启动生成新令牌。
+
 ```bash
-sqlite3 /var/lib/frpfirewall/frpfirewall.db \
-  "update settings set value='' where key='admin_password_hash';"
-systemctl restart frpfirewall
+sudo systemctl stop frpfirewall
+sudo cp -p /var/lib/frpfirewall/frpfirewall.db "/var/lib/frpfirewall/frpfirewall.db.backup-$(date +%Y%m%d-%H%M%S)"
+sudo sqlite3 /var/lib/frpfirewall/frpfirewall.db \
+  "BEGIN; UPDATE settings SET value='' WHERE key='admin_password_hash'; UPDATE settings SET value='' WHERE key='setup_token'; COMMIT;"
+sudo systemctl start frpfirewall
 ```
 
 重启后服务会**重新生成一个令牌**（旧的已作废），启动时打印、同时写进
@@ -136,12 +165,27 @@ systemctl restart frpfirewall
 
 ```bash
 sudo systemctl stop frpfirewall     # 必须先停，否则会被 reconcile 重新下发
-sudo frpfirewall-panic              # 清掉所有受管规则
 sudo frpfirewall-panic --dry-run    # 先看会做什么
+sudo frpfirewall-panic              # 执行清理，核对输出中的失败提示
 ```
 
-它只删归属 frpfirewall 的对象（两条自有链 + 带 `frpfirewall` 注释的规则 +
-`frpfirewall_*` 集合），不动系统原有规则。
+它只处理归属 frpfirewall 的跳转、链，以及带 `frpfirewall` 注释的 nftables 规则与
+`frpfirewall_*` 集合，不动系统原有规则。
+
+> [!IMPORTANT]
+> 当前 iptables 救援脚本只显式清理 `FRPFIREWALL_GUARD` 与 `FRPFIREWALL_BLACK`，
+> 未清理驱动使用的 `FRPFIREWALL_BLACK_FRP`；链删除顺序也可能使仍被引用的链删除失败。
+> 摘掉主链跳转后，本程序入口停止拦截，但这不等于所有受管对象都已删除。
+> 请检查脚本失败提示与 `iptables-save` / `ip6tables-save` 输出。
 
 救援脚本只清网络层，应用层的封禁记录还在数据库里 —— 要彻底放行，还得去
 **封禁记录** 页解封，或把对应的名单条目 / 规则停用。
+
+处理完来源后再启动服务，并核对连接与内核规则；数据库中仍活跃的封禁会在启动时重新下发。
+
+```bash
+sudo systemctl start frpfirewall
+sudo journalctl -u frpfirewall -n 50 --no-pager
+```
+
+需要反馈问题时，请附上版本、系统与防火墙后端、复现步骤、相关日志；分享前遮住初始化令牌、JWT、密码等信息。

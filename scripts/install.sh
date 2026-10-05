@@ -21,8 +21,12 @@
 # 离线用法（把二进制和服务单元放到同一目录）：
 #   sudo ./install.sh -b ./frpfirewall-linux-amd64
 #
-# 下载慢的话加加速前缀（不加就直连 GitHub）：
-#   curl -fsSL ... | sudo bash -s -- install --mirror https://ghfast.top/
+# 下载慢的话加加速前缀（不加就直连 GitHub）。脚本地址和下载地址各加一次：
+#   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/dreamstation625/FrpFireWall/main/scripts/install.sh | sudo bash -s -- install --mirror https://ghfast.top/
+#
+# 装最新预发布版（--pre 会去查 api.github.com 列版本，加速前缀不覆盖 API）：
+#   curl -fsSL ... | sudo bash -s -- install --pre --mirror https://ghfast.top/
+#   API 不通就改用 -v 0.0.1-pre.22 指定版本，这条路径不查 API。
 #
 # ---------------------------------------------------------------------------
 # 设计要点
@@ -380,7 +384,10 @@ frpfirewall 一键脚本：在线安装 / 升级 / 卸载
   curl -fsSL .../install.sh | sudo bash -s -- update
   curl -fsSL .../install.sh | sudo bash -s -- uninstall --purge -y
 
-  # 装某个预发布版
+  # 装最新预发布版（--pre 查 api.github.com 列版本，加速前缀不覆盖 API）
+  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/dreamstation625/FrpFireWall/main/scripts/install.sh | sudo bash -s -- install --pre --mirror https://ghfast.top/
+
+  # 装某个预发布版（不需要 API，加速前缀只管下载）
   curl -fsSL .../install.sh | sudo bash -s -- install -v 0.0.1-pre.01
 
   # 只监听内网地址（面板不对外），或换端口
