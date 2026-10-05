@@ -13,6 +13,7 @@
 
 <p>
   <a href="#quick-start">快速开始</a> ·
+  <a href="#screenshots">界面预览</a> ·
   <a href="#capabilities">核心能力</a> ·
   <a href="#development">开发编译</a> ·
   <a href="docs/README.md">文档中心</a> ·
@@ -26,6 +27,14 @@
 FrpFireWall 是运行在 **frps 同机**的服务端插件防火墙，用于应对公网扫描、频繁连接与暴力尝试。
 **Go 后端 + Vue 控制台打包为单个二进制**，部署无需额外安装 Go、Node.js 或数据库服务。
 
+> [!WARNING]
+> **部署前必读**
+>
+> 1. **系统支持**：优先面向 **Debian / Ubuntu**，预期可以正常运行；**其他 Linux 发行版不保证兼容，Windows 不支持部署运行**。
+> 2. **提前备份**：本项目会修改服务器防火墙规则，建议使用前先做好**服务器备份或快照**，并保存现有防火墙规则与关键配置。
+> 3. **后端适配**：理论上适配 **iptables 和 nftables**，实际可用功能取决于系统、内核版本及相关模块。
+> 4. **未完成验证的功能**：受测试环境与条件限制，**速率限制尚未完成全面实测验证**。已有局部验证不代表所有场景均可用，上线前请在自己的环境中单独测试。
+
 | 🧠 应用层判定 | ⚡ 网络层拦截 | 🖥️ 可视化管理 |
 | --- | --- | --- |
 | `Login` / `NewUserConn` 回调识别来源与规则 | iptables / nftables 丢包、限速与封禁 | 配置策略、查询封禁、查看事件与审计 |
@@ -33,6 +42,57 @@ FrpFireWall 是运行在 **frps 同机**的服务端插件防火墙，用于应�
 > [!IMPORTANT]
 > 连接限速默认围绕 frp 端口，程序只管理自身的防火墙对象。**自动封禁固定为全端口**；
 > 手动黑名单可选全端口、仅 frp 端口或自定义端口。上线前请先了解[封禁范围](docs/FEATURES.md#黑名单的封禁范围)。
+
+<a id="screenshots"></a>
+
+## 界面预览
+
+从概览查看封禁规模、拦截趋势与运行状态；展开下方截图，查看策略配置、名单管理和事件追踪。
+
+[![控制台概览：活跃封禁、登录拦截趋势与运行状态](img/1.png)](img/1.png)
+
+<details>
+<summary>📊 拦截统计与防火墙配置</summary>
+
+[![防火墙拦截统计：累计丢包、来源 IP 与地区分布](img/2.png)](img/2.png)
+
+[![防火墙配置：后端选择、环境探测与受管规则](img/3.png)](img/3.png)
+
+</details>
+
+<details>
+<summary>🛡️ 黑白名单与封禁记录</summary>
+
+[![名单管理：地址与地区条目、封禁范围及导入导出](img/4.png)](img/4.png)
+
+[![封禁记录：来源、原因、剩余时间与批量解封](img/6.png)](img/6.png)
+
+</details>
+
+<details>
+<summary>⚙️ 频控策略与 IP 属地</summary>
+
+[![频控策略：细分规则、滑动窗口、触发阈值与封禁阶梯](img/7.png)](img/7.png)
+
+[![IP 属地：数据库状态、下载更新与本地上传](img/8.png)](img/8.png)
+
+</details>
+
+<details>
+<summary>🔌 frp 接入与事件日志</summary>
+
+[![frp 接入：插件链路、受保护端口与 TOML/JSON 配置](img/9.png)](img/9.png)
+
+[![事件日志：拦截、封禁、来源属地与代理记录](img/10.png)](img/10.png)
+
+</details>
+
+<details>
+<summary>🌐 附：多地区多线路 HTTP 测速截图</summary>
+
+[![多地区多线路 HTTP 测速结果](img/http_多地区多线路HTTP测速.png)](img/http_多地区多线路HTTP测速.png)
+
+</details>
 
 ## 关键设计约束
 
@@ -252,7 +312,7 @@ sudo frpfirewall-panic                   # 只删归属 frpfirewall 的对象
 | Python 3 + curl | 安装脚本回归测试时需要 | 运行本地假 Release 服务并请求测试接口 |
 | Debian / Ubuntu | 验证实际防火墙行为时需要 | systemd、iptables / nftables 与真实 Linux 内核 |
 
-**Windows 可以开发和编译；防火墙实际生效验证需要 Linux。** SQLite 使用纯 Go 实现，
+**Windows 仅用于开发和交叉编译，不支持部署运行本项目的防火墙服务；实际生效验证需要 Linux。** SQLite 使用纯 Go 实现，
 构建设置 `CGO_ENABLED=0`，无需安装 C 编译器。完整 Windows 命令见[开发指南](docs/DEVELOPMENT.md#windowspowershell)。
 
 ### 从源码构建（Bash + Make）
@@ -288,11 +348,13 @@ make release     # Linux amd64 + arm64 二进制及校验和 → dist/
   库里没中文名时不会命中。按国家封禁不受影响。
 - **国家码与城市"写错不报错"**：国家码只校验两位字母、城市不校验真实性，写错的表现是
   **永远不命中**；省份查真实性，写错直接报错。配好建议先在 **IP 属地** 页核对写法。
-- **只支持 Debian / Ubuntu 系**，不支持 CentOS / RHEL 与 Docker 部署（需 `CAP_NET_ADMIN`
-  且要看到宿主机 netns）；**单用户**，一个面板账号 + JWT，没有 RBAC；**属地库需自行准备**
+- **优先支持 Debian / Ubuntu，其他 Linux 发行版不保证兼容，Windows 不支持运行**。
+  当前不支持 Docker 部署（需 `CAP_NET_ADMIN` 且要看到宿主机 netns）；
+  **单用户**，一个面板账号 + JWT，没有 RBAC；**属地库需自行准备**
   （MaxMind 有许可限制，不便随包分发）。
-- **防火墙规则的落盘与丢包计数解析都只验过输出样本，没在真实 Linux 上跑过**（开发机是
-  Windows）。上线前用 `iptables-save` / `nft -a list ruleset` 核对，并演练一次救援脚本。
+- **已在 Linux 独立网络空间验证封禁、解封、后端迁移与救援清理**；完整范围见
+  [安全修复记录](docs/SECURITY_REVIEW.md#验证结果)。**速率限制尚未完成全面实测验证**，
+  上线时仍需核对实际规则、丢包计数与限速效果。
 
 <a id="capabilities"></a>
 
