@@ -1,26 +1,12 @@
 name: Release
 
-# 发布流程：把 VERSION 文件改成目标版本号，提交，然后打同名 tag 推上来。
-#
-#   v0.0.1          正式版（默认 Release，GitHub 会标记为 latest）
-#   v0.0.2-pre.01   预发布版（自动标记为 Pre-release，不会成为 latest）
-#
-# 两道闸门，都过不了就不构建：
-#
-#   1. tag 必须与 VERSION 文件一致，避免出现「tag 说 0.0.2、
-#      二进制里却编译进 0.0.1」这种查不出来的事故；
-#   2. 版本号必须真的高于已发布的最高版本，重复推送同一个 tag、
-#      或者推一个更旧的版本，都会被挡下并跳过整个构建。
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
 
-# gh release create 需要写权限
 permissions:
-  contents: write
+  contents: read
 
-# 同一 tag 重复推送时，取消正在跑的旧任务，避免两个流程抢着建 release
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -29,326 +15,183 @@ env:
   MODULE: github.com/dreamstation625/FrpFireWall
 
 jobs:
-  release:
-    name: 构建并发布
+  prepare:
+    name: 发布校验
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+      publish: ${{ steps.gate.outputs.publish }}
+      built_at: ${{ steps.ver.outputs.built_at }}
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-        with:
-          # 生成变更日志需要完整历史与 tag
-          fetch-depth: 0
-
-      # 先校验版本号，尽早失败，不浪费构建时间
-      - name: 校验 tag 与 VERSION 一致
+      - uses: actions/checkout@v4
+      - name: 校验 tag 与 VERSION
         id: ver
         run: |
           set -euo pipefail
-
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
+          version="${GITHUB_REF_NAME#v}"
           file_version="$(tr -d ' \t\r\n' < VERSION)"
-
-          echo "tag=$tag  VERSION=$file_version  去前缀后=$version"
-
           if [ "$version" != "$file_version" ]; then
-            echo "::error title=版本号不一致::tag 为 $tag，但 VERSION 文件是 $file_version。请先把 VERSION 改成 $version 并提交。"
+            echo "::error::tag $GITHUB_REF_NAME 与 VERSION $file_version 不一致"
             exit 1
           fi
-
-          # 只接受 0.0.1 或 0.0.1-pre.01 两种形态
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]{2,})?$'; then
-            echo "::error title=版本号格式非法::$version 不是 0.0.1 或 0.0.1-pre.01 形态。"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]{2,})?$ ]]; then
+            echo "::error::非法版本号：$version"
             exit 1
           fi
-
-          case "$version" in
-            *-pre.*)
-              echo "prerelease=true" >> "$GITHUB_OUTPUT"
-              echo "::notice::识别为预发布版"
-              ;;
-            *)
-              echo "prerelease=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::识别为正式版"
-              ;;
-          esac
-
+          prerelease=false
+          if [[ "$version" == *-pre.* ]]; then prerelease=true; fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      # 守门需要跑项目自己的版本比较实现，所以 Go 要装在它前面。
-      # setup-go 读 go.mod 定版本、带模块缓存，本身很快；真正耗时的是
-      # 后面的 npm ci 与交叉编译，那两步才是这里要省掉的。
-      - name: 安装 Go
-        uses: actions/setup-go@v5
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-
-      # 守门：版本号相对已发布的 release 没有提升，就直接收工，不浪费构建资源。
-      #
-      # 基准取「已发布的 release」而不是 git tag。tag 在 release 建成之前就已经
-      # 存在，若拿 tag 当基准，「构建失败」或「release 创建失败」之后重跑会被判成
-      # 「没有提升」而永远跳过，失败的发布就再也修不好了。用 release 列表则自洽：
-      # 首发和失败重跑都算提升，只有「已发布之后重推同一个 tag」才会跳过。
-      #
-      # 比较逻辑复用 internal/version（即程序里检查更新用的那一套），
-      # 免得在 CI 里另写一份产生漂移 —— 尤其是「同号段正式版大于预发布版」
-      # （0.0.1 > 0.0.1-pre.99）这条规则，手写很容易搞反。
-      - name: 检查版本号是否提升
+      - name: 检查版本是否提升
         id: gate
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          # --limit 200 远大于本项目可预见的 release 数量。
-          # 这里不加 `|| true`：拿不到基准就不该盲目发布，失败反而更安全。
           gh release list --limit 200 --json tagName --jq '.[].tagName' > /tmp/released.txt
-          echo "已发布版本数: $(grep -c . /tmp/released.txt || true)"
-
-          # 人类可读说明走 stderr，key=value 走 stdout
-          go run ./tools/versioncmp \
-            -candidate "${GITHUB_REF_NAME}" \
-            -existing /tmp/released.txt > /tmp/gate.txt
-
+          go run ./tools/versioncmp -candidate "$GITHUB_REF_NAME" -existing /tmp/released.txt > /tmp/gate.txt
           cat /tmp/gate.txt
           cat /tmp/gate.txt >> "$GITHUB_OUTPUT"
-
-          publish="$(sed -n 's/^publish=//p' /tmp/gate.txt)"
-          reason="$(sed -n 's/^reason=//p' /tmp/gate.txt)"
-          max="$(sed -n 's/^max=//p' /tmp/gate.txt)"
-
-          {
-            echo "### 发布闸门"
-            echo
-            echo "| 项目 | 值 |"
-            echo "|---|---|"
-            echo "| 本次 tag | \`${GITHUB_REF_NAME}\` |"
-            echo "| 已发布最高版本 | \`${max:-（无）}\` |"
-            echo "| 判定 | ${reason} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$publish" != "true" ]; then
-            echo "::notice title=跳过发布::${reason}"
-            exit 0
+          cat /tmp/gate.txt >> "$GITHUB_STEP_SUMMARY"
+          if ! grep -qx 'publish=true' /tmp/gate.txt; then
+            echo '::notice::版本未提升，后续构建和发布任务全部跳过'
           fi
 
-      - name: 安装 Node
-        uses: actions/setup-node@v4
+  checks:
+    name: 后端检查
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./... -count=1
+
+  frontend:
+    name: 前端构建
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: test -s internal/web/dist/index.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-web
+          path: internal/web/dist/
+          if-no-files-found: error
+          retention-days: 1
 
-      # 发布前先过一遍静态检查与单元测试，不通过就不发
-      - name: 静态检查与单元测试
-        run: |
-          set -euo pipefail
-          go vet ./...
-
-          # 不用管道接 tee：set -o pipefail 会让 tee 之前失败时直接退出，
-          # 结果就是测试挂了却看不到是哪个包的哪条用例，只剩一个退出码。
-          if ! go test ./... > /tmp/test.log 2>&1; then
-            cat /tmp/test.log
-            echo "::error title=单元测试未通过::见上方输出"
-            exit 1
-          fi
-          cat /tmp/test.log
-
-      - name: 构建前端
-        run: |
-          set -euo pipefail
-          cd web
-          npm ci --no-audit --no-fund
-          npm run build
-
-      - name: 校验前端产物
-        run: |
-          set -euo pipefail
-          if [ ! -f internal/web/dist/index.html ]; then
-            echo "::error title=前端产物缺失::internal/web/dist/index.html 不存在，go:embed 会打进空的前端。"
-            exit 1
-          fi
-          echo "前端产物大小: $(du -sh internal/web/dist | cut -f1)"
-
-      # 打入真实版本信息；-trimpath 去掉本机路径，保证可复现
-      - name: 交叉编译
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-
-          version='${{ steps.ver.outputs.version }}'
-          commit="$(git rev-parse --short HEAD)"
-          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-          ldflags="-s -w \
-            -X ${MODULE}/internal/version.Version=${version} \
-            -X ${MODULE}/internal/version.Commit=${commit} \
-            -X ${MODULE}/internal/version.BuildTime=${built_at}"
-
-          for target in linux/amd64 linux/arm64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            echo ">>> 构建 ${os}/${arch}"
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-              go build -trimpath -ldflags "$ldflags" \
-              -o "dist/frpfirewall-${os}-${arch}" ./cmd/frpfirewall
-          done
-
-          ls -lh dist/
-
-      # 分发文件必须在生成校验和之前全部就位 —— 校验和要覆盖它们全部，
-      # 在线安装脚本会逐个核对，漏一个就会在用户机器上报「不在校验和文件里」。
-      - name: 收集分发文件
-        run: |
-          set -euo pipefail
-          cp scripts/install.sh            dist/install.sh
-          cp scripts/frpfirewall-panic.sh  dist/frpfirewall-panic.sh
-          cp deploy/frpfirewall.service    dist/frpfirewall.service
-          chmod 0755 dist/install.sh dist/frpfirewall-panic.sh
-          ls -lh dist/
-
-      # runner 本身就是 Linux，所以可以直接跑一遍，确认版本号真的注入进去了
-      - name: 验证二进制
-        run: |
-          set -euo pipefail
-          version='${{ steps.ver.outputs.version }}'
-
-          out="$(./dist/frpfirewall-linux-amd64 -version)"
-          echo "$out"
-
-          if ! printf '%s' "$out" | grep -q "FrpFireWall ${version} "; then
-            echo "::error title=版本注入失败::期望输出含 'FrpFireWall ${version} '，实际为：$out"
-            exit 1
-          fi
-          echo "版本注入校验通过"
-
-          # 救援脚本要能被用户直接下载执行，语法错误必须在发版时就拦住
-          bash -n dist/frpfirewall-panic.sh
-          bash -n dist/install.sh
-          echo "脚本语法检查通过"
-
-      # 覆盖发布里的每一个文件（sha256sums.txt 自己除外）。
-      # 早期版本只算了两个二进制，在线安装脚本对服务单元与救援脚本
-      # 只能跳过校验 —— 这里补上，让每个下载物都可验证。
-      - name: 生成校验和
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum \
-            frpfirewall-linux-amd64 \
-            frpfirewall-linux-arm64 \
-            frpfirewall-panic.sh \
-            frpfirewall.service \
-            install.sh \
-            > sha256sums.txt
-          cat sha256sums.txt
-
-      - name: 生成发布说明
+  build:
+    name: Linux ${{ matrix.arch }}
+    needs: [prepare, checks, frontend]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-web
+          path: internal/web/dist/
+      - name: 编译与验证
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
-          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILT_AT: ${{ needs.prepare.outputs.built_at }}
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
         run: |
           set -euo pipefail
+          test -s internal/web/dist/index.html
+          mkdir -p dist
+          ldflags="-s -w -X ${MODULE}/internal/version.Version=${VERSION} -X ${MODULE}/internal/version.Commit=$(git rev-parse --short HEAD) -X ${MODULE}/internal/version.BuildTime=${BUILT_AT}"
+          go build -trimpath -ldflags "$ldflags" -o "dist/frpfirewall-linux-${GOARCH}" ./cmd/frpfirewall
+          if [ "$GOARCH" = amd64 ]; then
+            out="$(./dist/frpfirewall-linux-amd64 -version)"
+            echo "$out"
+            [[ "$out" == "FrpFireWall ${VERSION} "* ]]
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/frpfirewall-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
-          {
-            if [ "$PRERELEASE" = "true" ]; then
-              echo "> ⚠️ 这是**预发布版**，用于尝鲜与验证，不建议在生产环境使用。"
-              echo "> 正式版用户的面板不会提示升级到本版本。"
-              echo
-            fi
-
-            echo "## 安装 / 升级"
-            echo
-            echo "在线一键（推荐）："
-            echo
-            echo '```bash'
-            echo "# 安装（已装过则用 update 升级）"
-            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash"
-            echo
-            echo "# 升级到本次发布的版本"
-            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash -s -- update"
-            echo
-            echo "# 卸载"
-            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash -s -- uninstall"
-            echo '```'
-            echo
-            echo "手动下载（离线 / 需要先审脚本时）："
-            echo
-            echo '```bash'
-            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/frpfirewall-linux-amd64"
-            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/frpfirewall.service"
-            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/frpfirewall-panic.sh"
-            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/install.sh"
-            echo "curl -LO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/sha256sums.txt"
-            echo
-            echo "# 校验完整性后再安装，不要跳过这一步"
-            echo "sha256sum -c sha256sums.txt --ignore-missing"
-            echo
-            echo "chmod +x install.sh frpfirewall-linux-amd64"
-            echo "sudo ./install.sh -b ./frpfirewall-linux-amd64"
-            echo '```'
-            echo
-            echo "arm64 机器把 \`frpfirewall-linux-amd64\` 换成 \`frpfirewall-linux-arm64\`。"
-            echo
-            echo "GitHub 直连慢的话，给在线脚本加加速前缀："
-            echo
-            echo '```bash'
-            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh | sudo bash -s -- update --mirror https://ghfast.top/"
-            echo '```'
-            echo
-            echo "## 变更"
-            echo
-
-            prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
-            if [ -n "$prev" ]; then
-              echo "自 \`${prev}\` 以来："
-              echo
-              git log --no-merges --pretty='- %s (`%h`)' "${prev}..${GITHUB_REF_NAME}"
-            else
-              echo "首个版本。"
-              echo
-              git log --no-merges --pretty='- %s (`%h`)' "${GITHUB_REF_NAME}"
-            fi
-
-            echo
-            echo "## 文件校验值"
-            echo
-            echo '```'
-            cat dist/sha256sums.txt
-            echo '```'
-          } > /tmp/notes.md
-
-          echo "发布说明预览:"
-          cat /tmp/notes.md
-
+  publish:
+    name: 发布 Release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-linux-*
+          path: dist/
+          merge-multiple: true
+      - name: 收集附件与校验和
+        run: |
+          set -euo pipefail
+          test -s dist/frpfirewall-linux-amd64
+          test -s dist/frpfirewall-linux-arm64
+          cp scripts/install.sh scripts/frpfirewall-panic.sh deploy/frpfirewall.service dist/
+          chmod 0755 dist/frpfirewall-linux-* dist/*.sh
+          bash -n dist/install.sh
+          bash -n dist/frpfirewall-panic.sh
+          cd dist
+          sha256sum frpfirewall-linux-amd64 frpfirewall-linux-arm64 frpfirewall-panic.sh frpfirewall.service install.sh > sha256sums.txt
+          sha256sum -c sha256sums.txt
+      - name: 生成发布说明
+        run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" > /tmp/notes.md
       - name: 创建 Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.ver.outputs.version }}
-          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
-
-          args=(
-            "v${VERSION}"
-            --title "FrpFireWall v${VERSION}"
-            --notes-file /tmp/notes.md
-            --verify-tag
-          )
-          if [ "$PRERELEASE" = "true" ]; then
-            args+=(--prerelease)
-            args+=(--latest=false)
+          args=("v${VERSION}" --title "v${VERSION}" --notes-file /tmp/notes.md --verify-tag)
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease --latest=false)
           else
             args+=(--latest)
           fi
-
-          gh release create "${args[@]}" \
-            dist/frpfirewall-linux-amd64 \
-            dist/frpfirewall-linux-arm64 \
-            dist/sha256sums.txt \
-            dist/install.sh \
-            dist/frpfirewall-panic.sh \
-            dist/frpfirewall.service
-
-          echo "::notice::发布完成 v${VERSION}"
+          gh release create "${args[@]}" dist/frpfirewall-linux-amd64 dist/frpfirewall-linux-arm64 dist/install.sh dist/frpfirewall-panic.sh dist/frpfirewall.service dist/sha256sums.txt

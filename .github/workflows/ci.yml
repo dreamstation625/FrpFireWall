@@ -8,8 +8,8 @@ name: CI
 #   日常提交 —— go vet + 单元测试。几十秒出结果，挡的是「编译器看不见」的那类
 #               问题：改了 JSON tag 而按字符串 key 取值的引用点没跟着改、
 #               往 ip 家族的链里写 ip6 表达式之类。
-#   发版提交 —— VERSION 文件有变化时，追加前端构建、安装脚本测试、版本脚本测试
-#               与交叉编译。这几步慢（npm ci 是大头），只有真要出包时才有意义。
+#   完整检查 —— VERSION 或工作流有变化时，追加前端构建、脚本回归与编译。
+#               脚本改动也独立触发回归，避免只改脚本时漏测。
 #
 # 前端构建是唯一的例外：它额外跟随 web/ 目录。前端产物只在改前端时会变，
 # 没必要等到发版才验一遍 —— 那会让前端错误一直积压到发版当天。
@@ -36,6 +36,8 @@ jobs:
     outputs:
       version_changed: ${{ steps.detect.outputs.version_changed }}
       web_changed: ${{ steps.detect.outputs.web_changed }}
+      full_check: ${{ steps.detect.outputs.full_check }}
+      scripts_changed: ${{ steps.detect.outputs.scripts_changed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,6 +61,8 @@ jobs:
              || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
             version_changed=true
             web_changed=true
+            full_check=true
+            scripts_changed=true
             note="拿不到比较基准，按全部变更处理"
           else
             files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
@@ -69,11 +73,17 @@ jobs:
             web_changed=false
             if grep -qx VERSION <<<"$files"; then version_changed=true; fi
             if grep -q '^web/' <<<"$files"; then web_changed=true; fi
+            full_check="$version_changed"
+            scripts_changed=false
+            if grep -q '^\.github/workflows/' <<<"$files"; then full_check=true; fi
+            if grep -Eq '^(scripts/|testdata/test-.*\.sh$)' <<<"$files"; then scripts_changed=true; fi
             note="基准 ${BASE_SHA:0:7}"
           fi
 
           echo "version_changed=$version_changed" >> "$GITHUB_OUTPUT"
           echo "web_changed=$web_changed" >> "$GITHUB_OUTPUT"
+          echo "full_check=$full_check" >> "$GITHUB_OUTPUT"
+          echo "scripts_changed=$scripts_changed" >> "$GITHUB_OUTPUT"
 
           {
             echo "### 变更范围"
@@ -82,6 +92,8 @@ jobs:
             echo "|---|---|"
             echo "| VERSION 变更 | \`$version_changed\` |"
             echo "| 前端变更 | \`$web_changed\` |"
+            echo "| 完整检查 | \`$full_check\` |"
+            echo "| 脚本变更 | \`$scripts_changed\` |"
             echo "| 说明 | $note |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -146,7 +158,7 @@ jobs:
       - name: 单元测试
         run: go test ./... -count=1
 
-      # ---- 以下三步只和「要出包」有关，日常提交跳过 ----
+      # 脚本回归随版本、工作流和脚本改动运行，额外编译随完整检查运行。
 
       # 一键脚本是用户装机的第一道门，它自己的回归必须固化下来。
       # 覆盖：版本比较与 Go 侧（internal/version）逐条一致、
@@ -154,7 +166,7 @@ jobs:
       #       校验和不匹配必须中止、降级拦截、--purge 护栏。
       # 全程用桩命令，不碰真实的 systemd / iptables / /usr/local。
       - name: 安装脚本测试
-        if: needs.changes.outputs.version_changed == 'true'
+        if: needs.changes.outputs.full_check == 'true' || needs.changes.outputs.scripts_changed == 'true'
         run: bash testdata/test-install.sh
 
       # 版本号散落在四处（VERSION / version.go / package.json / package-lock.json），
@@ -162,18 +174,22 @@ jobs:
       # Release 工作流在同一个位置失败，失败前不产出任何资产。手动改过两次
       # 两次都漏，所以把 "四处都改到了" 固化下来。
       - name: 版本脚本测试
-        if: needs.changes.outputs.version_changed == 'true'
+        if: needs.changes.outputs.full_check == 'true' || needs.changes.outputs.scripts_changed == 'true'
         run: bash testdata/test-version-bump.sh
 
+      - name: 发布说明测试
+        if: needs.changes.outputs.full_check == 'true' || needs.changes.outputs.scripts_changed == 'true'
+        run: bash testdata/test-release-notes.sh
+
       - name: 编译
-        if: needs.changes.outputs.version_changed == 'true'
+        if: needs.changes.outputs.full_check == 'true'
         run: CGO_ENABLED=0 go build -trimpath ./...
 
   frontend:
     name: 前端
     needs: changes
     # 发版要打包前端产物，改了前端代码也得验一遍；两条都不满足就没必要跑。
-    if: needs.changes.outputs.version_changed == 'true' || needs.changes.outputs.web_changed == 'true'
+    if: needs.changes.outputs.full_check == 'true' || needs.changes.outputs.web_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
