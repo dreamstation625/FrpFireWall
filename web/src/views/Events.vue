@@ -171,6 +171,7 @@ const tab = ref('events')
 const categories = [
   { value: 'login_attempt', label: '登录放行' },
   { value: 'login_blocked', label: '登录拦截' },
+  { value: 'observed', label: '策略观察' },
   { value: 'user_conn', label: '访问连接' },
   { value: 'ban', label: '封禁' },
   { value: 'unban', label: '解封' },

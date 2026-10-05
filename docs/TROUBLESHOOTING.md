@@ -117,7 +117,7 @@ ls -l /etc/systemd/system/frpfirewall.service.d/
 sudo systemctl stop frpfirewall
 sudo cp -p /var/lib/frpfirewall/frpfirewall.db "/var/lib/frpfirewall/frpfirewall.db.backup-$(date +%Y%m%d-%H%M%S)"
 sudo sqlite3 /var/lib/frpfirewall/frpfirewall.db \
-  "BEGIN; UPDATE settings SET value='' WHERE key='admin_password_hash'; UPDATE settings SET value='' WHERE key='setup_token'; COMMIT;"
+  "BEGIN; UPDATE settings SET value='' WHERE key='admin_password_hash'; UPDATE settings SET value='' WHERE key='setup_token'; INSERT INTO settings(key,value) VALUES('auth.session_version',lower(hex(randomblob(32)))) ON CONFLICT(key) DO UPDATE SET value=excluded.value; COMMIT;"
 sudo systemctl start frpfirewall
 ```
 
@@ -145,7 +145,11 @@ sudo systemctl start frpfirewall
 | 4 | 可信回源网段（CDN / 反代） | 放行，跳过后续封禁决策 |
 | 5 | 全局 GeoIP 国家名单 | 拒绝 + 封禁；**细分规则取代不了它** |
 | 6 | 频控细分规则（第一条命中的） | 「直接拦截」则拒绝 + 封禁；否则取代全局频控参数 |
-| 7 | 限速 → 阈值 | 超限则拒绝，达阈值则封禁 |
+| 7 | 窗口计数 → 阈值 → 限速 | 超速尝试也计入窗口；先判阈值封禁，再判独立限速 |
+
+上表描述正常执行模式。观察模式放行自动策略并记录「策略观察」，但人工地址黑名单和人工封禁
+继续拦截；关闭自动封禁不新增持久记录，地区 / 直接拦截仍拒绝当次连接，频次阈值仅记录，
+独立限速继续执行。详见[开关行为](FEATURES.md#观察模式与自动封禁)。
 
 两点容易误判：
 
@@ -169,14 +173,13 @@ sudo frpfirewall-panic --dry-run    # 先看会做什么
 sudo frpfirewall-panic              # 执行清理，核对输出中的失败提示
 ```
 
-它只处理归属 frpfirewall 的跳转、链，以及带 `frpfirewall` 注释的 nftables 规则与
+它只处理归属 frpfirewall 的跳转、链，以及注释以 `frpfirewall:` 开头的 nftables 规则、限速子链与
 `frpfirewall_*` 集合，不动系统原有规则。
 
 > [!IMPORTANT]
-> 当前 iptables 救援脚本只显式清理 `FRPFIREWALL_GUARD` 与 `FRPFIREWALL_BLACK`，
-> 未清理驱动使用的 `FRPFIREWALL_BLACK_FRP`；链删除顺序也可能使仍被引用的链删除失败。
-> 摘掉主链跳转后，本程序入口停止拦截，但这不等于所有受管对象都已删除。
-> 请检查脚本失败提示与 `iptables-save` / `ip6tables-save` 输出。
+> 脚本先摘入口，再清空并删除 `FRPFIREWALL_GUARD`、`FRPFIREWALL_BLACK`、
+> `FRPFIREWALL_BLACK_FRP`，并清理 nft 受管规则、限速子链与集合。
+> 任一清理失败会返回非零；仍须检查失败提示与实际规则输出。
 
 救援脚本只清网络层，应用层的封禁记录还在数据库里 —— 要彻底放行，还得去
 **封禁记录** 页解封，或把对应的名单条目 / 规则停用。
@@ -189,3 +192,12 @@ sudo journalctl -u frpfirewall -n 50 --no-pager
 ```
 
 需要反馈问题时，请附上版本、系统与防火墙后端、复现步骤、相关日志；分享前遮住初始化令牌、JWT、密码等信息。
+
+## 修复后的认证与传输行为
+
+- 改密码或登出后，旧 token 会被服务器撤销；单管理员面板的登出会撤销全部会话，重启也不会恢复。
+- CSV 导出由面板携带认证头下载，不接受 URL 中的 token。旧脚本请改用 `Authorization: Bearer ...`。
+- 面板以实际 TCP 对端限流，不信任客户端提供的转发头。放在反向代理后时，各客户端会共享该代理的登录限制。
+- 普通请求上限 1MiB，名单导入 8MiB；属地上传单文件 200MiB，完整请求允许额外 1MiB 表单开销。
+- 属地上传与同步下载使用独立 13 分钟传输截止时间；上游下载总预算仍为 12 分钟。反向代理自身的超时也应匹配。
+- 切换后端会清理旧受管拦截规则；失败会返回错误，检查同步状态，不要据此假定切换已成功。

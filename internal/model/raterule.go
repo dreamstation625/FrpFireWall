@@ -334,6 +334,14 @@ func (r *RateRule) Normalize() {
 //
 // 返回值第一项是给用户看的完整描述（带规则名），第二项是纯原因。
 func (r *RateRule) Validate() error {
+	if strings.TrimSpace(r.BanDurations) != "" {
+		if _, err := ParseDurationSteps(r.BanDurations); err != nil {
+			return fmt.Errorf("封禁配置不完整或非法: %w", err)
+		}
+	}
+	if r.PerSec > 1000000 || r.Burst > 2000000 {
+		return fmt.Errorf("连接速率或突发额度超出上限")
+	}
 	if r.Name == "" {
 		return fmt.Errorf("规则名不能为空")
 	}
@@ -423,7 +431,7 @@ func (r *RateRule) Validate() error {
 	}
 
 	// ---- 应用层 ----
-	if r.PerSec < 0 {
+	if r.PerSec < 0 || r.PerSec > 1000000 || r.Burst > 2000000 {
 		return fmt.Errorf("规则「%s」的每秒连接数上限不能为负数", r.Name)
 	}
 	if r.Burst < 0 {

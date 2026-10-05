@@ -15,6 +15,7 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/firewall"
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/guard"
+	"github.com/dreamstation625/FrpFireWall/internal/model"
 	"github.com/dreamstation625/FrpFireWall/internal/myip"
 	"github.com/dreamstation625/FrpFireWall/internal/store"
 	"github.com/dreamstation625/FrpFireWall/internal/update"
@@ -32,6 +33,8 @@ type Server struct {
 	tokenTTL  time.Duration
 
 	// 面板凭据（bcrypt 哈希），支持运行期改密码
+	authMu   sync.Mutex
+	switchMu sync.Mutex
 	credMu   sync.RWMutex
 	username string
 	passHash string
@@ -76,7 +79,7 @@ func New(
 		guard:     g,
 		log:       log,
 		jwtSecret: []byte(jwtSecret),
-		tokenTTL:  time.Duration(cfg.Server.Auth.TokenTTLHours) * time.Hour,
+		tokenTTL:  model.SafeHours(cfg.Server.Auth.TokenTTLHours),
 		username:  username,
 		passHash:  passHash,
 		drv:       drv,
@@ -114,6 +117,8 @@ func (s *Server) Routes() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
+	_ = r.SetTrustedProxies(nil)
+	r.Use(s.limitBody())
 	r.Use(gin.Recovery())
 	r.Use(s.accessLog())
 
@@ -205,7 +210,14 @@ func (s *Server) Routes() http.Handler {
 	}
 
 	s.mountWeb(r)
-	return r
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/api/v1/geoip/upload" || req.URL.Path == "/api/v1/geoip/download" {
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Now().Add(13 * time.Minute))
+			_ = rc.SetWriteDeadline(time.Now().Add(13 * time.Minute))
+		}
+		r.ServeHTTP(w, req)
+	})
 }
 
 // mountWeb 挂载前端静态资源。
@@ -272,7 +284,13 @@ func fail(c *gin.Context, status int, msg string) {
 	c.JSON(status, gin.H{"ok": false, "error": msg})
 }
 
-func badRequest(c *gin.Context, msg string) { fail(c, http.StatusBadRequest, msg) }
+func badRequest(c *gin.Context, msg string) {
+	if exceeded, _ := c.Get("body_limit_exceeded"); exceeded == true {
+		fail(c, http.StatusRequestEntityTooLarge, "请求体超过大小限制")
+		return
+	}
+	fail(c, http.StatusBadRequest, msg)
+}
 func serverErr(c *gin.Context, err error) {
 	fail(c, http.StatusInternalServerError, err.Error())
 }

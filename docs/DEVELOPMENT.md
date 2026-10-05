@@ -192,7 +192,24 @@ go build ./...
 ```
 
 覆盖包括版本比较与更新筛选、策略判定、封禁与到期、规则生成、计数解析、接口参数校验等。
-这些检查不等同于真实 Linux 防火墙验证。
+这些检查不等同于真实 Linux 防火墙验证。安全回归位于 `internal/api/security_test.go` 与
+`internal/guard/security_test.go`，修复对照见 [安全审查记录](SECURITY_REVIEW.md)。
+
+竞争检测使用 `CGO_ENABLED=1 go test -race ./internal/api ./internal/guard ./internal/firewall ./internal/geoip`，
+需要平台对应的 C 编译器；这不改变发布二进制使用纯 Go、`CGO_ENABLED=0` 的构建方式。
+
+Linux 内核测试位于 `internal/firewall/namespace_linux_test.go`。默认跳过，须显式启用并置于独立
+网络空间；测试会验证 `/proc/self/ns/net` 与 `/proc/1/ns/net` 不同，相同则拒绝执行。
+
+```bash
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o firewall.test ./internal/firewall
+unshare --net -- env FRPFIREWALL_NAMESPACE_TEST=1 ./firewall.test -test.run '^TestIsolatedFirewallTransactions$' -test.v
+```
+
+每个隔离用例应使用新的网络空间；禁止直接在有业务流量的宿主机空间执行。
+测试需要 root / 网络空间管理权限、nft、iptables 及对应 restore、ip 命令。
+救援用例还需通过 `FRPFIREWALL_PANIC_SCRIPT` 指定仓库脚本的绝对路径；它只在隔离空间执行。
+完整用例名单与测试范围见[验证结果](SECURITY_REVIEW.md#验证结果)。
 
 ### 脚本回归
 

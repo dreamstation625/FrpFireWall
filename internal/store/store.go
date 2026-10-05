@@ -390,6 +390,13 @@ func (s *Store) CreateBan(b *model.BanRecord) error {
 	return s.db.Create(b).Error
 }
 
+// ReleaseBansByRef 同时解除来源相同的历史重复活跃记录。
+func (s *Store) ReleaseBansByRef(ref, by string) (int64, error) {
+	tx := s.db.Model(&model.BanRecord{}).Where("source_ref = ? AND status = ?", ref, model.BanActive).
+		Updates(map[string]any{"status": model.BanReleased, "released_at": time.Now(), "released_by": by})
+	return tx.RowsAffected, tx.Error
+}
+
 // FindActiveBan 查某个 target 当前是否已在封禁中。
 func (s *Store) FindActiveBan(target string) (*model.BanRecord, error) {
 	var b model.BanRecord
@@ -427,13 +434,15 @@ func (s *Store) GetBan(id uint) (*model.BanRecord, error) {
 
 // ReleaseBan 把封禁标记为已解除。
 func (s *Store) ReleaseBan(id uint, by string, status string) error {
-	now := time.Now()
-	return s.db.Model(&model.BanRecord{}).Where("id = ?", id).
-		Updates(map[string]any{
-			"status":      status,
-			"released_at": &now,
-			"released_by": by,
-		}).Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var rec model.BanRecord
+		if err := tx.First(&rec, id).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		// 同一地址的旧版本重复活跃记录一并解除，保留历史审计行。
+		return tx.Model(&model.BanRecord{}).Where("target = ? AND status = ?", rec.Target, model.BanActive).Updates(map[string]any{"status": status, "released_at": now, "released_by": by}).Error
+	})
 }
 
 // ReleaseBans 批量把一组封禁标记为已解除。

@@ -88,26 +88,28 @@ func (s Set) Merge(other Set) Set {
 	return out.normalized()
 }
 
-// Chunks 把区间切成若干块，每块不超过 n 个区间。
-//
-// iptables 的 multiport 一次最多接受 15 个端口或区间，超了整条命令会被拒绝，
-// 所以端口块要按「区间个数」而不是「端口个数」来切。空集合返回 nil，
-// 免得调用方拿着一个空块去拼 `--dports ""` 这种规则。
+// Chunks 按 multiport 槽位切块：单端口占 1 槽，区间占 2 槽。
 func (s Set) Chunks(n int) []Set {
 	if len(s) == 0 {
 		return nil
 	}
-	if n <= 0 || n >= len(s) {
+	if n <= 0 {
 		return []Set{s}
 	}
-	out := make([]Set, 0, (len(s)+n-1)/n)
-	for i := 0; i < len(s); i += n {
-		end := i + n
-		if end > len(s) {
-			end = len(s)
+	var out []Set
+	start, used := 0, 0
+	for i, r := range s {
+		cost := 1
+		if r.Lo != r.Hi {
+			cost = 2
 		}
-		out = append(out, s[i:end])
+		if used > 0 && used+cost > n {
+			out = append(out, s[start:i])
+			start, used = i, 0
+		}
+		used += cost
 	}
+	out = append(out, s[start:])
 	return out
 }
 

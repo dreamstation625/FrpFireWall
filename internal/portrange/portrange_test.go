@@ -150,7 +150,7 @@ func TestChunks(t *testing.T) {
 	if n := len(set.Chunks(15)); n != 1 {
 		t.Fatalf("3 个区间按上限 15 切，应得 1 块，实际 %d 块", n)
 	}
-	parts := set.Chunks(2)
+	parts := set.Chunks(4)
 	if len(parts) != 2 {
 		t.Fatalf("3 个区间每块 2 个，应得 2 块，实际 %d 块", len(parts))
 	}

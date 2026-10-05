@@ -58,10 +58,14 @@ type iptablesDriver struct {
 func newIPTablesDriver(report *Report) *iptablesDriver {
 	d := &iptablesDriver{report: report}
 	if _, ok := lookPath("iptables"); ok {
-		d.fams = append(d.fams, ipFamily{name: "ipv4", bin: "iptables", bits: 32})
+		if _, ok := lookPath("iptables-restore"); ok {
+			d.fams = append(d.fams, ipFamily{name: "ipv4", bin: "iptables", bits: 32})
+		}
 	}
 	if _, ok := lookPath("ip6tables"); ok {
-		d.fams = append(d.fams, ipFamily{name: "ipv6", bin: "ip6tables", bits: 128})
+		if _, ok := lookPath("ip6tables-restore"); ok {
+			d.fams = append(d.fams, ipFamily{name: "ipv6", bin: "ip6tables", bits: 128})
+		}
 	}
 	return d
 }
@@ -74,19 +78,31 @@ func (d *iptablesDriver) Capability() Capability {
 		Version:   d.report.IPTablesVersion,
 		Supported: len(d.fams) > 0,
 	}
-	if d.report.HasIPTables {
+	if c.Supported {
 		c.RateLimit = true // hashlimit 自 iptables 1.4 起都有
 		// 每个地址一条规则，所以计数能细到地址。
 		c.CounterGranularity = CounterKindAddr
 	} else {
-		c.Reason = "未找到 iptables 命令"
+		c.Reason = "未找到可用的 iptables/ip6tables 与对应 restore 命令"
+	}
+	if len(d.report.Warnings) > 0 {
+		warnings := strings.Join(d.report.Warnings, "；")
+		if c.Reason == "" {
+			c.Reason = warnings
+		} else {
+			c.Reason += "；" + warnings
+		}
 	}
 	return c
 }
 
 // EnsureBase 幂等创建受管链，并把跳转挂进 INPUT。
-func (d *iptablesDriver) EnsureBase() error {
-	ctx := context.Background()
+func (d *iptablesDriver) EnsureBase() error { return d.ensureBase(context.Background()) }
+
+func (d *iptablesDriver) ensureBase(ctx context.Context) error {
+	if len(d.fams) == 0 {
+		return ErrNotSupported
+	}
 	for _, f := range d.fams {
 		for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
 			if _, err := run(ctx, f.bin, "-N", chain); err != nil {
@@ -106,21 +122,29 @@ func (d *iptablesDriver) EnsureBase() error {
 }
 
 // Sync 全量重建受管链，使实际状态对齐期望状态。幂等，可随时重放。
-func (d *iptablesDriver) Sync(des Desired) error {
-	if err := d.EnsureBase(); err != nil {
+func (d *iptablesDriver) Sync(des Desired) error { return d.SyncContext(context.Background(), des) }
+
+func (d *iptablesDriver) SyncContext(ctx context.Context, des Desired) error {
+	if err := d.ensureBase(ctx); err != nil {
 		return err
 	}
-	ctx := context.Background()
+	before, err := d.Snapshot()
+	if err != nil {
+		return err
+	}
 	for _, f := range d.fams {
 		if err := d.syncFamily(ctx, f, des); err != nil {
+			if rollbackErr := d.Restore(before); rollbackErr != nil {
+				return fmt.Errorf("同步失败: %w；恢复旧规则失败: %v", err, rollbackErr)
+			}
 			return err
 		}
 	}
 	return nil
 }
 
-// iptRule 是一条待下发的规则。Soft 为真表示失败不阻断整次同步 ——
-// 用于限速这类"模块不可用就降级"的增强能力。
+// iptRule 是一条待下发的规则。Soft 仅标识限速规则的历史分类；
+// 当前批量提交会在任一规则预检失败时保留旧规则，不静默跳过。
 type iptRule struct {
 	Args []string
 	Soft bool
@@ -181,8 +205,7 @@ func buildIPTablesRules(des Desired, bits int) iptRules {
 
 	// 连接速率限制（per-IP），放在封禁判定之后、兜底 RETURN 之前。
 	//
-	// 顺序就是优先级：全局兜底规则在最前面（作用面最宽），细分规则依次排在后面。
-	// 想让"细分优先"真正成立，上层编译时就得把细分规则放在前面 ——
+	// 顺序就是优先级：上层把细分规则放在前面、全局兜底放在最后；
 	// 这里不做任何重排，照单下发。
 	for _, rl := range filterRateRules(des.RateLimits, bits) {
 		for _, args := range rateLimitArgs(rl) {
@@ -190,6 +213,14 @@ func buildIPTablesRules(des Desired, bits int) iptRules {
 				Args: append([]string{"-A", ManagedChain}, args...),
 				Soft: true,
 			})
+			i := 0
+			for i < len(args)-1 {
+				if args[i] == "-m" && args[i+1] == "hashlimit" {
+					break
+				}
+				i++
+			}
+			r.Guard = append(r.Guard, iptRule{Args: append(append([]string{"-A", ManagedChain}, args[:i]...), "-j", "RETURN"), Soft: true})
 		}
 	}
 
@@ -208,8 +239,8 @@ func iptPorts(s portrange.Set) string { return renderPorts(s, ":", ",") }
 // 只封 TCP 会留下一条用 UDP 绕过的路径。自定义端口同样按两种协议封 —— 用户填的
 // 是"目的端口"，没有理由替他假定只有 TCP。
 //
-// 端口按「区间个数」切块：multiport 一次最多认 15 个端口或区间，而一个区间
-// 无论多宽都只占一个名额 —— 所以 20000-30000 是一条规则，不是一千多条。
+// 按 multiport 的 15 个名额切块：单端口占 1、区间占 2，
+// 无论区间多宽都不枚举其中的端口。
 func portBlockRules(groups []iptPortGroup) [][]string {
 	total := 0
 	for _, g := range groups {
@@ -246,49 +277,15 @@ func (d *iptablesDriver) warn(msg string) {
 }
 
 func (d *iptablesDriver) syncFamily(ctx context.Context, f ipFamily, des Desired) error {
-	rules := buildIPTablesRules(des, f.bits)
-
-	// 先清空自己的链——只动受管命名空间，绝不碰系统其它规则。
-	for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
-		if _, err := run(ctx, f.bin, "-w", "-F", chain); err != nil {
-			return fmt.Errorf("清空 %s 失败: %w", chain, err)
-		}
+	if len(d.fams) == 0 {
+		return ErrNotSupported
 	}
-
-	for _, rule := range rules.Guard {
-		full := append([]string{"-w"}, rule.Args...)
-		if _, err := run(ctx, f.bin, full...); err != nil {
-			if rule.Soft {
-				// 限速是增强能力，模块不可用时降级而不是让整次同步失败。
-				d.warn(fmt.Sprintf("%s 下发连接速率限制失败，已跳过：%v", f.name, err))
-				continue
-			}
-			return fmt.Errorf("写入主链规则失败: %w", err)
-		}
+	script := restoreScript(buildIPTablesRules(des, f.bits))
+	if _, err := runStdin(ctx, script, f.bin+"-restore", "--test", "--noflush", "--wait", "10"); err != nil {
+		return fmt.Errorf("规则预检失败，保留旧规则: %w", err)
 	}
-
-	// 黑名单逐条写入子链。
-	for _, b := range rules.Black {
-		if _, err := run(ctx, f.bin, "-w", "-A", managedBlackChain, "-s", b, "-j", "DROP"); err != nil {
-			return fmt.Errorf("写入黑名单 %s 失败: %w", b, err)
-		}
-	}
-
-	// 端口限定分组里没端口的那一类，生成不出 dport 条件。静默跳过会让"设了
-	// 端口限定范围"看起来生效了、实际一条规则都没有 —— 这种"以为封了其实没封"
-	// 必须报出来。按 Desired 里的原始分组报，不能用过滤后的（过滤时已经丢掉了）。
-	for _, g := range des.PortBlacklists {
-		if len(g.Ports.Normalize()) == 0 && len(g.Prefixes) > 0 {
-			d.warn(fmt.Sprintf(
-				"有 %d 个地址属于「%s」，但这一组没有配置任何端口，这些条目暂未下发",
-				len(g.Prefixes), g.Label))
-		}
-	}
-	for _, args := range portBlockRules(rules.PortGroups) {
-		full := append([]string{"-w"}, args...)
-		if _, err := run(ctx, f.bin, full...); err != nil {
-			return fmt.Errorf("写入端口限定黑名单失败: %w", err)
-		}
+	if _, err := runStdin(ctx, script, f.bin+"-restore", "--noflush", "--wait", "10"); err != nil {
+		return fmt.Errorf("提交规则失败: %w", err)
 	}
 	return nil
 }
@@ -509,6 +506,7 @@ func (d *iptablesDriver) DumpSystem() (string, error) {
 // 就是"会下发的"。
 func (d *iptablesDriver) Preview(des Desired) (string, error) {
 	var b strings.Builder
+	b.WriteString("# 以下展示规则结构；实际同步通过 restore 预检后批量原子提交，不逐条清空追加。\n")
 	for _, f := range d.fams {
 		rules := buildIPTablesRules(des, f.bits)
 
@@ -554,8 +552,7 @@ func (d *iptablesDriver) Snapshot() (string, error) {
 		for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
 			out, err := run(ctx, f.bin, "-w", "-S", chain)
 			if err != nil {
-				fmt.Fprintf(&b, "# %s %s: %v\n", f.bin, chain, err)
-				continue
+				return "", fmt.Errorf("读取受管链快照失败: %w", err)
 			}
 			fmt.Fprintf(&b, "# %s %s\n%s\n", f.bin, chain, out)
 		}
@@ -566,44 +563,51 @@ func (d *iptablesDriver) Snapshot() (string, error) {
 // Restore 回滚到快照。只重建受管链，不动系统规则。
 func (d *iptablesDriver) Restore(snapshot string) error {
 	ctx := context.Background()
-	for _, f := range d.fams {
-		for _, chain := range []string{ManagedChain, managedBlackChain, managedPortBlackChain} {
-			if _, err := run(ctx, f.bin, "-w", "-F", chain); err != nil {
-				return err
-			}
-		}
-	}
-
-	// 快照里存的是 -A 规则行，按顺序回放。
-	//
-	// 用哪个 bin 要从 "# <bin> <chain>" 注释行里跟出来：v4 与 v6 的规则在快照里
-	// 是顺序混排的，回放时若一律用 iptables 执行，v6 规则会落到 v4 表上 ——
-	// 回滚"成功"了，恢复出来的却是错的。
+	sections := make(map[string][]string)
 	bin := ""
 	for _, line := range strings.Split(snapshot, "\n") {
 		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		f := strings.Fields(line)
 		if strings.HasPrefix(line, "# ") {
-			if f := strings.Fields(line); len(f) >= 3 {
-				bin = f[1]
+			if len(f) != 3 || (f[1] != "iptables" && f[1] != "ip6tables") || !ownIPTChain(f[2]) {
+				return fmt.Errorf("非法快照标题")
+			}
+			bin = f[1]
+			if _, ok := sections[bin]; !ok {
+				sections[bin] = nil
 			}
 			continue
 		}
-		if !strings.HasPrefix(line, "-A ") {
-			continue
+		if len(f) < 2 || bin == "" || !ownIPTChain(f[1]) || (f[0] != "-A" && f[0] != "-N") {
+			return fmt.Errorf("快照包含非受管命令")
 		}
-		fields := strings.Fields(line)
-		chain := ""
-		if len(fields) >= 2 {
-			chain = fields[1]
+		if f[0] == "-A" {
+			for i, a := range f {
+				if a == "-j" && i+1 < len(f) && f[i+1] != "DROP" && f[i+1] != "RETURN" && !ownIPTChain(f[i+1]) {
+					return fmt.Errorf("快照跳转到非受管目标")
+				}
+			}
+			sections[bin] = append(sections[bin], line)
 		}
-		if chain != ManagedChain && chain != managedBlackChain && chain != managedPortBlackChain {
-			continue
+	}
+	for _, f := range d.fams {
+		rules, ok := sections[f.bin]
+		if !ok {
+			return fmt.Errorf("快照缺少 %s", f.bin)
 		}
-		if bin == "" {
-			bin = "iptables"
+		script := restoreHeader() + strings.Join(rules, "\n") + "\nCOMMIT\n"
+		if _, err := runStdin(ctx, script, f.bin+"-restore", "--test", "--noflush", "--wait", "10"); err != nil {
+			return err
 		}
-		args := append([]string{"-w"}, fields...)
-		_, _ = run(ctx, bin, args...)
+	}
+	for _, f := range d.fams {
+		script := restoreHeader() + strings.Join(sections[f.bin], "\n") + "\nCOMMIT\n"
+		if _, err := runStdin(ctx, script, f.bin+"-restore", "--noflush", "--wait", "10"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -656,7 +660,21 @@ func filterByFamily(targets []string, bits int) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out
+	kept := out[:0]
+	for _, x := range out {
+		p, _ := normalizeTarget(x)
+		covered := false
+		for bits := p.Bits() - 1; bits >= 0; bits-- {
+			if _, ok := set[netip.PrefixFrom(p.Addr(), bits).Masked().String()]; ok {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			kept = append(kept, x)
+		}
+	}
+	return kept
 }
 
 // rateLimitArgs 把一条限速规则展开成 iptables 参数。
@@ -664,7 +682,7 @@ func filterByFamily(targets []string, bits int) []string {
 // 展开成「来源 × 端口分块」的笛卡尔积，而不是靠 iptables 自己对重复的 -s
 // 做隐式展开 —— 展开出来的条数得能提前数清楚，否则"到底下了几条规则"
 // 只能上机器数。端口按区间个数切块（multiport 的 15 个名额数的是端口或区间的
-// 个数，20000:30000 只占一个）。
+// 个数，20000:30000 占两个）。
 //
 // 同一个 Key 拆出来的所有条共用同一个 --hashlimit-name，因而共享同一张计数表。
 // 各条各算一份配额的话，实际放行量会按条数翻倍 —— 这块以前踩过。

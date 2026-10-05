@@ -97,8 +97,15 @@ export const api = {
     http.post(`/acl/${kind}/batch`, body),
   importACL: (kind: string, body: Record<string, unknown>) =>
     http.post(`/acl/${kind}/import`, body),
-  exportACLURL: (kind: string) =>
-    `/api/v1/acl/${kind}/export?token=${localStorage.getItem(TOKEN_KEY) || ''}`,
+  exportACL: async (kind: string) => {
+    const blob = await http.get('/acl/' + kind + '/export', { responseType: 'blob' }) as unknown as Blob
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = kind + '-list.csv'
+    link.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  },
 
   // ---- 封禁 ----
   listBans: (params: Record<string, unknown>) => http.get('/bans', { params }),
@@ -130,7 +137,7 @@ export const api = {
     fd.append('file', file)
     return http.post('/geoip/upload', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 120000,
+      timeout: 780000,
     })
   },
   // 可下载的库清单 + 可选加速源。加速源列表由后端给，前端不自己存一份。
@@ -139,7 +146,7 @@ export const api = {
   // 可能拖几分钟。这里不设超时，把节奏交给后端 —— 前端抢在后端前面断开，
   // 用户只会看到一个没头没尾的错误，还以为是网络问题。
   geoDownload: (name: string, mirror: string) =>
-    http.post('/geoip/download', { name, mirror }, { timeout: 0 }),
+    http.post('/geoip/download', { name, mirror }, { timeout: 780000 }),
 
   // ---- 事件 ----
   listEvents: (params: Record<string, unknown>) =>

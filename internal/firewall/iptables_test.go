@@ -75,7 +75,7 @@ func TestPortBlockRules(t *testing.T) {
 
 		// 20 段 → 2 块 × 2 种协议 = 4 条
 		if len(got) != 4 {
-			t.Fatalf("规则数 %d，期望 4：%v", len(got), got)
+			t.Fatalf("规则数 %d，期望 6：%v", len(got), got)
 		}
 		for _, args := range got {
 			if n := len(strings.Split(dportsOf(t, args), ",")); n > multiportMax {
@@ -84,8 +84,8 @@ func TestPortBlockRules(t *testing.T) {
 		}
 	})
 
-	t.Run("切块按区间个数算，宽区间不会撑爆一条规则", func(t *testing.T) {
-		// 20 段互不相邻的宽区间：总端口数上万，但每块只放 15 段。
+	t.Run("切块按名额算，每个区间占两个名额", func(t *testing.T) {
+		// 20 段互不相邻的宽区间：总端口数上万，但每块最多放 7 个区间。
 		set := portrange.Set{}
 		for i := 0; i < 20; i++ {
 			base := 1000 + i*1000
@@ -93,7 +93,7 @@ func TestPortBlockRules(t *testing.T) {
 		}
 		got := portBlockRules(portGroup([]string{"198.51.100.9"}, set))
 
-		if len(got) != 4 { // 2 块 × 2 协议
+		if len(got) != 6 { // 20 个区间占 40 个名额，3 块 × 2 协议
 			t.Fatalf("规则数 %d，期望 4：%v", len(got), got)
 		}
 		for _, args := range got {
@@ -205,9 +205,7 @@ func TestBuildIPTablesRulesOrder(t *testing.T) {
 	}
 }
 
-// 限速是增强能力，失败可以降级；其余规则失败必须让整次同步失败。
-// 两者的区分靠 iptRule.Soft，弄反了后果是：限速失败导致整次同步中断，
-// 或者黑名单写失败却被当成可忽略。
+// 历史分类仍标记限速规则，但提交预检失败不再忽略，旧规则必须继续生效。
 func TestBuildIPTablesRulesRateLimitIsSoft(t *testing.T) {
 	withRate := buildIPTablesRules(Desired{
 		RateLimits: []RateLimitRule{{Key: "global", PerSec: 20, Ports: portrange.Ports(7000)}},
@@ -221,8 +219,8 @@ func TestBuildIPTablesRulesRateLimitIsSoft(t *testing.T) {
 			hard++
 		}
 	}
-	if soft != 1 {
-		t.Errorf("应当恰好有一条可降级的限速规则，实际 %d 条", soft)
+	if soft != 2 {
+		t.Errorf("应当有 DROP 与匹配 RETURN 两条限速规则，实际 %d 条", soft)
 	}
 	if hard != 3 { // 跳转全端口 + 跳转端口限定 + RETURN
 		t.Errorf("固定规则应为 3 条，实际 %d 条", hard)

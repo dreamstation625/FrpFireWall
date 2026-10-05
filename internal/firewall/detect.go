@@ -166,13 +166,23 @@ func New(ctx context.Context, backend string, report *Report) (Driver, error) {
 	if report == nil {
 		report = Detect(ctx)
 	}
+	copyReport := *report
+	copyReport.Warnings = append([]string(nil), report.Warnings...)
+	report = &copyReport
 
 	pick := func(b Backend) (Driver, error) {
 		switch b {
 		case BackendIPTables:
-			return newIPTablesDriver(report), nil
+			d := newIPTablesDriver(report)
+			if !d.Capability().Supported {
+				return nil, ErrNotSupported
+			}
+			return &serialDriver{Driver: d}, nil
 		case BackendNFTables:
-			return newNFTablesDriver(report), nil
+			if !report.HasNFTables {
+				return nil, ErrNotSupported
+			}
+			return &serialDriver{Driver: newNFTablesDriver(report)}, nil
 		default:
 			return nil, ErrNotSupported
 		}

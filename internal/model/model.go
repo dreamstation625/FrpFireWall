@@ -33,11 +33,9 @@ const (
 	//
 	// 和 ScopeFrp 是两个方向：ScopeFrp 回答"别碰 frp 之外的东西"（端口由全局
 	// 配置算出来），ScopeCustom 回答"只动这几个端口"（端口随条目走）。
-	// 后者才是"既要限制这个地址访问某个服务、又不想把它的 frp 一起掐了"的落点 ——
-	// 拿 ScopeFrp 做不到这件事，它的端口集合是全局的，改它等于改所有条目。
 	//
-	// 注意插件层（frps 的 Login / NewUserConn 回调）拿不到被访问的端口，所以
-	// 自定义端口只作用于内核规则，不影响"这个地址能不能登录 frp" —— 见 D19。
+	// 端口范围只限定内核规则。插件层仍拒绝命中地址的 frp 登录，
+	// 即使登录端口不在所选范围内；这是本项目明确保留的行为，见 D19。
 	ScopeCustom = "custom"
 )
 
@@ -96,6 +94,7 @@ const (
 // 频次统计因此是"登录尝试频次"，对暴力破解场景效果一致。
 const (
 	EvtLoginAttempt = "login_attempt" // Login 回调，已放行
+	EvtObserved     = "observed"      // 观察模式或自动封禁关闭，仅记录策略决策
 	EvtLoginBlocked = "login_blocked" // Login 回调，被本程序拦截
 	EvtUserConn     = "user_conn"     // NewUserConn 回调
 	EvtBan          = "ban"

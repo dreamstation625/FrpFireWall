@@ -101,6 +101,26 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 		})
 	}
 
+	observe := m.dryRun() || (policy != nil && policy.ObserveOnly)
+	if observe && banned && ban.Source != model.SourceManual {
+		banned = false
+	}
+	autoCategory := model.EvtLoginBlocked
+	if observe {
+		autoCategory = model.EvtObserved
+	}
+	autoDetail := func(detail string) string {
+		if observe {
+			return "【观察模式】本应拦截：" + detail
+		}
+		return detail
+	}
+	autoVerdict := func(reason, detail string) Verdict {
+		if observe {
+			return Verdict{Allow: true, Reason: "observed-" + reason, Detail: detail}
+		}
+		return Verdict{Allow: false, Reason: reason, Detail: detail}
+	}
 	// 1. 白名单：直接放行，永不封禁。IP 条目与地区条目同权 —— 对用户来说
 	//    "这个来源放行"是一件事，只是写法和匹配方式不同。
 	if isWhite || geoWhiteHit != nil {
@@ -138,11 +158,11 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 	if geoBlackHit != nil {
 		reason := m.banGeoBlackHit(addr, geoInfo, user, proxy, geoBlackHit, now)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
+			Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
-			Detail: reason,
+			Detail: autoDetail(reason),
 		})
-		return Verdict{Allow: false, Reason: "geo-blacklist", Detail: reason}
+		return autoVerdict("geo-blacklist", reason)
 	}
 
 	// 3. 活跃封禁：拒绝，并把剩余时间回给 frpc，方便运维排查。
@@ -183,11 +203,11 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 			}
 			m.triggerBan(addr, model.SourceGeoIP, reason, user, proxy, geoInfo, nil, "")
 			m.pushEvent(&model.Event{
-				Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
+				Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
-				Detail: reason,
+				Detail: autoDetail(reason),
 			})
-			return Verdict{Allow: false, Reason: "geoip-blocked", Detail: reason}
+			return autoVerdict("geoip-blocked", reason)
 		}
 	}
 
@@ -214,11 +234,11 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 		reason := "规则「" + rule.name + "」命中，来源被直接拦截"
 		m.triggerBan(addr, model.SourceRule, reason, user, proxy, geoInfo, nil, rule.ref)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
+			Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
-			Detail: reason,
+			Detail: autoDetail(reason),
 		})
-		return Verdict{Allow: false, Reason: "rule-blocked", Detail: reason}
+		return autoVerdict("rule-blocked", reason)
 	}
 
 	// 7. 频控参数：命中规则就用规则的，否则用全局策略。
@@ -249,15 +269,6 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 	//    全局的限速不在这里做：它按端口分流，而插件回调拿不到被访问的端口，
 	//    只能落在内核（见 DESIGN D16）。这里只做细分规则自己那份 ——
 	//    细分规则的条件是属地与网段，内核表达不出来。
-	if rule != nil && rule.perSec > 0 && !rule.bucket.allow(ip, now) {
-		detail := fmt.Sprintf("规则「%s」：单个来源 IP 每秒最多 %d 个连接，已超限", rule.name, rule.perSec)
-		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
-			Country: geoInfo.Country, Province: geoInfo.Province,
-			Detail: detail,
-		})
-		return Verdict{Allow: false, Reason: "rate-limited", Detail: detail}
-	}
 
 	// 10. 阈值判定
 	if threshold > 0 && hits >= threshold {
@@ -266,20 +277,29 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 
 		if !policy.AutoBanEnabled {
 			m.pushEvent(&model.Event{
-				Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
+				Category: model.EvtObserved, IP: ip, User: user, ProxyName: proxy, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
 				Detail: detail + "（自动封禁已关闭，仅记录）",
 			})
-			return Verdict{Allow: true, Reason: "threshold-hit-no-autoban"}
+		} else {
+			m.triggerBan(addr, model.SourceAuto, detail, user, proxy, geoInfo, steps, "")
+			m.pushEvent(&model.Event{
+				Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
+				Country: geoInfo.Country, Province: geoInfo.Province,
+				Detail: autoDetail(detail),
+			})
+			return autoVerdict("rate-exceeded", detail)
 		}
+	}
 
-		m.triggerBan(addr, model.SourceAuto, detail, user, proxy, geoInfo, steps, "")
+	if rule != nil && rule.perSec > 0 && !rule.bucket.allow(ip, now) {
+		detail := fmt.Sprintf("规则「%s」：单个来源 IP 每秒最多 %d 个连接，已超限", rule.name, rule.perSec)
 		m.pushEvent(&model.Event{
-			Category: model.EvtLoginBlocked, IP: ip, User: user, ProxyName: proxy, Op: op,
+			Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,
-			Detail: detail,
+			Detail: autoDetail(detail),
 		})
-		return Verdict{Allow: false, Reason: "rate-exceeded", Detail: detail}
+		return autoVerdict("rate-limited", detail)
 	}
 
 	// 代理名不再拼进详情：它自己有一列，拼进来只是把同一件事说两遍。

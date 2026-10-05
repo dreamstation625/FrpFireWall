@@ -177,16 +177,16 @@
 
         <el-form-item label="自动封禁">
           <el-switch v-model="form.auto_ban_enabled" active-text="开启" inactive-text="关闭" inline-prompt />
-          <div class="hint">关闭后仍然记录事件和统计，只是不再自动产生封禁记录。</div>
+          <div class="hint">关闭后策略不再新增封禁记录。地区和直接拦截仍拒绝当次连接，频次阈值只记录，独立限速仍生效。</div>
         </el-form-item>
 
         <el-form-item label="观察模式">
           <el-switch v-model="form.observe_only" active-text="开启" inactive-text="关闭" inline-prompt />
           <div v-if="form.observe_only" class="alert-note" style="margin-top: 6px; width: 100%">
-            不会真正封禁，只在事件日志里记录「本该被封」。建议上线头几天开着校准阈值，
+            自动策略放行，只记录「本应拦截」，暂停内核限速；人工黑名单与人工封禁继续生效。建议上线初期校准阈值，
             确认误封率可接受后再关。
           </div>
-          <div v-else class="hint">开启后只记录不封禁，用于校准阈值。</div>
+          <div v-else class="hint">自动策略只记录并放行，人工黑名单与人工封禁继续生效。</div>
         </el-form-item>
 
         <el-divider content-position="left">地域封禁（GeoIP）</el-divider>

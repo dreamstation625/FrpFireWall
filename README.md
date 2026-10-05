@@ -195,7 +195,7 @@ curl -fsSL $SCRIPT | sudo bash -s -- update --pre --mirror https://ghfast.top/
 | 代理端口 | `80,443` | `NewUserConn` 参与判定的端口，支持区间（如 `20000-30000`） |
 | 可信回源网段 | 自定义列表为空 | 内置 Cloudflare 网段；可追加 CIDR。跳过后续自动封禁决策，不解析访客 HTTP 头；手动黑名单与已有封禁仍优先 |
 | 总开关 | 开 | 关闭后只判定不写规则 |
-| 观察模式 | 关 | 只记录不封禁，上线前验证误伤 |
+| 观察模式 | 关 | 自动策略只记录并放行，不下发内核限速；人工黑名单与人工封禁继续生效 |
 | 日志级别 | `info` | `debug` / `info` / `warn` / `error` |
 | 事件保留 | 30 天 | 超期事件定时清理；填 `0` 永久保留。调小会立刻删除超期记录，不可恢复 |
 | 在线检查更新 | 开 | 关闭后面板不访问 GitHub，纯内网部署建议关掉 |
@@ -233,7 +233,7 @@ sudo frpfirewall-panic                   # 只删归属 frpfirewall 的对象
 ```
 
 救援脚本只清网络层，应用层封禁记录还在数据库里。
-当前 iptables 清理仍可能残留未被引用的受管链，详见[救援流程与限制](docs/TROUBLESHOOTING.md#误封导致连不上)。
+脚本清理全部受管子链与集合，失败返回非零；详见[救援流程](docs/TROUBLESHOOTING.md#误封导致连不上)。
 **面板打不开、忘记密码、判定顺序** 见 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)；
 查某个地址为什么被拦：面板 **封禁记录 → 排障查询**，输入 IP 返回当前状态与命中原因。
 
@@ -278,7 +278,7 @@ make release     # Linux amd64 + arm64 二进制及校验和 → dist/
 - **连接限速默认保护 frp 端口**，不接管 ssh、web 等其它服务已有的规则。
   手动黑名单选「全端口」或「自定义端口」，以及下述自动封禁，都可能拦截 frp 以外端口。
 - **自动封禁恒为全端口**：频次超限 / 地域命中的自动封禁不由人逐条确认，固定按 `all` 下发。
-- **「自定义端口」只作用于内核层**：插件回调拿不到目的端口，所以它在插件侧与「全端口」
+- **「自定义端口」的范围只影响内核层**：插件回调拿不到目的端口，所以它在插件侧与「全端口」
   等价（该地址照样被拒绝登录），只用来精确控制内核封哪几个端口。
 - **手动黑名单不过滤 CDN 可信回源段**：自动封禁会跳过回源 IP，手工新增 / 导入的不检查 ——
   把 CDN 节点加进去会掐死一大片正常用户，选「仅 frp 端口」也不缓解（回源打的正是 frp 端口）。
@@ -338,6 +338,7 @@ flowchart LR
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | 排障：面板打不开、忘记密码、判定顺序、误封救援 |
 | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | 开发：构建、测试、代码结构 |
 | [`docs/RELEASE.md`](docs/RELEASE.md) | 版本格式、CI 分级、发版流程与发布闸门 |
+| [`docs/SECURITY_REVIEW.md`](docs/SECURITY_REVIEW.md) | 安全与功能问题核实、修复方式和验证范围 |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | 架构、设计决策（D1…D30）与[关键设计约束完整版](docs/DESIGN.md#design-constraints) |
 
 按角色和任务查找文档，见 **[文档中心 →](docs/README.md)**。

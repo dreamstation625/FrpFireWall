@@ -25,6 +25,7 @@
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | 按现象定位、密码恢复、判定顺序与误封救援 |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | 工具版本、首次准备、PowerShell / Make 构建、测试和代码结构 |
 | [RELEASE.md](RELEASE.md) | 版本同步、CI 分级、发布步骤、附件与发布闸门 |
+| [SECURITY_REVIEW.md](SECURITY_REVIEW.md) | 本轮问题核实、修复对照与隔离验证 |
 | [DESIGN.md](DESIGN.md) | 架构、D1–D30 决策、数据与 API 设计、历史验证记录 |
 
 ## 阅读时留意

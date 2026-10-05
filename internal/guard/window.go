@@ -6,7 +6,7 @@ import "time"
 //
 // 一旦计数远超任何合理阈值，继续记录就没有意义了（反正已经要封），
 // 这个上限是为了防止极端洪水场景下内存被撑爆。
-const maxHitsPerWindow = 4096
+const maxHitsPerWindow = 100000
 
 // hitWindow 记录某个 IP 在滑动窗口内的命中时间点。
 //

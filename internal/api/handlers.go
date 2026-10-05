@@ -127,6 +127,8 @@ func (s *Server) handlePublicIP(c *gin.Context) {
 // 顺序很重要：先把新后端的链建好、规则灌进去，再让引擎切过去。
 // 反过来做会出现"旧后端已清理、新后端还没生效"的保护真空窗口。
 func (s *Server) handleSwitchMode(c *gin.Context) {
+	s.switchMu.Lock()
+	defer s.switchMu.Unlock()
 	var req struct {
 		Backend string `json:"backend"`
 	}
@@ -151,19 +153,11 @@ func (s *Server) handleSwitchMode(c *gin.Context) {
 		return
 	}
 
-	if err := newDrv.EnsureBase(); err != nil {
+	if err := s.guard.SwitchDriver(newDrv); err != nil {
 		serverErr(c, err)
 		return
 	}
-
-	// 新后端已就绪，切过去并全量重灌规则
-	s.guard.SetDriver(newDrv)
 	s.SetDriver(newDrv, report)
-
-	if err := s.guard.Reconcile(); err != nil {
-		serverErr(c, err)
-		return
-	}
 
 	profile, err := s.store.GetFirewallProfile()
 	if err == nil {
@@ -191,7 +185,7 @@ func (s *Server) handleSwitchMode(c *gin.Context) {
 		"capability": newDrv.Capability(),
 		"requested":  req.Backend,
 		"detect":     report,
-		"note":       "旧后端的受管规则不会自动清理，避免误删；如需清理可执行 scripts/frpfirewall-panic.sh",
+		"note":       "新后端已完成同步，旧后端的受管拦截规则已清理",
 	})
 }
 
@@ -260,17 +254,15 @@ func (s *Server) handlePreview(c *gin.Context) {
 }
 
 func (s *Server) handleReconcile(c *gin.Context) {
-	if err := s.guard.Reconcile(); err != nil {
-		serverErr(c, err)
-		return
-	}
+	s.guard.Apply()
+
 	_ = s.store.AddEvent(&model.Event{
 		Category: model.EvtRuleChange,
 		IP:       c.ClientIP(),
-		Detail:   "手动触发规则同步",
+		Detail:   "手动请求规则同步",
 		Actor:    s.currentUser(c),
 	})
-	ok(c, gin.H{"message": "规则已同步", "stats": s.guard.Stats()})
+	ok(c, gin.H{"message": "已安排规则同步，请查看同步状态", "stats": s.guard.Stats()})
 }
 
 func (s *Server) handleSnapshot(c *gin.Context) {
@@ -296,7 +288,7 @@ func (s *Server) handleListEvents(c *gin.Context) {
 
 	var since *time.Time
 	if h := c.Query("hours"); h != "" {
-		if n, err := strconv.Atoi(h); err == nil && n > 0 {
+		if n, err := strconv.Atoi(h); err == nil && n > 0 && n <= 24*30 {
 			t := time.Now().Add(-time.Duration(n) * time.Hour)
 			since = &t
 		}
@@ -512,6 +504,9 @@ func pageParams(c *gin.Context) (page, size int) {
 		if n, err := strconv.Atoi(s); err == nil && n > 0 && n <= 500 {
 			size = n
 		}
+	}
+	if page > int(^uint(0)>>1)/size {
+		page = int(^uint(0)>>1) / size
 	}
 	return page, size
 }

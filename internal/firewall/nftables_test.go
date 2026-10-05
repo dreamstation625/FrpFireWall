@@ -215,7 +215,7 @@ func TestRenderScriptRateRuleOrder(t *testing.T) {
 
 	got := renderScript(stacks, des, nil, planRateRules(des.RateLimits))
 
-	inserts := insertOrder(got)
+	inserts := strings.Split(got, "\n")
 	fine, global := -1, -1
 	for i, line := range inserts {
 		if strings.Contains(line, "@frpfirewall_rate_r1") {

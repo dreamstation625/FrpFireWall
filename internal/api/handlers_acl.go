@@ -117,6 +117,11 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 		return
 	}
 
+	if req.ExpiresIn != nil && (*req.ExpiresIn < 0 || *req.ExpiresIn > model.MaxDurationSeconds) {
+		badRequest(c, "有效期超出范围，永久请填写 0")
+		return
+	}
+
 	target, targetType, err := normalizeACLTarget(req.Target, req.TargetType)
 	if err != nil {
 		badRequest(c, err.Error())
@@ -146,7 +151,7 @@ func (s *Server) handleCreateACL(c *gin.Context) {
 
 	// 创建时"没传"与"传 0"都是永久，不必区分。
 	if req.ExpiresIn != nil && *req.ExpiresIn > 0 {
-		t := time.Now().Add(time.Duration(*req.ExpiresIn) * time.Second)
+		t := time.Now().Add(model.SafeSeconds(*req.ExpiresIn))
 		entry.ExpiresAt = &t
 	}
 
@@ -211,6 +216,11 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 		return
 	}
 
+	if req.ExpiresIn != nil && (*req.ExpiresIn < 0 || *req.ExpiresIn > model.MaxDurationSeconds) {
+		badRequest(c, "有效期超出范围，永久请填写 0")
+		return
+	}
+
 	entry, err := s.store.GetACL(uint(id))
 	if err != nil {
 		fail(c, http.StatusNotFound, "条目不存在")
@@ -270,7 +280,7 @@ func (s *Server) handleUpdateACL(c *gin.Context) {
 	case req.ExpiresIn == nil:
 		// 没传就不动 —— 这是"只改备注"的形状，条目该怎么到期还怎么到期。
 	case *req.ExpiresIn > 0:
-		t := time.Now().Add(time.Duration(*req.ExpiresIn) * time.Second)
+		t := time.Now().Add(model.SafeSeconds(*req.ExpiresIn))
 		entry.ExpiresAt = &t
 	default:
 		// 显式传 0 才是"改成永久"。
@@ -681,6 +691,10 @@ func (s *Server) handleCreateBan(c *gin.Context) {
 		return
 	}
 
+	if req.DurationS < 0 || req.DurationS > model.MaxDurationSeconds {
+		badRequest(c, "封禁时长超出范围，永久封禁请填写 0")
+		return
+	}
 	// 这里统一走 normalizeScope：大小写归一、留空补 all 都在同一个地方做，
 	// 免得 BanManual 和名单接口对同一个字符串给出两种判断。
 	scope, err := normalizeScope(model.KindBlack, req.Scope)
@@ -699,7 +713,7 @@ func (s *Server) handleCreateBan(c *gin.Context) {
 	}
 
 	rec, err := s.guard.BanManual(req.Target, req.Reason, s.currentUser(c),
-		time.Duration(req.DurationS)*time.Second, scope, ports)
+		model.SafeSeconds(req.DurationS), scope, ports)
 	if err != nil {
 		badRequest(c, err.Error())
 		return
@@ -915,6 +929,10 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		badRequest(c, "触发阈值需在 1 ~ 100000 之间")
 		return
 	}
+	if p.EscalateWindowHours > 24*30 {
+		badRequest(c, "升级窗口最多 720 小时")
+		return
+	}
 	if p.EscalateWindowHours < 1 {
 		p.EscalateWindowHours = 24
 	}
@@ -937,7 +955,11 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		return
 	}
 
-	steps := p.DurationSteps()
+	steps, stepsErr := model.ParseDurationSteps(p.BanDurations)
+	if stepsErr != nil {
+		badRequest(c, stepsErr.Error())
+		return
+	}
 	if len(steps) == 0 {
 		badRequest(c, "阶梯封禁时长不能为空")
 		return
@@ -949,7 +971,7 @@ func (s *Server) handleUpdatePolicy(c *gin.Context) {
 		}
 	}
 	if p.RateLimitEnabled {
-		if p.RateLimitPerSec < 1 {
+		if p.RateLimitPerSec < 1 || p.RateLimitPerSec > 1000000 || p.RateLimitBurst > 2000000 {
 			badRequest(c, "速率限制必须大于 0")
 			return
 		}

@@ -226,6 +226,9 @@ func stringSet(in []string) map[string]bool {
 // **顺序**：细分规则在前，全局兜底在最后。内核规则是"先匹配先生效"
 // （iptables 是链上顺序，nft 是插入链首），顺序反了细分规则就永远轮不到。
 func (m *Manager) rateLimitsLocked() []firewall.RateLimitRule {
+	if m.policy != nil && m.policy.ObserveOnly {
+		return nil
+	}
 	out := make([]firewall.RateLimitRule, 0, len(m.kernelRules)+1)
 	for _, r := range m.kernelRules {
 		out = append(out, firewall.RateLimitRule{

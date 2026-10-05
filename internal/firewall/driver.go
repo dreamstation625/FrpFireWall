@@ -1,7 +1,7 @@
 // Package firewall 定义防火墙后端抽象。
 //
 // 核心设计：
-//  1. 受管规则独占命名空间（iptables 用自定义链，nftables 用独立表），
+//  1. 受管对象独占命名空间（iptables 用自定义链，nftables 用前缀集合与普通限速子链），
 //     任何情况下都不 flush 整表、不碰用户已有规则。
 //  2. 上层只描述"期望状态"，由各驱动翻译成自己的命令。
 //  3. 全量 Sync 幂等，可随时重放，用来做崩溃自愈与配置漂移修复。
@@ -34,8 +34,8 @@ var ErrNotSupported = errors.New("防火墙后端在当前主机不可用")
 
 // 受管对象的名字，集中在这里方便排查。
 //
-// iptables 侧用两条独占的自定义链；nftables 侧不建独立表/链（见 nftables.go 的说明），
-// 只创建带前缀的集合，并把规则插进系统的 input 链，靠 comment 标记识别归属。
+// iptables 使用三条独占自定义链；nftables 复用可靠探测到的系统 input 链，
+// 使用前缀集合与普通限速子链，靠 comment 识别受管规则；无 input 链时才建独立表。
 const (
 	// ManagedChain iptables 主链名。
 	ManagedChain = "FRPFIREWALL_GUARD"
@@ -402,7 +402,7 @@ type Driver interface {
 	EnsureBase() error
 	// Sync 把受管规则对齐到期望状态（全量、幂等、可重放）。
 	Sync(d Desired) error
-	// AddBlock / DelBlock 是增量操作，日常封禁解封走这里，避免全量重建。
+	// AddBlock / DelBlock 保留增量接口；管理器日常操作使用期望状态合并同步。
 	AddBlock(target string) error
 	DelBlock(target string) error
 	// DumpManaged 返回受管规则（结构化 + 原始文本），用于前端展示。
@@ -416,7 +416,7 @@ type Driver interface {
 	DumpSystem() (string, error)
 	// Preview 只生成规则文本，不落盘，用于"预览变更"与 dry-run 校验。
 	Preview(d Desired) (string, error)
-	// Snapshot / Restore 用于变更前备份与失败回滚。
+	// Snapshot 供检查；iptables Restore 只恢复受管链，nft 禁止重放文本系统快照。
 	Snapshot() (string, error)
 	Restore(snapshot string) error
 }

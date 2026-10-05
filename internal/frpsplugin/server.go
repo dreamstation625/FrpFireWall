@@ -156,6 +156,10 @@ func (s *Server) Stop(ctx context.Context) error {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(r.RemoteAddr) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "frpfirewall-plugin"})
 }

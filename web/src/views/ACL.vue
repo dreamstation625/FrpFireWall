@@ -692,8 +692,8 @@ async function doImport(dry: boolean) {
   }
 }
 
-function exportList() {
-  window.open(api.exportACLURL(kind.value), '_blank')
+async function exportList() {
+  try { await api.exportACL(kind.value) } catch { /* 请求层已提示下载错误 */ }
 }
 
 // 国家与省份候选表来自服务端：这两个值必须和属地库返回的是同一套写法，

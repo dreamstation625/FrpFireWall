@@ -78,9 +78,10 @@ type Resolver struct {
 	mu sync.RWMutex
 
 	// downloadMu 保证同一时刻只有一个下载任务。
-	// 除了省带宽，主要是两个下载会撞在同一个 <file>.tmp 上。
+	// 下载任务独占以节约带宽；上传与下载的最终安装由 installMu 串行化。
 	// 用 TryLock 而不是 Lock：第二个请求直接告诉用户「正在下」，不用干等。
 	downloadMu sync.Mutex
+	installMu  sync.Mutex
 
 	dataDir string
 
@@ -390,22 +391,27 @@ func (r *Resolver) SaveUpload(name string, src io.Reader) error {
 // 校验不通过就删掉临时文件、旧库原样在用 —— 把下载到一半的坏文件换上去，
 // 属地功能会整个失效，比安装失败严重得多。返回写入的字节数，供调用方判断超限。
 func (r *Resolver) install(name string, src io.Reader, maxSize int64) (int64, error) {
+	r.installMu.Lock()
+	defer r.installMu.Unlock()
 	if !isKnownFile(name) {
 		return 0, fmt.Errorf("不支持的文件名 %q，只接受 %s / %s / %s",
 			name, FileCountry, FileCity, FileRegion)
 	}
 
 	dst := filepath.Join(r.dataDir, name)
-	tmp := dst + ".tmp"
-
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.CreateTemp(r.dataDir, name+".*.tmp")
 	if err != nil {
 		return 0, fmt.Errorf("创建临时文件失败: %w", err)
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
 
 	// 多读一个字节，好把「正好等于上限」和「超过上限」分开。
 	lr := &io.LimitedReader{R: src, N: maxSize + 1}
 	n, copyErr := io.Copy(f, lr)
+	if copyErr == nil {
+		copyErr = f.Sync()
+	}
 	closeErr := f.Close()
 
 	if copyErr != nil {

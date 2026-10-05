@@ -14,19 +14,10 @@ import (
 
 // nftables 驱动的设计要点
 //
-// 关键约束一：**不自己创建带 hook 的 base chain**。
-//
-// 原因是 nftables 的 verdict 语义 —— 同一个 hook 上的多个 base chain 按 priority
-// 依次执行，一旦某个链给出 accept（包括链尾 policy accept），后续链就不再评估。
-// 如果我们建一个 `type filter hook input priority -150; policy accept;` 的链，
-// 那么所有包走到链尾都会被 accept，系统原有的 input 链（ufw / 手工规则）将完全失效。
-// 这是灾难性的。
-//
-// 所以正确做法是：把规则**插入到系统已有 input base chain 的最前面**。
-// 这样天然共享同一套判决流程，我们的规则对不匹配的包"什么都不做"，自然往下走。
-//
-// 系统没有 input 链时（全新 Debian/Ubuntu 未启用任何防火墙工具），
-// 才创建标准的 `table inet filter` + `chain input`。
+// 优先在现有 input 链前插入带归属标记的 DROP 规则，保留系统判决流程。
+// nft 的 accept 仍会继续执行同 hook 的后续 base chain，drop 则立即终止。
+// 只有可靠确认不存在 input 链时，才在本项目独立表中创建 base chain。
+// 读取或解析失败必须中止，不能被当成没有系统防火墙。
 //
 // 关键约束二：**规则落点按协议栈分开，一个不够**。
 //
@@ -143,15 +134,24 @@ func (d *nftablesDriver) Capability() Capability {
 		c.Reason = "未找到 nft 命令，Debian/Ubuntu 请执行 apt install nftables"
 	} else if !c.RateLimit {
 		c.Reason = fmt.Sprintf("nftables %s 版本过低，不支持动态集合（per-IP 限速需要 >= 0.9.3）", d.report.NFTablesVersion)
+	} else {
+		c.Reason = "当前 nftables 的 per-IP 内核限速只支持 IPv4；IPv6 黑名单仍受支持"
+	}
+	if len(d.report.Warnings) > 0 {
+		c.Reason = strings.TrimSpace(c.Reason + "；" + strings.Join(d.report.Warnings, "；"))
 	}
 	return c
 }
 
 // EnsureBase 定位（或创建）input base chain，按协议栈记录落点，并保证集合存在。
-func (d *nftablesDriver) EnsureBase() error {
-	ctx := context.Background()
+func (d *nftablesDriver) EnsureBase() error { return d.ensureBase(context.Background()) }
 
-	chains := d.inputChains(ctx)
+func (d *nftablesDriver) ensureBase(ctx context.Context) error {
+
+	chains, err := d.inputChains(ctx)
+	if err != nil {
+		return err
+	}
 	inet, hasInet := chains["inet"]
 	ip, hasIP := chains["ip"]
 	ip6, hasIP6 := chains["ip6"]
@@ -200,32 +200,31 @@ func (d *nftablesDriver) EnsureBase() error {
 //
 // 只在"什么都没有"时才走这条路 —— 有链可插入时绝不新建，见文件头的关键约束一。
 func (d *nftablesDriver) createDefaultChain(ctx context.Context) (nftTarget, error) {
-	if _, err := run(ctx, "nft", "add", "table", "inet", "filter"); err != nil && !isAlreadyExists(err) {
-		return nftTarget{}, fmt.Errorf("创建 table inet filter 失败: %w", err)
+	script := "create table inet frpfirewall\ncreate chain inet frpfirewall input { type filter hook input priority filter; policy accept; }\n"
+	if _, err := runStdin(ctx, script, "nft", "-f", "-"); err != nil {
+		return nftTarget{}, fmt.Errorf("创建独立受管链失败: %w", err)
 	}
-	if _, err := run(ctx, "nft", "add", "chain", "inet", "filter", "input",
-		"{", "type", "filter", "hook", "input", "priority", "filter", ";",
-		"policy", "accept", ";", "}"); err != nil && !isAlreadyExists(err) {
-		return nftTarget{}, fmt.Errorf("创建 input 链失败: %w", err)
-	}
-	return nftTarget{Family: "inet", Table: "filter", Chain: "input"}, nil
+	return nftTarget{Family: "inet", Table: "frpfirewall", Chain: "input"}, nil
 }
 
 // inputChains 一次性取回 ruleset 里所有 INPUT base chain，按家族归组。
 // 同家族有多个候选取 priority 最小的（最先执行，我们的 drop 也就能最早生效）。
 //
 // 只调用一次 nft：原先是按家族各跑一遍 list ruleset，三倍开销。
-func (d *nftablesDriver) inputChains(ctx context.Context) map[string]nftTarget {
+func (d *nftablesDriver) inputChains(ctx context.Context) (map[string]nftTarget, error) {
 	out, err := run(ctx, "nft", "-j", "list", "ruleset")
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("读取 nft 规则失败: %w", err)
 	}
 
 	var doc struct {
 		Nftables []map[string]json.RawMessage `json:"nftables"`
 	}
 	if err := json.Unmarshal([]byte(out), &doc); err != nil {
-		return nil
+		return nil, fmt.Errorf("解析 nft 规则失败: %w", err)
+	}
+	if doc.Nftables == nil {
+		return nil, fmt.Errorf("nft 返回了不完整的规则集")
 	}
 
 	found := make(map[string]nftTarget, 3)
@@ -243,7 +242,7 @@ func (d *nftablesDriver) inputChains(ctx context.Context) map[string]nftTarget {
 			Prio   int    `json:"prio"`
 		}
 		if err := json.Unmarshal(raw, &ch); err != nil {
-			continue
+			return nil, fmt.Errorf("解析 nft 链失败: %w", err)
 		}
 		if ch.Hook != "input" {
 			continue
@@ -256,10 +255,13 @@ func (d *nftablesDriver) inputChains(ctx context.Context) map[string]nftTarget {
 		if _, seen := found[ch.Family]; seen && ch.Prio >= prio[ch.Family] {
 			continue
 		}
+		if !nftIdentifier.MatchString(ch.Table) || !nftIdentifier.MatchString(ch.Name) {
+			return nil, fmt.Errorf("系统 input 链名称无法安全编译")
+		}
 		found[ch.Family] = nftTarget{Family: ch.Family, Table: ch.Table, Chain: ch.Name}
 		prio[ch.Family] = ch.Prio
 	}
-	return found
+	return found, nil
 }
 
 func (d *nftablesDriver) ensureSet(ctx context.Context, s nftStack, name, typ string, dynamic bool) error {
@@ -289,11 +291,12 @@ func (d *nftablesDriver) warn(msg string) {
 
 // Sync 全量对齐：重建归属本程序的规则 + 重填黑名单集合。
 // 所有落点的改动放进同一个 nft 事务，原子提交，中途没有规则空窗。
-func (d *nftablesDriver) Sync(des Desired) error {
-	if err := d.EnsureBase(); err != nil {
+func (d *nftablesDriver) Sync(des Desired) error { return d.SyncContext(context.Background(), des) }
+
+func (d *nftablesDriver) SyncContext(ctx context.Context, des Desired) error {
+	if err := d.ensureBase(ctx); err != nil {
 		return err
 	}
-	ctx := context.Background()
 
 	// 按链去重地取受管规则 handle。inet 家族下两个协议栈共用一条链，
 	// 不去重就会把同一个 handle 在同一个事务里删两次，nft 找不到第二条即报错，
@@ -303,7 +306,11 @@ func (d *nftablesDriver) Sync(des Desired) error {
 		if _, done := handles[s.target]; done {
 			continue
 		}
-		handles[s.target] = d.managedRuleHandles(ctx, s)
+		h, err := d.managedRuleHandles(ctx, s)
+		if err != nil {
+			return err
+		}
+		handles[s.target] = h
 	}
 
 	// 连接速率限制要先确认动态集合能建出来（老版本 nftables 不支持）。
@@ -344,7 +351,6 @@ func (d *nftablesDriver) Sync(des Desired) error {
 	// 动态集合带 timeout，元素会自己过期；但规则改速率、改条件、删掉之后，
 	// 旧的集合会一直留在内核里。它们不参与判决（规则每次全量重建），
 	// 却会在 `nft list sets` 里越堆越多，排障时干扰判断。按前缀清掉不在本次期望里的。
-	d.pruneRateSets(ctx, rates)
 
 	// 端口限定分组各需要一个地址集合，名字由端口签名派生。补在渲染脚本之前 ——
 	// 脚本里会对每个集合做 flush，集合不存在的话整份脚本会在事务里被拒，
@@ -366,8 +372,12 @@ func (d *nftablesDriver) Sync(des Desired) error {
 
 	// 逻辑同上，只是对象换成端口限定的集合：分组改了端口或条目被删之后，
 	// 旧集合不再被任何规则引用，却会一直留在 nft list sets 里。
-	d.prunePortSets(ctx, groups)
 
+	if st, ok := d.stackFor(32); ok {
+		if _, err := run(ctx, "nft", "add", "chain", st.target.Family, st.target.Table, nftRateChain); err != nil && !isAlreadyExists(err) {
+			return err
+		}
+	}
 	script := renderScript(d.stacks, des, handles, rates)
 
 	// 语法预检：不通过就整个放弃，绝不带着半截规则上生产。
@@ -377,6 +387,8 @@ func (d *nftablesDriver) Sync(des Desired) error {
 	if _, err := runStdin(ctx, script, "nft", "-f", "-"); err != nil {
 		return fmt.Errorf("下发规则失败: %w", err)
 	}
+	d.pruneRateSets(ctx, rates)
+	d.prunePortSets(ctx, groups)
 	return nil
 }
 
@@ -511,15 +523,18 @@ func renderScript(stacks []nftStack, des Desired, handles map[nftTarget][]int, r
 
 	// 3. 限速规则。表达式里的 saddr 是 IPv4 的，所以只落在 v4 链上。
 	//
-	//    insert 一律插到链首，所以想让最终顺序等于 rates 的顺序，输出就得倒着来。
-	//    顺序是有意义的：细分规则要排在全局兜底前面（第一条命中的生效）。
+	//    普通子链按配置顺序追加，匹配后的 RETURN 跳过后续本项目限速。
 	if s, ok := stackOf(stacks, 32); ok {
-		for i := len(rates) - 1; i >= 0; i-- {
-			p := rates[i]
+		fmt.Fprintf(&b, "flush chain %s %s %s\n", s.target.Family, s.target.Table, nftRateChain)
+		for _, p := range rates {
 			if expr, ok := nftRateExpr(p.rule, p.set); ok {
-				fmt.Fprintf(&b, "insert rule %s %s %s %s comment \"%s\"\n",
-					s.target.Family, s.target.Table, s.target.Chain, expr, rateComment(p.rule.Key))
+				fmt.Fprintf(&b, "add rule %s %s %s %s comment %q\n", s.target.Family, s.target.Table, nftRateChain, expr, rateComment(p.rule.Key))
+				match := strings.Split(expr, " add @")[0]
+				fmt.Fprintf(&b, "add rule %s %s %s %s return comment %q\n", s.target.Family, s.target.Table, nftRateChain, match, "frpfirewall:rate-match")
 			}
+		}
+		if len(rates) > 0 {
+			fmt.Fprintf(&b, "insert rule %s %s %s jump %s comment %q\n", s.target.Family, s.target.Table, s.target.Chain, nftRateChain, "frpfirewall:rate-jump")
 		}
 	}
 
@@ -683,6 +698,18 @@ func (d *nftablesDriver) DumpManaged() (*ManagedRules, error) {
 				}
 			}
 		}
+		if s.bits == 32 {
+			out, err := run(ctx, "nft", "-a", "list", "chain", s.target.Family, s.target.Table, nftRateChain)
+			if err == nil {
+				fmt.Fprintf(&b, "# nft -a list chain %s %s %s\n", s.target.Family, s.target.Table, nftRateChain)
+				for _, line := range strings.Split(out, "\n") {
+					if strings.Contains(line, commentPrefix) {
+						b.WriteString(strings.TrimSpace(line) + "\n")
+						res.Summary = append(res.Summary, strings.TrimSpace(line))
+					}
+				}
+			}
+		}
 		// 集合逐个报数：只报一个总数的话，界面看到"黑名单 12 个元素"
 		// 无从判断其中多少是全端口封、多少是限定了端口。
 		res.Summary = append(res.Summary,
@@ -733,6 +760,11 @@ func (d *nftablesDriver) Counters() ([]RuleCounter, error) {
 			continue
 		}
 		out = append(out, parseNFTCounters(res)...)
+	}
+	if s, ok := d.stackFor(32); ok {
+		if raw, err := run(ctx, "nft", "-a", "list", "chain", s.target.Family, s.target.Table, nftRateChain); err == nil {
+			out = append(out, parseNFTCounters(raw)...)
+		}
 	}
 	return out, nil
 }
@@ -860,6 +892,9 @@ func (d *nftablesDriver) Preview(des Desired) (string, error) {
 	fmt.Fprintf(&b, "# nftables 规则预览（受管规则插入 %s 链首）\n\n", strings.Join(targets, "、"))
 
 	fmt.Fprintf(&b, "# --- 集合定义（首次创建）---\n")
+	if s, ok := stackOf(stacks, 32); ok {
+		fmt.Fprintf(&b, "add chain %s %s %s\n", s.target.Family, s.target.Table, nftRateChain)
+	}
 	for _, s := range stacks {
 		names := []string{s.set()}
 		// 端口限定分组的集合名由端口签名派生，只有拿得到期望状态才算得出来，
@@ -907,6 +942,9 @@ func (d *nftablesDriver) Snapshot() (string, error) {
 			}
 		}
 		if s.bits == 32 {
+			if out, err := run(ctx, "nft", "-a", "list", "chain", s.target.Family, s.target.Table, nftRateChain); err == nil {
+				fmt.Fprintf(&b, "# rate chain\n%s\n", out)
+			}
 			for _, name := range d.listOwnRateSets(ctx, s) {
 				if out, err := run(ctx, "nft", "list", "set", s.target.Family, s.target.Table, name); err == nil {
 					fmt.Fprintf(&b, "# set %s\n%s\n", name, out)
@@ -925,47 +963,16 @@ func (d *nftablesDriver) Snapshot() (string, error) {
 	return b.String(), nil
 }
 
-// Restore 对 nftables 来说等价于重放一次期望状态，由上层 Sync 承担，
-// 这里只保证清空受管对象不出错。
+// Restore 拒绝重放包含系统规则的 nft 文本快照；恢复由期望状态 Sync 承担。
 func (d *nftablesDriver) Restore(snapshot string) error {
-	ctx := context.Background()
-	if !d.ready {
-		return nil
-	}
-	for _, s := range d.stacks {
-		_, _ = run(ctx, "nft", "flush", "set", s.target.Family, s.target.Table, s.set())
-		for _, h := range d.managedRuleHandles(ctx, s) {
-			_, _ = run(ctx, "nft", "delete", "rule", s.target.Family, s.target.Table, s.target.Chain,
-				"handle", strconv.Itoa(h))
-		}
-	}
-	// 端口限定与限速集合的名字都是算出来的，挨个列出来清。
-	seen := make(map[nftTarget]bool, len(d.stacks))
-	for _, s := range d.stacks {
-		if seen[s.target] {
-			continue
-		}
-		seen[s.target] = true
-		for _, name := range d.listOwnSets(ctx, s, isPortSetName) {
-			_, _ = run(ctx, "nft", "flush", "set", s.target.Family, s.target.Table, name)
-		}
-	}
-	// 限速集合只建在 IPv4 落点上（见 Sync 的说明）。
-	// 挨个 flush 而不是只 flush 一个：现在是一条规则一个集合，
-	// 老版本那个单一的 frpfirewall_rate 也要一起清掉。
-	if s, ok := d.stackFor(32); ok {
-		for _, name := range d.listOwnRateSets(ctx, s) {
-			_, _ = run(ctx, "nft", "flush", "set", s.target.Family, s.target.Table, name)
-		}
-	}
-	return nil
+	return fmt.Errorf("nft 快照仅用于检查；恢复请通过期望状态重新同步，禁止重放系统规则")
 }
 
 // managedRuleHandles 找出某条链里归属本程序的规则 handle（靠 comment 标记识别）。
-func (d *nftablesDriver) managedRuleHandles(ctx context.Context, s nftStack) []int {
+func (d *nftablesDriver) managedRuleHandles(ctx context.Context, s nftStack) ([]int, error) {
 	out, err := run(ctx, "nft", "-a", "list", "chain", s.target.Family, s.target.Table, s.target.Chain)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("读取受管规则失败: %w", err)
 	}
 	var handles []int
 	for _, line := range strings.Split(out, "\n") {
@@ -978,7 +985,7 @@ func (d *nftablesDriver) managedRuleHandles(ctx context.Context, s nftStack) []i
 			}
 		}
 	}
-	return handles
+	return handles, nil
 }
 
 var reHandle = regexp.MustCompile(`#\s*handle\s+(\d+)`)
@@ -1089,7 +1096,7 @@ func nftRateExpr(r RateLimitRule, set string) (string, bool) {
 		// 把整个区间集合写进集合字面量 —— 区间写法让它天然只有几个元素。
 		fmt.Fprintf(&b, "tcp dport { %s } ", nftPorts(ps))
 	} else {
-		b.WriteString("tcp ")
+		b.WriteString("meta l4proto tcp ")
 	}
 	// counter 同样放在 drop 之前：drop 之后写的表达式不会被执行。
 	fmt.Fprintf(&b, "ct state new add @%s { ip saddr limit rate over %d/second burst %d packets } counter drop",

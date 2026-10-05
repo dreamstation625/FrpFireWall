@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -19,16 +21,22 @@ import (
 // ---- JWT ----
 
 type claims struct {
+	Version  string `json:"session_version"`
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
 
 func (s *Server) issueToken(username string) (string, time.Time, error) {
+	version, err := s.store.GetSetting("auth.session_version")
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	now := time.Now()
 	exp := now.Add(s.tokenTTL)
 
 	c := claims{
 		Username: username,
+		Version:  version,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   username,
 			Issuer:    "frpfirewall",
@@ -47,13 +55,23 @@ func (s *Server) parseToken(tokenStr string) (*claims, error) {
 	var c claims
 	_, err := jwt.ParseWithClaims(tokenStr, &c, func(t *jwt.Token) (any, error) {
 		// 明确限定算法，避免 alg=none 之类的降级攻击
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+		if t.Method != jwt.SigningMethodHS256 {
 			return nil, fmt.Errorf("非预期的签名算法: %v", t.Header["alg"])
 		}
 		return s.jwtSecret, nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer("frpfirewall"), jwt.WithExpirationRequired())
 	if err != nil {
 		return nil, err
+	}
+	version, err := s.store.GetSetting("auth.session_version")
+	if err != nil {
+		return nil, err
+	}
+	s.credMu.RLock()
+	username := s.username
+	s.credMu.RUnlock()
+	if c.Version != version || c.Username != username {
+		return nil, fmt.Errorf("会话已撤销")
 	}
 	return &c, nil
 }
@@ -63,10 +81,6 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 		token := ""
 		if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
 			token = strings.TrimPrefix(h, "Bearer ")
-		}
-		// 导出场景（比如用浏览器直接下载 CSV）允许 query 传 token
-		if token == "" {
-			token = c.Query("token")
 		}
 		if token == "" {
 			fail(c, http.StatusUnauthorized, "未登录")
@@ -104,13 +118,15 @@ const (
 // loginLimiter 保护的是**管理面板入口**本身，与业务防火墙无关。
 // 面板对外网开放时，这一层是必需的。
 type loginLimiter struct {
-	mu    sync.Mutex
-	state map[string]*loginAttempt
+	mu        sync.Mutex
+	state     map[string]*loginAttempt
+	lastPrune time.Time
 }
 
 type loginAttempt struct {
 	fails    []int64
 	lockedTo time.Time
+	lastSeen time.Time
 }
 
 func newLoginLimiter() *loginLimiter {
@@ -121,11 +137,16 @@ func (l *loginLimiter) blocked(ip string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	now := time.Now()
+	l.prune(now)
 	a, ok := l.state[ip]
 	if !ok {
+		if len(l.state) >= 10000 {
+			return true, loginLockDur
+		}
 		return false, 0
 	}
-	now := time.Now()
+	a.lastSeen = now
 	if now.Before(a.lockedTo) {
 		return true, a.lockedTo.Sub(now)
 	}
@@ -146,17 +167,37 @@ func (l *loginLimiter) recordFail(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	now := time.Now()
+	l.prune(now)
 	a, ok := l.state[ip]
 	if !ok {
+		if len(l.state) >= 10000 {
+			return
+		}
 		a = &loginAttempt{}
 		l.state[ip] = a
 	}
-	now := time.Now()
+	a.lastSeen = now
+	if now.Before(a.lockedTo) {
+		return
+	}
 	a.fails = append(a.fails, now.UnixMilli())
 
 	if len(a.fails) >= loginMaxFailures {
 		a.lockedTo = now.Add(loginLockDur)
 		a.fails = nil
+	}
+}
+
+func (l *loginLimiter) prune(now time.Time) {
+	if now.Sub(l.lastPrune) < time.Minute {
+		return
+	}
+	l.lastPrune = now
+	for ip, a := range l.state {
+		if !now.Before(a.lockedTo) && now.Sub(a.lastSeen) > loginWindow {
+			delete(l.state, ip)
+		}
 	}
 }
 
@@ -168,15 +209,20 @@ func (l *loginLimiter) clear(ip string) {
 
 func (s *Server) loginRateLimit() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
-		if blocked, wait := s.loginLim.blocked(ip); blocked {
-			fail(c, http.StatusTooManyRequests,
-				fmt.Sprintf("登录失败次数过多，已临时锁定，请在 %s 后重试", wait.Round(time.Second)))
-			c.Abort()
+		if !s.allowLoginAttempt(c) {
 			return
 		}
 		c.Next()
 	}
+}
+
+func (s *Server) allowLoginAttempt(c *gin.Context) bool {
+	if blocked, wait := s.loginLim.blocked(c.ClientIP()); blocked {
+		fail(c, http.StatusTooManyRequests, fmt.Sprintf("登录失败次数过多，已临时锁定，请在 %s 后重试", wait.Round(time.Second)))
+		c.Abort()
+		return false
+	}
+	return true
 }
 
 // ---- 处理器 ----
@@ -204,6 +250,13 @@ func (s *Server) handleSetup(c *gin.Context) {
 		return
 	}
 
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	// 等待认证锁期间其他请求可能已触发封锁，必须在锁内重新判断。
+	if !s.allowLoginAttempt(c) {
+		return
+	}
+
 	s.credMu.RLock()
 	initialized := s.passHash != ""
 	s.credMu.RUnlock()
@@ -219,8 +272,8 @@ func (s *Server) handleSetup(c *gin.Context) {
 		return
 	}
 
-	if len(req.Password) < 8 {
-		badRequest(c, "密码至少 8 位")
+	if len(req.Password) < 8 || len(req.Password) > 72 {
+		badRequest(c, "密码需为 8 ~ 72 字节")
 		return
 	}
 	username := strings.TrimSpace(req.Username)
@@ -233,8 +286,14 @@ func (s *Server) handleSetup(c *gin.Context) {
 		serverErr(c, err)
 		return
 	}
+	version, err := sessionVersion()
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
 
 	if err := s.store.SetSettings(map[string]string{
+		"auth.session_version":    version,
 		model.SettingPasswordHash: newHash,
 		model.SettingUsername:     username,
 		config.KeyAuthUsername:    username,
@@ -279,6 +338,13 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	// 等待认证锁期间其他请求可能已触发封锁，必须在锁内重新判断。
+	if !s.allowLoginAttempt(c) {
+		return
+	}
+
 	s.credMu.RLock()
 	username, hash := s.username, s.passHash
 	s.credMu.RUnlock()
@@ -290,7 +356,8 @@ func (s *Server) handleLogin(c *gin.Context) {
 
 	ip := c.ClientIP()
 
-	if req.Username != username || !config.CheckPassword(hash, req.Password) {
+	passwordOK := config.CheckPassword(hash, req.Password)
+	if req.Username != username || !passwordOK {
 		s.loginLim.recordFail(ip)
 		_ = s.store.AddEvent(&model.Event{
 			Category: model.EvtAuth,
@@ -332,8 +399,18 @@ func (s *Server) handleMe(c *gin.Context) {
 }
 
 func (s *Server) handleLogout(c *gin.Context) {
-	// JWT 无状态，登出由前端丢弃 token 完成。
-	// 这里只做一次审计留痕。
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	version, err := sessionVersion()
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	if err := s.store.SetSetting("auth.session_version", version); err != nil {
+		serverErr(c, err)
+		return
+	}
+	// 单管理员面板：登出撤销全部已签发会话，并持久保存。
 	_ = s.store.AddEvent(&model.Event{
 		Category: model.EvtAuth,
 		IP:       c.ClientIP(),
@@ -344,6 +421,8 @@ func (s *Server) handleLogout(c *gin.Context) {
 }
 
 func (s *Server) handleChangePassword(c *gin.Context) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
 	var req struct {
 		OldPassword string `json:"old_password"`
 		NewPassword string `json:"new_password"`
@@ -352,8 +431,8 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 		badRequest(c, "请求格式不正确")
 		return
 	}
-	if len(req.NewPassword) < 8 {
-		badRequest(c, "新密码至少 8 位")
+	if len(req.NewPassword) < 8 || len(req.NewPassword) > 72 {
+		badRequest(c, "新密码需为 8 ~ 72 字节")
 		return
 	}
 
@@ -373,7 +452,12 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 	}
 
 	// 落库，优先于配置文件生效
-	if err := s.store.SetSetting(model.SettingPasswordHash, newHash); err != nil {
+	version, err := sessionVersion()
+	if err != nil {
+		serverErr(c, err)
+		return
+	}
+	if err := s.store.SetSettings(map[string]string{model.SettingPasswordHash: newHash, "auth.session_version": version}); err != nil {
 		serverErr(c, err)
 		return
 	}
@@ -390,4 +474,12 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 	})
 
 	ok(c, gin.H{"message": "密码已更新，请用新密码重新登录"})
+}
+
+func sessionVersion() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }

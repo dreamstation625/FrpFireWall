@@ -124,8 +124,9 @@ type Verdict struct {
 // 插件层本来就只作用于 frp 连接，而且拿不到被访问的端口，几种范围对它没有区别。
 // 所以自定义端口与「仅 frp 端口」在判定路径上完全一样，区别只在内核规则的端口集合。
 type blockTarget struct {
-	Prefix netip.Prefix
-	Scope  string
+	Prefix    netip.Prefix
+	ExpiresAt *time.Time
+	Scope     string
 	// Ports 只在 Scope == custom 时有值。其余范围下端口要么是全局的（frp），
 	// 要么根本不带（all），存在条目上只会制造两个真相。
 	Ports portrange.Set
@@ -160,11 +161,16 @@ type Manager struct {
 	drv   firewall.Driver
 	log   *slog.Logger
 
-	mu      sync.RWMutex
-	policy  *model.Policy
-	protect *protector
-	white   []netip.Prefix
-	black   []blockTarget
+	applyMu       sync.Mutex
+	banMu         sync.Mutex
+	refreshMu     sync.Mutex
+	whiteExpiry   map[netip.Prefix]time.Time
+	nextACLExpiry time.Time
+	mu            sync.RWMutex
+	policy        *model.Policy
+	protect       *protector
+	white         []netip.Prefix
+	black         []blockTarget
 	// geoWhite / geoBlack 是名单里的地区条目，与上面的 IP 名单并列。
 	// 判定时两者都看：命中任一即算命中白/黑名单。
 	geoWhite []geoEntry
@@ -202,8 +208,6 @@ type Manager struct {
 
 	eventCh chan *model.Event
 	applyCh chan struct{}
-
-	droppedEvents int64
 }
 
 // New 创建引擎。drv 可以为 nil —— 此时只做判定与展示，不往防火墙写规则。
@@ -237,15 +241,8 @@ func (m *Manager) Start(ctx context.Context) error {
 		return err
 	}
 
-	if m.guardEnabled() && m.drv != nil {
-		if err := m.drv.EnsureBase(); err != nil {
-			// 基础链建不起来不是致命错误：判定与展示仍可用，
-			// 但要明确告诉用户"网络层封禁当前不可用"。
-			m.log.Error("创建受管防火墙链失败，网络层封禁将不可用", "err", err)
-			m.mu.Lock()
-			m.lastSyncErr = err.Error()
-			m.mu.Unlock()
-		} else if err := m.Reconcile(); err != nil {
+	if m.guardEnabled() {
+		if err := m.Reconcile(); err != nil {
 			m.log.Error("初始规则同步失败", "err", err)
 		}
 		// 先采一次：不采的话第一条趋势要等一个采样间隔后才出现，而"刚启动就想知道
@@ -265,6 +262,8 @@ func (m *Manager) dryRun() bool { return m.cfg.Guard.DryRun }
 
 // Refresh 从数据库重新加载策略与名单。前端改完配置后调用。
 func (m *Manager) Refresh() error {
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
 	policy, err := m.store.GetPolicy()
 	if err != nil {
 		return fmt.Errorf("读取策略失败: %w", err)
@@ -305,6 +304,32 @@ func (m *Manager) Refresh() error {
 	m.policy = policy
 	m.protect = prot
 	m.white = white
+	m.whiteExpiry = make(map[netip.Prefix]time.Time)
+	m.nextACLExpiry = time.Time{}
+	for _, r := range append(whiteRows, blackRows...) {
+		if !r.Enabled || r.ExpiresAt == nil || !r.ExpiresAt.After(now) {
+			continue
+		}
+		if m.nextACLExpiry.IsZero() || r.ExpiresAt.Before(m.nextACLExpiry) {
+			m.nextACLExpiry = *r.ExpiresAt
+		}
+	}
+	seenWhite := make(map[netip.Prefix]bool)
+	for _, r := range whiteRows {
+		if !r.Enabled || model.IsGeoTargetType(r.TargetType) || (r.ExpiresAt != nil && !r.ExpiresAt.After(now)) {
+			continue
+		}
+		p, err := parsePrefixOrAddr(r.Target)
+		if err != nil {
+			continue
+		}
+		if r.ExpiresAt == nil {
+			m.whiteExpiry[p] = time.Time{}
+		} else if !seenWhite[p] || (!m.whiteExpiry[p].IsZero() && r.ExpiresAt.After(m.whiteExpiry[p])) {
+			m.whiteExpiry[p] = *r.ExpiresAt
+		}
+		seenWhite[p] = true
+	}
 	m.black = black
 	m.geoWhite = geoWhite
 	m.geoBlack = geoBlack
@@ -410,7 +435,7 @@ func toBlockTargets(rows []model.ACLEntry, now time.Time) []blockTarget {
 		if !ok {
 			scope, ports = model.ScopeAll, nil
 		}
-		out = append(out, blockTarget{Prefix: p, Scope: scope, Ports: ports})
+		out = append(out, blockTarget{Prefix: p, Scope: scope, Ports: ports, ExpiresAt: r.ExpiresAt})
 	}
 	return out
 }
@@ -495,7 +520,12 @@ func (m *Manager) rebuildBans() error {
 
 // Reconcile 把内核规则对齐到当前期望状态。
 func (m *Manager) Reconcile() error {
-	if m.drv == nil || !m.guardEnabled() {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.mu.RLock()
+	drv := m.drv
+	m.mu.RUnlock()
+	if drv == nil || !m.guardEnabled() {
 		return nil
 	}
 
@@ -505,12 +535,14 @@ func (m *Manager) Reconcile() error {
 	if m.dryRun() {
 		// 观察模式：只打印将要下发的规则，不落盘。
 		var preview string
-		preview, err = m.drv.Preview(desired)
+		preview, err = drv.Preview(desired)
 		if err == nil {
 			m.log.Info("观察模式：跳过规则下发", "preview_bytes", len(preview))
 		}
 	} else {
-		err = m.drv.Sync(desired)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err = firewall.SyncContext(ctx, drv, desired)
 	}
 
 	m.mu.Lock()
@@ -525,7 +557,7 @@ func (m *Manager) Reconcile() error {
 
 	if err != nil {
 		_ = m.store.AddRuleChange(&model.RuleChange{
-			Backend: m.drv.Name(),
+			Backend: drv.Name(),
 			Action:  "sync",
 			Payload: fmt.Sprintf(`{"rules":%d}`, desiredRuleCount(desired)),
 			Result:  "failed",
@@ -576,14 +608,15 @@ func (m *Manager) desired() firewall.Desired {
 		ports  portrange.Set
 	}
 	entries := make([]scopedEntry, 0, len(m.black)+len(m.bans))
+	exceptions := append([]netip.Prefix(nil), systemProtected...)
+	for _, w := range m.white {
+		if exp := m.whiteExpiry[w]; exp.IsZero() || exp.After(now) {
+			exceptions = append(exceptions, w)
+		}
+	}
 
 	collect := func(p netip.Prefix, scope string, ports portrange.Set) {
-		if IsSystemProtected(p.Addr()) {
-			return
-		}
-		if m.matchAnyLocked(m.white, p.Addr()) {
-			return
-		}
+
 		if !model.ValidScope(scope) {
 			scope = model.ScopeAll
 		}
@@ -604,13 +637,20 @@ func (m *Manager) desired() firewall.Desired {
 		if scope != model.ScopeAll && len(ports.Normalize()) == 0 {
 			scope, ports = model.ScopeAll, nil
 		}
-		entries = append(entries, scopedEntry{prefix: p, scope: scope, ports: ports})
+		for _, piece := range subtractPrefixes(p, exceptions) {
+			entries = append(entries, scopedEntry{prefix: piece, scope: scope, ports: ports})
+		}
 	}
 
 	for _, b := range m.black {
-		collect(b.Prefix, b.Scope, b.Ports)
+		if b.ExpiresAt == nil || b.ExpiresAt.After(now) {
+			collect(b.Prefix, b.Scope, b.Ports)
+		}
 	}
 	for _, b := range m.bans {
+		if m.policy != nil && m.policy.ObserveOnly && b.Source != model.SourceManual {
+			continue
+		}
 		if b.Expires.IsZero() || b.Expires.After(now) {
 			collect(b.Prefix, b.Scope, b.Ports)
 		}
@@ -681,6 +721,9 @@ func (m *Manager) desired() firewall.Desired {
 
 	white := make([]string, 0, len(m.white))
 	for _, p := range m.white {
+		if exp := m.whiteExpiry[p]; !exp.IsZero() && !exp.After(now) {
+			continue
+		}
 		white = append(white, p.String())
 	}
 
@@ -729,10 +772,15 @@ func (m *Manager) SetFrpsProxyPorts(ports portrange.Set) {
 
 // Preview 生成将要下发的规则文本。
 func (m *Manager) Preview() (string, error) {
-	if m.drv == nil {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	m.mu.RLock()
+	drv := m.drv
+	m.mu.RUnlock()
+	if drv == nil {
 		return "", fmt.Errorf("当前没有可用的防火墙后端")
 	}
-	return m.drv.Preview(m.desired())
+	return drv.Preview(m.desired())
 }
 
 // scheduleApply 触发一次异步重新对齐。多次连续调用会被合并。
@@ -903,6 +951,8 @@ func (m *Manager) Lookup(target string) map[string]any {
 // SetDriver 在切换防火墙后端时替换驱动。
 // 调用方要保证新驱动已经 EnsureBase 完毕，否则会出现规则悬空。
 func (m *Manager) SetDriver(drv firewall.Driver) {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
 	m.mu.Lock()
 	m.drv = drv
 	m.mu.Unlock()
@@ -968,6 +1018,16 @@ func (m *Manager) tickLoop(ctx context.Context) {
 			}
 		case <-sec.C:
 			m.expireBans()
+			m.mu.RLock()
+			exp := m.nextACLExpiry
+			m.mu.RUnlock()
+			if !exp.IsZero() && !exp.After(time.Now()) {
+				if err := m.Refresh(); err == nil {
+					m.scheduleApply()
+				} else {
+					m.log.Error("刷新到期名单失败", "err", err)
+				}
+			}
 		case <-sample.C:
 			m.sampleCounters()
 		case <-clean.C:
@@ -980,7 +1040,14 @@ func (m *Manager) tickLoop(ctx context.Context) {
 
 // expireBans 处理到期封禁，自动解封并把状态落库。
 func (m *Manager) expireBans() {
+	m.banMu.Lock()
+	defer m.banMu.Unlock()
 	now := time.Now()
+	retired, err := m.store.ReleaseExpired(now)
+	if err != nil {
+		m.log.Warn("更新过期封禁状态失败", "err", err)
+		return
+	}
 
 	m.mu.Lock()
 	var expired []*banState
@@ -988,7 +1055,7 @@ func (m *Manager) expireBans() {
 		if !b.Expires.IsZero() && !b.Expires.After(now) {
 			expired = append(expired, b)
 			delete(m.bans, k)
-			m.resetWindowsForLocked(b.Prefix.Addr().String())
+			m.resetWindowsForLocked(b.Prefix.String())
 		}
 	}
 	m.mu.Unlock()
@@ -1001,11 +1068,6 @@ func (m *Manager) expireBans() {
 	// 这些行会永远卡在 status=active —— 封禁记录页一直显示"封禁中"，
 	// 内核里其实早已没有对应规则，变成"界面说封着、实际没封"。
 	// 它本身是全局 + 幂等的，多跑一次的代价只是一次带索引的查询。
-	retired, err := m.store.ReleaseExpired(now)
-	if err != nil {
-		m.log.Warn("更新过期封禁状态失败", "err", err)
-		retired = nil
-	}
 
 	if len(expired) == 0 && len(retired) == 0 {
 		return
@@ -1041,10 +1103,16 @@ func (m *Manager) expireBans() {
 
 // pruneWindows 淘汰长时间无活动的计数窗口与令牌桶，防止内存随历史 IP 无限增长。
 func (m *Manager) pruneWindows() {
-	cutoff := time.Now().Add(-30 * time.Minute)
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	retention := 30 * time.Minute
+	if m.policy != nil {
+		retention = max(retention, time.Duration(m.policy.WindowSeconds)*time.Second)
+	}
+	for _, r := range m.appRules {
+		retention = max(retention, r.window)
+	}
+	cutoff := time.Now().Add(-retention)
 	for k, w := range m.windows {
 		if w.last.Before(cutoff) {
 			delete(m.windows, k)
@@ -1101,7 +1169,7 @@ func (m *Manager) pushEvent(e *model.Event) {
 	select {
 	case m.eventCh <- e:
 	default:
-		m.droppedEvents++
+		// 队列满时丢弃，判定路径不等待日志写入。
 	}
 }
 
@@ -1113,18 +1181,15 @@ func (m *Manager) pushEvent(e *model.Event) {
 //
 // 调用方需持有读锁。
 func (m *Manager) findBanLocked(addr netip.Addr, policy *model.Policy, now time.Time) (*banState, bool) {
+	active := func(b *banState) bool {
+		return (b.Expires.IsZero() || b.Expires.After(now)) && !(policy != nil && policy.ObserveOnly && b.Source != model.SourceManual)
+	}
 	key := m.banKeyLocked(addr, policy)
-	if b, ok := m.bans[key]; ok {
-		if b.Expires.IsZero() || b.Expires.After(now) {
-			return b, true
-		}
-		return nil, false
+	if b, ok := m.bans[key]; ok && active(b) {
+		return b, true
 	}
 	for _, b := range m.bans {
-		if !b.Prefix.Contains(addr) {
-			continue
-		}
-		if b.Expires.IsZero() || b.Expires.After(now) {
+		if b.Prefix.Contains(addr) && active(b) {
 			return b, true
 		}
 	}
@@ -1181,11 +1246,18 @@ func (m *Manager) windowCount(ruleTag, ip string, now time.Time, win time.Durati
 //
 // 调用方需持有写锁。
 func (m *Manager) resetWindowsForLocked(ip string) {
-	suffix := "|" + ip
+	p, err := parsePrefixOrAddr(ip)
+	if err != nil {
+		return
+	}
 	for k, w := range m.windows {
-		if strings.HasSuffix(k, suffix) {
+		a, err := netip.ParseAddr(k[strings.LastIndex(k, "|")+1:])
+		if err == nil && p.Contains(a) {
 			w.reset()
 		}
+	}
+	for i := range m.appRules {
+		m.appRules[i].bucket.resetPrefix(p)
 	}
 }
 
@@ -1207,6 +1279,9 @@ func (m *Manager) Whitelisted(addr netip.Addr) bool {
 // matchAnyLocked 判断地址是否命中某个前缀集合。调用方需持有锁。
 func (m *Manager) matchAnyLocked(list []netip.Prefix, addr netip.Addr) bool {
 	for _, p := range list {
+		if exp := m.whiteExpiry[p]; !exp.IsZero() && !exp.After(time.Now()) {
+			continue
+		}
 		if p.Contains(addr) {
 			return true
 		}
@@ -1220,6 +1295,9 @@ func (m *Manager) matchAnyLocked(list []netip.Prefix, addr netip.Addr) bool {
 // 与"全端口封禁"在它面前是同一件事。
 func (m *Manager) matchAnyBlockLocked(list []blockTarget, addr netip.Addr) bool {
 	for _, b := range list {
+		if b.ExpiresAt != nil && !b.ExpiresAt.After(time.Now()) {
+			continue
+		}
 		if b.Prefix.Contains(addr) {
 			return true
 		}
@@ -1241,6 +1319,9 @@ func (m *Manager) matchGeoLocked(list []geoEntry, geo *geoip.Info) *geoEntry {
 		return nil
 	}
 	for i := range list {
+		if list[i].expiresAt != nil && !list[i].expiresAt.After(time.Now()) {
+			continue
+		}
 		if model.MatchGeo(list[i].kind, list[i].list, geo.Country, geo.Province, geo.City) {
 			return &list[i]
 		}
@@ -1260,7 +1341,7 @@ func (m *Manager) matchGeoLocked(list []geoEntry, geo *geoip.Info) *geoEntry {
 func (m *Manager) blockScopeLocked(list []blockTarget, addr netip.Addr) string {
 	scope := ""
 	for _, b := range list {
-		if !b.Prefix.Contains(addr) {
+		if !b.Prefix.Contains(addr) || (b.ExpiresAt != nil && !b.ExpiresAt.After(time.Now())) {
 			continue
 		}
 		switch b.Scope {

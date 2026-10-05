@@ -27,6 +27,8 @@ func (m *Manager) triggerBan(
 	addr netip.Addr, source, reason, user, proxy string,
 	geo *geoip.Info, steps []int64, sourceRef string,
 ) {
+	m.banMu.Lock()
+	defer m.banMu.Unlock()
 	addr = addr.Unmap()
 
 	m.mu.RLock()
@@ -53,7 +55,7 @@ func (m *Manager) triggerBan(
 	if observe {
 		m.log.Info("观察模式：记录封禁决策但不下发", "target", target, "reason", reason)
 		m.pushEvent(&model.Event{
-			Category:  model.EvtBan,
+			Category:  model.EvtObserved,
 			IP:        target,
 			User:      user,
 			ProxyName: proxy,
@@ -65,6 +67,9 @@ func (m *Manager) triggerBan(
 		return
 	}
 
+	if policy != nil && !policy.AutoBanEnabled {
+		return
+	}
 	dur, step := m.nextDuration(target, policy, steps)
 
 	now := time.Now()
@@ -145,6 +150,8 @@ func (m *Manager) triggerBan(
 // ports 只在 scope=custom 时用得上，其余范围忽略（接口层已经挡住了这种情况，
 // 这里再判一次是因为 guard 也可能被别的调用方直接调）。
 func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope string, ports portrange.Set) (*model.BanRecord, error) {
+	m.banMu.Lock()
+	defer m.banMu.Unlock()
 	p, err := parsePrefixOrAddr(strings.TrimSpace(target))
 	if err != nil {
 		return nil, fmt.Errorf("地址格式不正确: %w", err)
@@ -258,23 +265,29 @@ func (m *Manager) BanManual(target, reason, by string, dur time.Duration, scope 
 
 // Unban 按地址解封。
 func (m *Manager) Unban(target, by string) error {
+	m.banMu.Lock()
+	defer m.banMu.Unlock()
 	p, err := parsePrefixOrAddr(strings.TrimSpace(target))
 	if err != nil {
 		return fmt.Errorf("地址格式不正确: %w", err)
 	}
 	t := p.String()
 
-	m.mu.Lock()
+	m.mu.RLock()
 	st, ok := m.bans[t]
-	delete(m.bans, t)
-	m.resetWindowsForLocked(p.Addr().String())
-	m.mu.Unlock()
-
-	if ok && st.RecordID > 0 {
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%s 当前不在封禁列表中", t)
+	}
+	if st.RecordID > 0 {
 		if err := m.store.ReleaseBan(st.RecordID, by, model.BanReleased); err != nil {
-			m.log.Warn("更新封禁记录状态失败", "err", err, "id", st.RecordID)
+			return fmt.Errorf("更新封禁记录失败: %w", err)
 		}
 	}
+	m.mu.Lock()
+	delete(m.bans, t)
+	m.resetWindowsForLocked(t)
+	m.mu.Unlock()
 
 	m.pushEvent(&model.Event{
 		Category: model.EvtUnban,
@@ -292,6 +305,8 @@ func (m *Manager) Unban(target, by string) error {
 
 // UnbanByRecordID 按封禁记录 ID 解封。前端列表用的是记录 ID。
 func (m *Manager) UnbanByRecordID(id uint, by string) error {
+	m.banMu.Lock()
+	defer m.banMu.Unlock()
 	rec, err := m.store.GetBan(id)
 	if err != nil {
 		return fmt.Errorf("封禁记录不存在: %w", err)
@@ -300,15 +315,14 @@ func (m *Manager) UnbanByRecordID(id uint, by string) error {
 		return fmt.Errorf("该记录状态为 %s，无需解封", rec.Status)
 	}
 
-	m.mu.Lock()
-	_, ok := m.bans[rec.Target]
-	delete(m.bans, rec.Target)
-	m.resetWindowsForLocked(rec.TargetAddr())
-	m.mu.Unlock()
-
 	if err := m.store.ReleaseBan(rec.ID, by, model.BanReleased); err != nil {
 		return fmt.Errorf("更新记录状态失败: %w", err)
 	}
+	m.mu.Lock()
+	_, ok := m.bans[rec.Target]
+	delete(m.bans, rec.Target)
+	m.resetWindowsForLocked(rec.Target)
+	m.mu.Unlock()
 
 	m.pushEvent(&model.Event{
 		Category: model.EvtUnban,
@@ -330,11 +344,12 @@ func (m *Manager) UnbanByRecordID(id uint, by string) error {
 // 列表里，而界面上已经看不到那条名单了 —— 用户既不知道该点哪几条，
 // 也想不通"我明明删了，为什么它还进不来"。规则被停用/删除同理。
 //
-// 以**内存那份为准**扫（内存是权威，见 banState 的注释），再按记录 ID 批量
-// 回写数据库；只扫库的话，内存里"库里状态已经变了但还没刷新"的那些会漏掉。
+// 数据库按来源解除全部活跃行，包含旧版本遗留的重复记录；成功后同步更新内存。
 //
 // 没有匹配的封禁不算错误 —— 那条来源可能一个地址都没封过，这是正常情况。
 func (m *Manager) ReleaseBansByRef(ref, by, why string) (int, error) {
+	m.banMu.Lock()
+	defer m.banMu.Unlock()
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return 0, nil
@@ -342,30 +357,25 @@ func (m *Manager) ReleaseBansByRef(ref, by, why string) (int, error) {
 
 	m.mu.Lock()
 	hits := make([]*banState, 0, 4)
-	for k, b := range m.bans {
+	for _, b := range m.bans {
 		if b.SourceRef != ref {
 			continue
 		}
 		hits = append(hits, b)
-		delete(m.bans, k)
-		m.resetWindowsForLocked(b.Prefix.Addr().String())
 	}
 	m.mu.Unlock()
 
-	if len(hits) == 0 {
-		return 0, nil
-	}
-
-	ids := make([]uint, 0, len(hits))
-	for _, b := range hits {
-		if b.RecordID > 0 {
-			ids = append(ids, b.RecordID)
-		}
-	}
-	if err := m.store.ReleaseBans(ids, by, model.BanReleased); err != nil {
+	count, err := m.store.ReleaseBansByRef(ref, by)
+	if err != nil {
 		return 0, fmt.Errorf("更新封禁记录状态失败: %w", err)
 	}
 
+	m.mu.Lock()
+	for _, b := range hits {
+		delete(m.bans, b.Target)
+		m.resetWindowsForLocked(b.Prefix.String())
+	}
+	m.mu.Unlock()
 	for _, b := range hits {
 		m.pushEvent(&model.Event{
 			Category: model.EvtUnban,
@@ -377,7 +387,7 @@ func (m *Manager) ReleaseBansByRef(ref, by, why string) (int, error) {
 	m.scheduleApply()
 
 	m.log.Info("来源移除，联动解封", "ref", ref, "count", len(hits), "reason", why)
-	return len(hits), nil
+	return int(count), nil
 }
 
 // nextDuration 按阶梯策略算出本次封禁时长与阶梯序号。
@@ -405,7 +415,7 @@ func (m *Manager) nextDuration(target string, policy *model.Policy, steps []int6
 
 	step := 0
 	if last, err := m.store.LastBanOfTarget(target); err == nil && last != nil {
-		window := time.Duration(windowHours) * time.Hour
+		window := model.SafeHours(windowHours)
 		if window > 0 && time.Since(last.BannedAt) < window {
 			step = last.HitCount
 		}
@@ -421,7 +431,7 @@ func (m *Manager) nextDuration(target string, policy *model.Policy, steps []int6
 	if sec <= 0 {
 		return 0, step + 1 // 0 表示永久
 	}
-	return time.Duration(sec) * time.Second, step + 1
+	return model.SafeSeconds(sec), step + 1
 }
 
 // banStepsForEntry 把"名单条目的到期时刻"翻译成 triggerBan 要的阶梯表。
