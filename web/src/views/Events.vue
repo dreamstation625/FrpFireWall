@@ -25,13 +25,14 @@
           />
           <el-button size="small" @click="reload">查询</el-button>
           <el-button size="small" @click="reset">重置</el-button>
-          <!-- 刷新与查询的区别是页码：查询会把条件变了之后的第 1 页拉回来，
-               刷新只是"当前这一页再看一遍"，翻到第 5 页时不该被弹回第 1 页 -->
+          <!-- 刷新 = 按当前条件重新取一次并回到第 1 页。
+               回第 1 页是刻意的：新事件插在最前面，停在第 5 页刷新等于
+               把刚发生的事挡在视野外，而"看看现在怎么样"就是要看最新的 -->
           <el-button
             size="small"
             :loading="loading"
             style="margin-left: auto"
-            @click="loadEvents"
+            @click="reload"
           >
             刷新
           </el-button>
