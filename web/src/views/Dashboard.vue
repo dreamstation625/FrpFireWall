@@ -64,6 +64,14 @@
       </el-col>
     </el-row>
 
+    <!-- 与防火墙页共用同一块面板：这里是精简版（图矮一点、表短一点），
+         完整版仍在防火墙页。 -->
+    <el-row :gutter="12" class="mt">
+      <el-col :span="24">
+        <CounterPanel compact />
+      </el-col>
+    </el-row>
+
     <el-row :gutter="12" class="mt">
       <el-col :span="12">
         <div class="page-card panel">
@@ -149,6 +157,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import echarts, { type EChartsType } from '@/utils/echarts'
 import api from '@/api'
+import CounterPanel from '@/components/CounterPanel.vue'
 import TablePager from '@/components/TablePager.vue'
 import { useColumnWidths } from '@/utils/table'
 import { useSystemStore } from '@/stores/system'
