@@ -7,7 +7,7 @@
     <div class="guide-blocker" :style="{ background: rect ? 'transparent' : 'rgba(15, 18, 24, 0.45)' }"></div>
     <div v-if="rect" class="guide-hole" :style="holeStyle"></div>
 
-    <div class="guide-pop" :style="popStyle">
+    <div ref="popEl" class="guide-pop" :style="popStyle">
       <div class="guide-head">
         <span class="guide-seq">{{ index + 1 }} / {{ steps.length }}</span>
         <span class="guide-title">{{ step.title }}</span>
@@ -26,7 +26,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { GuideStep } from '@/utils/guide'
 
@@ -38,6 +38,10 @@ const route = useRoute()
 
 const index = ref(0)
 const rect = ref<{ top: number; left: number; bottom: number; right: number } | null>(null)
+const popEl = ref<HTMLElement | null>(null)
+// 气泡实际高度（渲染后量出来的）：文案长短不一，估高度会翻车 ——
+// 估低了气泡超出视口底部、估高了白白放弃下方空间。
+const popH = ref(0)
 let targetEl: HTMLElement | null = null
 
 // 越界保护：steps 被改短时不至于渲染出一个空气泡
@@ -59,19 +63,33 @@ const holeStyle = computed(() => {
 
 const POP_W = 340
 const popStyle = computed(() => {
+  const vh = window.innerHeight
+  const vw = window.innerWidth
+  const h = popH.value || 240
   const r = rect.value
   if (!r) {
     // 没有指向时居中：整句话就是内容本身，不该偏到某个角落去
     return { left: '50%', top: '50%', width: `${POP_W}px`, transform: 'translate(-50%, -50%)' }
   }
-  const left = Math.max(16, Math.min(r.left, window.innerWidth - POP_W - 16))
-  const below = r.bottom + 12
-  // 下面放得下就放下面，放不下翻到上面。气泡高度随文案长短变化，
-  // 这里按最长那句估（约 260），宁可翻到上面也不要溢出视口。
-  if (below + 260 <= window.innerHeight) {
-    return { left: `${left}px`, top: `${below}px`, width: `${POP_W}px` }
+  const left = Math.max(16, Math.min(r.left, vw - POP_W - 16))
+  const belowTop = r.bottom + 12
+  const aboveTop = r.top - 12 - h
+  let top: number
+  if (belowTop + h <= vh - 12) {
+    // 下面放得下就放下面
+    top = belowTop
+  } else if (aboveTop >= 12) {
+    // 下面不够、上面够，翻到上面
+    top = aboveTop
+  } else {
+    // 两边都放不下（目标占了视口大头，或视口本身矮）：挑剩余空间大的一侧，
+    // 再把气泡钳回视口内 —— 不钳的话它会整体飘出视口，表现成"被挡住一截"。
+    const belowSpace = vh - r.bottom
+    const aboveSpace = r.top
+    const raw = belowSpace >= aboveSpace ? belowTop : aboveTop
+    top = Math.max(12, Math.min(raw, vh - h - 12))
   }
-  return { left: `${left}px`, bottom: `${window.innerHeight - r.top + 12}px`, width: `${POP_W}px` }
+  return { left: `${left}px`, top: `${top}px`, width: `${POP_W}px` }
 })
 
 function sleep(ms: number) {
@@ -96,7 +114,15 @@ function measure() {
     return
   }
   const r = targetEl.getBoundingClientRect()
-  rect.value = { top: r.top, left: r.left, bottom: r.bottom, right: r.right }
+  const vh = window.innerHeight
+  // 裁到视口内：目标可能比视口还高（比如整块面板），洞和气泡都只该
+  // 对着"看得见的那一段"算，否则量出来的是视口外的坐标，气泡会飘走。
+  rect.value = {
+    top: Math.max(0, r.top),
+    left: r.left,
+    bottom: Math.min(vh, r.bottom),
+    right: r.right,
+  }
 }
 
 async function locate(s: GuideStep) {
@@ -110,7 +136,13 @@ async function locate(s: GuideStep) {
   // 否则高亮框会飘在视口外。
   el.scrollIntoView({ block: 'center', behavior: 'smooth' })
   await sleep(320)
-  if (targetEl === el) measure()
+  if (targetEl === el) {
+    measure()
+    // 量一次气泡真实高度再重排一次：popStyle 首次用的是估算值，
+    // 等气泡挂出来把实测高度补上，位置才算得准。
+    await nextTick()
+    if (popEl.value) popH.value = popEl.value.offsetHeight
+  }
 }
 
 async function go(i: number) {
