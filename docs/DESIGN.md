@@ -706,7 +706,7 @@ udp dport { 7020, 20000-30000 } ip saddr @frpfirewall_black_p_xxxxxxxx drop comm
 
 **端口上下文必须可靠。** Login 使用部署配置的 bindPort；NewUserConn 只有来源地址、代理名与类型，没有目的端口。
 NewProxy 在代理注册成功之前调用，不能把申请的 remote_port 当成实际端口（尤其动态分配或注册失败）。
-本版本采用代理名完成代理新连接的应用层频控，目的端口留空，不接入 Dashboard 或代理端口映射。端口条件仅匹配 Login 的 bindPort；代理新连接没有可信目的端口时不命中端口规则，策略状态返回明确提示，其它规则或全局兜底继续执行。
+本版本在应用层完成代理新连接的频控，目的端口留空，代理名可选，不接入 Dashboard 或代理端口映射。代理名留空时，按地区与来源等其他条件匹配，同一来源跨代理共享该规则的窗口与令牌桶，也可匹配 Login；所有条件均为空时使用全局兜底。端口条件仅匹配 Login 的 bindPort；代理新连接没有可信目的端口时不命中端口规则，策略状态返回明确提示，其它规则或全局兜底继续执行。
 不从 remote_addr 的客户端来源端口推导目的端口。HTTP 请求数与没有 NewUserConn 回调的访问不属于本次频控范围。
 
 **计数隔离与重置。** 带端口规则的窗口 key 为 ruleTag@port|sourceIP，令牌桶 key 为 port|sourceIP；

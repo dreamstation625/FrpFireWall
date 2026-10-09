@@ -816,7 +816,7 @@ func (m *Manager) Stats() Stats {
 	}
 	for _, r := range m.appRules {
 		if len(r.ports) > 0 {
-			s.RuleWarnings = append(s.RuleWarnings, "规则「"+r.name+"」：目的端口仅在 Login 阶段按 bindPort 匹配；对代理新连接做频控，请填写代理名并将目的端口留空，无需 Dashboard")
+			s.RuleWarnings = append(s.RuleWarnings, "规则「"+r.name+"」：目的端口仅在 Login 阶段按 bindPort 匹配；对代理新连接做频控，请将目的端口留空，代理名可选，无需 Dashboard")
 		}
 	}
 	if m.protect != nil {
