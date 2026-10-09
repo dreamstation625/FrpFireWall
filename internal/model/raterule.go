@@ -11,31 +11,13 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
-// 频控规则的两种落点。
-//
-// 落点不是用户选的，是由"有没有端口条件"推出来的，原因见 RateRule 的注释。
+// 细分规则在应用层匹配和计数，内核只执行已触发的封禁。
 const (
-	// LayerKernel 内核层：由防火墙按 dport 丢包，只能限速。
-	LayerKernel = "kernel"
-	// LayerApp 应用层：由 frps 插件判定，能限速也能封禁。
-	LayerApp = "app"
+	LayerKernel = "kernel" // 兼容旧版接口常量，不再用于细分频控。
+	LayerApp    = "app"
 )
 
-// RateRule 是一条细分频控规则。
-//
-// 为什么落点由"有没有端口条件"决定，而不是由"有没有地区条件"决定：
-//
-//   - 需要按"访问了哪个端口"分流，只能在内核做 —— frps 的插件回调
-//     （Login / NewUserConn）里根本没有被访问的端口，只有来源地址。
-//   - 反过来，需要按"来源属地"分流，只能在应用层做 —— DESIGN 的 D8 定了
-//     不把地区下沉到内核，而且 mmdb / ip2region 是查询型库，没法反向枚举出
-//     一个国家的 CIDR 列表，想下沉也做不到。
-//
-// 两条合起来：**端口和地区不可能同时出现在一条规则里**，Validate 会直接拒绝，
-// 而不是保存下来之后静默地少生效一半。
-//
-// 内核层还有一条硬边界：它只能丢包。超限的包在内核就被丢了，根本到不了 frps，
-// 应用层自然也无从"发现它超限"，所以内核规则**不能封禁**，只有限速。
+// RateRule 同一维度多个值为 OR，不同维度之间为 AND。
 type RateRule struct {
 	ID   uint   `gorm:"primaryKey" json:"id"`
 	Name string `gorm:"size:64;not null" json:"name"`
@@ -73,10 +55,8 @@ type RateRule struct {
 	// 显式指定列名：GORM 的命名策略把 "CIDRs" 拆成了 C + ID + Rs
 	// （ID 在 commonInitialisms 里），不加 column 的话列名会是 c_id_rs。
 	CIDRs string `gorm:"column:cidrs;size:4096;not null;default:''" json:"cidrs"`
-	// Ports 被访问的目的端口，区间写法，如 "20000-30000,443"。
-	//
-	// **这个字段一旦非空，规则就落在内核层**，且不能再有国家/省份条件，
-	// 也不能有代理条件 —— 内核只看得到源地址和目的端口，认不出 frp 的隧道名。
+	// Ports 实际被访问的目的端口，仅是匹配条件，不决定封禁范围。
+	// 本版本仅在 Login 使用 bindPort；代理名规则必须留空。
 	Ports string `gorm:"size:1024;not null;default:''" json:"ports"`
 	// ProxyName frp 的代理（隧道）名，精确匹配，单个值。
 	//
@@ -99,12 +79,8 @@ type RateRule struct {
 
 	// Block 命中即拦截：直接拒绝这次连接，不计数、不限速。
 	//
-	// 与"限速 / 阈值封禁"是两条不同的路：那两个都是**先放过去、超了才处理**，
-	// 这个是命中就进不来。所以它不能和端口条件同时出现 —— 端口落内核，而内核
-	// 只有丢包一种动作、且丢包发生在 frps 之前，应用层的"命中即拒绝"在那里
-	// 表达不出来（见 DESIGN D16）。
-	//
-	// 也不能与限速 / 封禁配置同时出现：命中就直接拒了，后面那些参数永远轮不到
+	// 直接拦截首次命中后才产生来源封禁；默认仍为全端口。
+	// 不能与限速 / 封禁配置同时出现：命中就直接拒了，后面那些参数永远轮不到
 	// 生效。留着就是"配了不生效"的陷阱，Validate 会直接拒绝这种组合。
 	// 这里带 default:false 并不违背上面 Enabled 那条"不加 default"的经验：
 	// 那个坑的条件是**默认值为 true** —— 零值 false 被省略，就变成库里默认的 true。
@@ -120,7 +96,7 @@ type RateRule struct {
 	// Burst 突发额度。PerSec > 0 且 Burst <= 0 时按 PerSec*2 自动补齐。
 	Burst int `gorm:"not null;default:0" json:"burst"`
 
-	// ---- 动作：封禁（内核层规则用不上，见类型注释）----
+	// ---- 动作：封禁 ----
 
 	// WindowSeconds 统计窗口秒数。0 表示这条规则不封禁。
 	WindowSeconds int `gorm:"not null;default:0" json:"window_seconds"`
@@ -138,16 +114,8 @@ type RateRule struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Layer 返回规则落点：有端口条件落内核，否则落应用层。
-//
-// 只看字段是否为空，不做解析 —— 这个方法要给界面用，非法输入应当先被
-// Validate 拦下，而不是让落点跟着解析结果飘。
-func (r *RateRule) Layer() string {
-	if strings.TrimSpace(r.Ports) != "" {
-		return LayerKernel
-	}
-	return LayerApp
-}
+// Layer 返回判定位置：所有细分规则统一在应用层。
+func (r *RateRule) Layer() string { return LayerApp }
 
 // HasProxyCondition 是否指定了代理（隧道）名。空 = 不限代理。
 func (r *RateRule) HasProxyCondition() bool {
@@ -362,6 +330,10 @@ func (r *RateRule) Validate() error {
 	if !hasGeo && !hasCIDR && !hasPorts && !hasProxy {
 		return fmt.Errorf("规则「%s」没有任何匹配条件，会命中所有流量；全量兜底请用上方的全局规则", r.Name)
 	}
+	// NewUserConn 没有目的端口；本版本不接入端口映射，不能保存永远不命中的组合。
+	if hasProxy && hasPorts {
+		return fmt.Errorf("规则「%s」未接入代理端口映射：按代理名对新连接做频控时，请将目的端口留空", r.Name)
+	}
 
 	// 条件解析失败要在这里挡掉，不能留到下发时才炸。
 	//
@@ -389,48 +361,11 @@ func (r *RateRule) Validate() error {
 	if _, err := r.PrefixList(); err != nil {
 		return fmt.Errorf("规则「%s」：%w", r.Name, err)
 	}
-	ports, err := r.PortSet()
+	_, err := r.PortSet()
 	if err != nil {
 		return fmt.Errorf("规则「%s」：%w", r.Name, err)
 	}
 
-	// 端口 + 地区：两个条件各自只有一层能判，凑在一起必然有一条不生效。
-	if hasPorts && hasGeo {
-		return fmt.Errorf(
-			"规则「%s」同时写了「地区」和「端口」，无法生效：地区只有 frps 插件能判（它拿不到被访问的端口），"+
-				"端口只有内核能判（见 DESIGN D16）。请拆成两条规则", r.Name)
-	}
-	// 端口 + 代理：同一类冲突的另一半。代理名来自 frps 的 NewUserConn 回调，
-	// 内核那条路上根本没有这个概念（它只看源地址与目的端口），凑在一起代理
-	// 条件永远判不上 —— 与地区那条一样必须拆开，否则是"配了不生效"。
-	if hasPorts && hasProxy {
-		return fmt.Errorf(
-			"规则「%s」同时写了「代理」和「端口」，无法生效：代理名只有 frps 插件能判，"+
-				"带端口条件的规则下发到内核、那里认不出代理（见 DESIGN D16）。请拆成两条规则", r.Name)
-	}
-
-	if len(ports) > 0 {
-		// ---- 内核层 ----
-		if r.Block {
-			return fmt.Errorf(
-				"规则「%s」同时写了「端口」和「直接拦截」：端口落内核，而内核只能丢包、丢包发生在 frps 之前，"+
-					"应用层的拦截在那里表达不出来（见 DESIGN D16）。去掉端口条件即可改走应用层", r.Name)
-		}
-		if r.PerSec < 1 {
-			return fmt.Errorf("规则「%s」落在内核层，必须填写「每秒连接数上限」", r.Name)
-		}
-		if r.Burst < 0 {
-			return fmt.Errorf("规则「%s」的突发额度不能为负数", r.Name)
-		}
-		if r.BanConfigured() {
-			return fmt.Errorf(
-				"规则「%s」落在内核层，不能配置封禁：超限的包在内核就被丢了，到不了 frps，"+
-					"应用层无从知道它超限。只保留限速，或去掉端口条件改走应用层", r.Name)
-		}
-		return nil
-	}
-
-	// ---- 应用层 ----
 	if r.PerSec < 0 || r.PerSec > 1000000 || r.Burst > 2000000 {
 		return fmt.Errorf("规则「%s」的每秒连接数上限不能为负数", r.Name)
 	}

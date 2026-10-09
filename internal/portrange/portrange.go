@@ -39,6 +39,16 @@ type Range struct {
 // 是不是写错了。现在归一化由类型本身兜住，驱动那边再兜一层（见 Normalize）。
 type Set []Range
 
+// Contains 判断实际目的端口是否属于集合，不展开区间。
+func (s Set) Contains(port int) bool {
+	for _, r := range s {
+		if port >= r.Lo && port <= r.Hi {
+			return true
+		}
+	}
+	return false
+}
+
 // Ports 用一组单端口构造集合。
 func Ports(ns ...int) Set {
 	s := make(Set, 0, len(ns))

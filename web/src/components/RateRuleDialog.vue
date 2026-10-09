@@ -33,7 +33,6 @@
           collapse-tags
           collapse-tags-tooltip
           :max-collapse-tags="6"
-          :disabled="portsFilled"
           placeholder="选择或直接输入两位国家码（如 CN、CU）"
           style="width: 100%"
         >
@@ -62,7 +61,6 @@
           collapse-tags
           collapse-tags-tooltip
           :max-collapse-tags="6"
-          :disabled="portsFilled"
           placeholder="中国省份（可多选）"
           style="width: 100%"
         >
@@ -90,7 +88,6 @@
           collapse-tags
           collapse-tags-tooltip
           :max-collapse-tags="6"
-          :disabled="portsFilled"
           placeholder="直接输入城市名后回车（可多个），例如 深圳"
           style="width: 100%"
         >
@@ -119,7 +116,7 @@
           placeholder="端口或区间，例如 443, 20000-30000"
         />
         <div class="hint">
-          留空表示不限端口。填了端口这条规则就落在<strong>内核层</strong>，由系统防火墙按目的端口丢包。
+          本版本目的端口条件仅匹配登录阶段的 bindPort。<br />对代理新连接做频控，请填写下方代理名并将此项留空，无需 Dashboard。统计的是新建连接，不是 HTTP 请求数；自动封禁仍为全端口。
         </div>
       </el-form-item>
 
@@ -130,7 +127,6 @@
           allow-create
           default-first-option
           clearable
-          :disabled="portsFilled"
           placeholder="留空 = 不限代理；可手填代理名后回车"
           style="width: 100%"
         >
@@ -141,11 +137,8 @@
             :value="p"
           />
         </el-select>
-        <div v-if="portsFilled" class="hint">
-          带端口条件的规则落在内核层，那里认不出 frp 的代理名 —— 需要按代理分流请去掉端口条件。
-        </div>
-        <div v-else class="hint">
-          只对<strong>这个代理</strong>生效。不同代理要不同力度，就建多条规则、把专用的排前面。
+        <div class="hint">
+          只对<strong>这个代理</strong>的新连接生效，目的端口请留空，无需启用 Dashboard。不同代理要不同力度，就建多条规则、把专用的排前面。
           <br />
           下拉里是<strong>最近出现过</strong>的代理名（来自事件日志，受保留期影响），
           新建的隧道还没人来过时不在里面 —— 直接敲名字回车即可。
@@ -163,16 +156,11 @@
       <el-form-item label="直接拦截">
         <el-switch
           v-model="form.block"
-          :disabled="portsFilled"
           active-text="开启"
           inactive-text="关闭"
           inline-prompt
         />
-        <div v-if="portsFilled" class="hint">
-          带端口条件的规则落在内核层。内核只能丢包，「拒绝」这一步在那里表达不出来 ——
-          需要直接拦截请去掉端口条件。
-        </div>
-        <div v-else-if="form.block" class="alert-note" style="margin-top: 6px; width: 100%">
+        <div v-if="form.block" class="alert-note" style="margin-top: 6px; width: 100%">
           命中即<strong>拒绝这次连接</strong>，同时把来源封进内核防火墙，后续它连别的端口也进不来。
           按全局策略的封禁粒度与阶梯时长执行。与限速、封禁阈值互斥（命中就被拒了，后面那些参数轮不到生效）。
         </div>
@@ -196,16 +184,12 @@
       <el-form-item label="封禁">
         <el-switch
           v-model="banOn"
-          :disabled="portsFilled || form.block"
+          :disabled="form.block"
           active-text="开启"
           inactive-text="关闭"
           inline-prompt
         />
-        <div v-if="portsFilled" class="hint">
-          带端口条件的规则落在内核层。内核只能丢包，超限的包到不了 frps，
-          应用层无从知道它超限，所以内核规则不能封禁 —— 需要封禁请去掉端口条件。
-        </div>
-        <div v-else-if="form.block" class="hint">已开启直接拦截，不再需要封禁阈值。</div>
+        <div v-if="form.block" class="hint">已开启直接拦截，不再需要封禁阈值。</div>
         <div v-else-if="banOn" style="margin-top: 8px; width: 100%">
           <div>
             <span class="field-label">统计窗口</span>
@@ -292,7 +276,6 @@ const steps = ref<Step[]>([])
 const rateOn = ref(false)
 const banOn = ref(false)
 
-const portsFilled = computed(() => String(form.ports ?? '').trim() !== '')
 
 const countryOptions = computed(() => props.countries || [])
 const provinceOptions = computed(() => props.provinces || [])
@@ -393,18 +376,6 @@ watch(rateOn, (on) => {
   if (on && !form.per_sec) form.per_sec = 20
 })
 
-// 填了端口就不能再有封禁：直接把封禁开关关掉并清空，
-// 比留着值让后端报错更清楚 —— 界面上已经用红框说明了原因。
-watch(portsFilled, (filled) => {
-  if (!filled) return
-  banOn.value = false
-  form.window_seconds = 0
-  form.threshold = 0
-  steps.value = []
-  // 代理名同理：内核认不出隧道，留着会被后端直接拒绝。
-  // 清掉比让用户点保存时弹一句看不懂的报错好。
-  form.proxy_name = ''
-})
 
 function confirm() {
   if (problems.value.length) return

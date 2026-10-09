@@ -95,13 +95,13 @@
         </el-form-item>
         <el-form-item label="bindPort">
           <el-input-number v-model="form.frps.bind_port" :min="1" :max="65535" />
-          <span class="unit">frps 的 bindPort，用于下发连接速率限制</span>
+          <span class="unit">frps 的 bindPort，用于登录端口匹配与「仅 frp 端口」封禁</span>
         </el-form-item>
         <el-form-item label="代理端口">
           <el-input v-model="proxyPortsText" placeholder="80,443,20000-30000" />
           <div class="tip">
             逗号分隔，支持区间 <span class="mono">20000-30000</span>。
-            速率限制作用于此，「仅 frp 端口」的黑名单也按它封禁
+            「仅 frp 端口」的黑名单按它封禁；这不是代理名到实际端口的映射
           </div>
         </el-form-item>
         <el-form-item label="可信回源网段">

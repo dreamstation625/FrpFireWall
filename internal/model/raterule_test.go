@@ -15,8 +15,8 @@ func TestRateRuleLayer(t *testing.T) {
 		{"只有省份 → 应用层", RateRule{Provinces: "广东省"}, LayerApp},
 		{"只有地址段 → 应用层", RateRule{CIDRs: "1.2.3.0/24"}, LayerApp},
 		{"地区 + 地址段 → 应用层", RateRule{Countries: "HK", CIDRs: "1.2.3.0/24"}, LayerApp},
-		{"有端口 → 内核层", RateRule{Ports: "20000-30000"}, LayerKernel},
-		{"地址段 + 端口 → 内核层", RateRule{CIDRs: "1.2.3.0/24", Ports: "443"}, LayerKernel},
+		{"有端口 → 端口规则", RateRule{Ports: "20000-30000"}, LayerApp},
+		{"地址段 + 端口 → 端口规则", RateRule{CIDRs: "1.2.3.0/24", Ports: "443"}, LayerApp},
 		{"空白端口不算条件", RateRule{Countries: "HK", Ports: "  "}, LayerApp},
 	}
 	for _, c := range cases {
@@ -33,12 +33,27 @@ func TestRateRuleValidateAccepts(t *testing.T) {
 		name string
 		rule RateRule
 	}{
+
 		{
-			"内核层：只有限速",
+			"地区 + 端口",
+			RateRule{Name: "混搭", Countries: "HK", Ports: "443", PerSec: 1},
+		},
+		{
+			"省份 + 端口",
+			RateRule{Name: "混搭", Provinces: "广东省", Ports: "443", PerSec: 1},
+		},
+		{
+			"端口规则配封禁",
+			RateRule{
+				Name: "内核封禁", Ports: "443", PerSec: 5,
+				WindowSeconds: 60, Threshold: 10, BanDurations: "600",
+			},
+		}, {
+			"端口规则：只有限速",
 			RateRule{Name: "扫描限速", Ports: "20000-30000", PerSec: 5},
 		},
 		{
-			"内核层：带来源段",
+			"端口规则：带来源段",
 			RateRule{Name: "某段限速", CIDRs: "1.2.3.0/24", Ports: "443", PerSec: 20, Burst: 40},
 		},
 		{
@@ -91,33 +106,17 @@ func TestRateRuleValidateRejects(t *testing.T) {
 			RateRule{Name: "空规则", Countries: "  ", CIDRs: "\n", Ports: " "},
 			"没有任何匹配条件",
 		},
+
 		{
-			"地区 + 端口",
-			RateRule{Name: "混搭", Countries: "HK", Ports: "443", PerSec: 1},
-			"无法生效",
-		},
-		{
-			"省份 + 端口",
-			RateRule{Name: "混搭", Provinces: "广东省", Ports: "443", PerSec: 1},
-			"无法生效",
-		},
-		{
-			"内核层缺限速",
+			"端口规则缺限速",
 			RateRule{Name: "内核无限速", Ports: "443"},
-			"每秒连接数上限",
+			"什么都不会发生",
 		},
+
 		{
-			"内核层配封禁",
-			RateRule{
-				Name: "内核封禁", Ports: "443", PerSec: 5,
-				WindowSeconds: 60, Threshold: 10, BanDurations: "600",
-			},
-			"不能配置封禁",
-		},
-		{
-			"内核层只配了半截封禁",
+			"端口规则只配了半截封禁",
 			RateRule{Name: "内核半截", Ports: "443", PerSec: 5, Threshold: 10},
-			"不能配置封禁",
+			"封禁配置不完整",
 		},
 		{
 			"应用层什么都没配",
@@ -410,12 +409,6 @@ func TestRateRuleValidateBlock(t *testing.T) {
 				WindowSeconds: 60, Threshold: 10, BanDurations: "60"},
 			"只保留一个",
 		},
-		{
-			// 端口落内核，内核只能丢包、表达不出"拒绝"这一步
-			"拦截 + 端口",
-			RateRule{Name: "x", Ports: "443", Block: true},
-			"去掉端口条件",
-		},
 	}
 	for _, c := range cases {
 		err := c.rule.Validate()
@@ -463,9 +456,7 @@ func TestRateRuleValidateRejectsEmptyCity(t *testing.T) {
 // 没有地区和网段的写法；不把它算进条件里，这种规则会被"没有任何匹配条件"
 // 那条检查拒掉，功能直接配不出来。
 //
-// 二、**不能与端口共存**。代理名来自 frps 的回调，带端口条件的规则下发到内核，
-// 内核只看源地址与目的端口、认不出隧道 —— 凑在一起代理条件永远判不上，
-// 属于"配了不生效"，必须像"地区 + 端口"那样在保存时挡掉。
+// 二、未接入端口映射时拒绝与目的端口共存，避免永远不命中的组合。
 //
 // 三、**它进封禁来源引用的签名**。改了代理名等于换了一批适用对象，旧的封禁
 // 依据不再成立，由它封的地址要跟着解封。
@@ -477,10 +468,10 @@ func TestRateRuleProxyNameContract(t *testing.T) {
 		t.Fatalf("只有代理名、没有地区/网段的规则应当合法，实际被拒：%v", err)
 	}
 
-	// 二、端口 + 代理必须被拒
+	// 二、本版本未接入端口映射，代理规则的目的端口必须留空。
 	conflict := RateRule{Name: "x", ProxyName: "web-ssh", Ports: "7000", PerSec: 10}
-	if err := conflict.Validate(); err == nil || !strings.Contains(err.Error(), "代理") {
-		t.Errorf("「代理」+「端口」应当被拒绝并说明原因，实际：%v", err)
+	if err := conflict.Validate(); err == nil || !strings.Contains(err.Error(), "目的端口留空") {
+		t.Fatalf("应明确说明代理规则需要目的端口留空: %v", err)
 	}
 
 	// 三、代理名进签名

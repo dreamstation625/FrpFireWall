@@ -1,6 +1,9 @@
 package guard
 
-import "net/netip"
+import (
+	"net/netip"
+	"strings"
+)
 
 var systemProtected = func() []netip.Prefix {
 	var out []netip.Prefix
@@ -52,7 +55,7 @@ func (b *tokenBucket) resetPrefix(p netip.Prefix) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for k := range b.state {
-		if a, err := netip.ParseAddr(k); err == nil && p.Contains(a) {
+		if a, err := netip.ParseAddr(k[strings.LastIndex(k, "|")+1:]); err == nil && p.Contains(a) {
 			delete(b.state, k)
 		}
 	}

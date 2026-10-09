@@ -18,6 +18,10 @@
         <div v-for="(p, i) in guardProblems" :key="i">· {{ p }}</div>
       </div>
 
+      <div v-if="guardWarnings.length" class="alert-note" style="margin-bottom: 12px">
+        <div v-for="(w, i) in guardWarnings" :key="i">{{ w }}</div>
+      </div>
+
       <el-table :data="pagedRules" size="small" border @header-dragend="cw.onDragend">
         <el-table-column label="顺序" v-bind="cw.col('顺序', { width: 60 })" align="center">
           <template #default="{ $index }">
@@ -183,7 +187,7 @@
         <el-form-item label="观察模式">
           <el-switch v-model="form.observe_only" active-text="开启" inactive-text="关闭" inline-prompt />
           <div v-if="form.observe_only" class="alert-note" style="margin-top: 6px; width: 100%">
-            自动策略放行，只记录「本应拦截」，暂停内核限速；人工黑名单与人工封禁继续生效。建议上线初期校准阈值，
+            自动策略放行，只记录「本应拦截」，超限也放行；人工黑名单与人工封禁继续生效。建议上线初期校准阈值，
             确认误封率可接受后再关。
           </div>
           <div v-else class="hint">自动策略只记录并放行，人工黑名单与人工封禁继续生效。</div>
@@ -246,22 +250,19 @@
 
         <el-form-item label="启用速率限制">
           <el-switch v-model="form.rate_limit_enabled" active-text="开启" inactive-text="关闭" inline-prompt />
-          <el-tag v-if="!rateSupported" size="small" type="warning" style="margin-left: 10px">
-            当前防火墙后端不支持，规则不会下发
-          </el-tag>
         </el-form-item>
 
         <template v-if="form.rate_limit_enabled">
           <el-form-item label="单 IP 速率">
             <el-input-number v-model="form.rate_limit_per_sec" :min="1" :max="100000" />
-            <span class="unit">包 / 秒</span>
+            <span class="unit">连接 / 秒</span>
           </el-form-item>
           <el-form-item label="突发容量">
             <el-input-number v-model="form.rate_limit_burst" :min="1" :max="100000" />
-            <span class="unit">包</span>
+            <span class="unit">连接</span>
             <div class="hint">
-              允许短暂突发不被丢弃，一般设为速率的 2 倍。由系统防火墙在网络层执行，
-              只作用于受保护的 frp 端口。它是<strong>兜底</strong>：上面细分规则里的限速会先匹配、先生效。
+              允许短暂突发，一般设为速率的 2 倍。在 frps 插件应用层执行，
+              统计登录尝试与支持回调的代理新连接，限速拒绝也计入封禁窗口。它是<strong>兜底</strong>：上面细分规则里的限速会先匹配、先生效。
             </div>
           </el-form-item>
         </template>
@@ -329,7 +330,6 @@ const provinces = ref<any[]>([])
 // 最近出现过的代理名，给规则编辑器的「代理」一栏做候选。
 const proxyNames = ref<string[]>([])
 const countryAvailable = ref(false)
-const capability = ref<any>({})
 
 // ---- 细分规则 ----
 
@@ -366,11 +366,11 @@ function clampRulePage() {
   if (rPage.value > last) rPage.value = last
 }
 const guardProblems = ref<string[]>([])
+const guardWarnings = ref<string[]>([])
 const ruleDialogVisible = ref(false)
 const editingIndex = ref(-1)
 const editingRule = ref<RateRule | null>(null)
 
-const rateSupported = computed(() => capability.value?.rate_limit !== false)
 
 const countriesGrouped = computed(() => countries.value)
 
@@ -380,7 +380,7 @@ const countryLabel = (code: string) => {
 }
 
 // 落点优先用后端算的那份（保存过的规则都带），没保存过的新行本地推一遍。
-// 两边推的是同一条规则（有端口落内核），所以不会出现两种答案。
+// 两边均使用应用层判定，所以不会出现两种答案。
 const rowLayer = (row: RateRule): Layer => row.layer || layerOf(row)
 
 /**
@@ -491,7 +491,7 @@ async function loadRuleMeta() {
   ])
   rules.value = (r?.rules || []) as RateRule[]
   guardProblems.value = info?.guard?.rule_problems || []
-  capability.value = info?.capability || {}
+  guardWarnings.value = info?.guard?.rule_warnings || []
   proxyNames.value = (pn?.items || []) as string[]
 }
 

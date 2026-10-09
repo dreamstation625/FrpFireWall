@@ -227,7 +227,7 @@ func TestDesiredFrpScopeWithoutProtectPortsDegradesToAll(t *testing.T) {
 	}
 }
 
-// 代理端口热更后，受保护端口、frp 分组的 Key、全局限速的兜底端口必须同时跟着变。
+// 代理端口热更后，受保护端口与 frp 分组的 Key 必须同时改变。
 //
 // 三处漏一处就是"改了等于没改"，而且漏哪一处都不报错：
 // 端口分组还挂在旧端口上，封禁会照旧生效在已经被改掉的端口上。
@@ -268,12 +268,8 @@ func TestSetFrpsProxyPortsHotUpdate(t *testing.T) {
 		t.Errorf("frp 分组的端口 = %q", got)
 	}
 
-	last := des.RateLimits[len(des.RateLimits)-1]
-	if last.Key != globalRateKey {
-		t.Fatalf("最后一条应当是全局限速兜底，实际 Key=%q", last.Key)
-	}
-	if last.Ports.String() != "7000,9100,9200" {
-		t.Errorf("全局限速兜底的端口 = %q，期望跟着热更一起变", last.Ports.String())
+	if len(des.RateLimits) != 0 {
+		t.Fatal("端口热更不应产生内核限速")
 	}
 }
 

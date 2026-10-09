@@ -56,7 +56,7 @@ func TestNormalizeRateRules(t *testing.T) {
 	t.Run("错误信息要指出是第几条", func(t *testing.T) {
 		in := []rateRuleInput{
 			{Name: "好的", Countries: "HK", PerSec: 5},
-			{Name: "坏的", Countries: "HK", Ports: "443", PerSec: 5}, // 地区 + 端口
+			{Name: "坏的", Countries: "HK", Ports: "70000", PerSec: 5}, // 地区 + 端口
 		}
 		_, err := normalizeRateRules(in)
 		if err == nil {
@@ -65,7 +65,7 @@ func TestNormalizeRateRules(t *testing.T) {
 		if !strings.HasPrefix(err.Error(), "第 2 条规则：") {
 			t.Errorf("错误信息应当以「第 2 条规则：」开头，实际 %q", err.Error())
 		}
-		if !strings.Contains(err.Error(), "无法生效") {
+		if !strings.Contains(err.Error(), "无法识别") {
 			t.Errorf("应当说明为什么不能生效，实际 %q", err.Error())
 		}
 	})
@@ -250,8 +250,8 @@ func TestPolicyRequestDistinguishesAbsentAndEmptyRules(t *testing.T) {
 // 落点由端口条件推出，且只有这一处实现。
 func TestRateRuleViewExposesLayer(t *testing.T) {
 	kernel := newRateRuleView(model.RateRule{Name: "端口", Ports: "443", PerSec: 5})
-	if kernel.Layer != model.LayerKernel {
-		t.Errorf("带端口的规则应当标成内核层，实际 %q", kernel.Layer)
+	if kernel.Layer != model.LayerApp {
+		t.Errorf("带端口的规则应当标成应用层，实际 %q", kernel.Layer)
 	}
 	app := newRateRuleView(model.RateRule{Name: "地区", Countries: "HK", PerSec: 5})
 	if app.Layer != model.LayerApp {

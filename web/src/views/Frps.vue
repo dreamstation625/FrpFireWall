@@ -72,9 +72,9 @@
 
       <div class="hint" style="margin-top: 10px">
         插件只监听回环地址，frps 必须与本程序同机。
-        防火墙规则只针对上面这个受保护端口集合下发：<span class="mono">bind_port</span> 与
-        <span class="mono">proxy_ports</span> 的并集。「仅 frp 端口」的封禁范围、
-        以及全局限速的兜底规则，用的都是它。
+        「仅 frp 端口」封禁针对上面这个端口集合下发：<span class="mono">bind_port</span> 与
+        <span class="mono">proxy_ports</span> 的并集。全端口和自定义端口封禁仍按各自范围执行。
+        频控在应用层统计新连接，请按代理名配置并将目的端口留空，无需 Dashboard。目的端口条件仅用于登录阶段。
       </div>
     </div>
 

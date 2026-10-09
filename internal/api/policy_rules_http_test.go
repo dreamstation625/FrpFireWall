@@ -272,8 +272,8 @@ func TestSavePolicyWithRulesEndToEnd(t *testing.T) {
 		t.Errorf("顺序被改动了：%v / %v", first["name"], second["name"])
 	}
 	// 落点是算出来一起返回的，界面直接显示
-	if first["layer"] != model.LayerKernel {
-		t.Errorf("带端口的规则应当标成内核层，实际 %v", first["layer"])
+	if first["layer"] != model.LayerApp {
+		t.Errorf("带端口的规则应当标成应用层，实际 %v", first["layer"])
 	}
 	if second["layer"] != model.LayerApp {
 		t.Errorf("不带端口的规则应当标成应用层，实际 %v", second["layer"])
@@ -291,12 +291,12 @@ func TestSavePolicyWithRulesEndToEnd(t *testing.T) {
 
 	// 最关键的一步：规则要真的进到判定引擎里，而不只是躺在数据库里。
 	// 只断言接口回显的话，Refresh / 编译整段挂掉也照样"通过"。
-	if n := h.srv.guard.AppRuleCount(); n != 1 {
-		t.Errorf("应用层规则应当有 1 条生效，实际 %d 条", n)
+	if n := h.srv.guard.AppRuleCount(); n != 2 {
+		t.Errorf("应用层规则应当有 2 条生效，实际 %d 条", n)
 	}
 	st := h.srv.guard.Stats()
-	if st.KernelRuleCount < 1 {
-		t.Errorf("内核层应当至少有细分那条，实际 %d 条", st.KernelRuleCount)
+	if st.KernelRuleCount != 0 {
+		t.Errorf("应用层限速不应产生内核规则，实际 %d 条", st.KernelRuleCount)
 	}
 	if len(st.RuleProblems) != 0 {
 		t.Errorf("不该有编译不过的规则：%v", st.RuleProblems)
@@ -348,7 +348,7 @@ func TestSavePolicyRejectsAndLeavesNoPartialState(t *testing.T) {
 	beforeThreshold := base["threshold"]
 
 	body := withRules(base, []map[string]any{
-		{"name": "混搭", "countries": "HK", "ports": "443", "per_sec": 5},
+		{"name": "混搭", "countries": "HK", "ports": "70000", "per_sec": 5},
 	})
 	body["threshold"] = 7777 // 故意改一个字段，验证它不会被写进去
 
@@ -356,7 +356,7 @@ func TestSavePolicyRejectsAndLeavesNoPartialState(t *testing.T) {
 	if code != http.StatusBadRequest {
 		t.Fatalf("应当返回 400，实际 %d（%s）", code, r.Error)
 	}
-	if !strings.Contains(r.Error, "无法生效") {
+	if !strings.Contains(r.Error, "无法识别") {
 		t.Errorf("错误信息应当说明为什么不能生效，实际 %q", r.Error)
 	}
 
@@ -369,8 +369,7 @@ func TestSavePolicyRejectsAndLeavesNoPartialState(t *testing.T) {
 	}
 }
 
-// 内核层规则不能配封禁：超限的包在内核就被丢了，到不了 frps。
-func TestSavePolicyRejectsBanOnKernelRule(t *testing.T) {
+func TestSavePolicyAcceptsBanOnPortRule(t *testing.T) {
 	h := newHarness(t)
 
 	body := withRules(h.policyBody(), []map[string]any{
@@ -379,11 +378,8 @@ func TestSavePolicyRejectsBanOnKernelRule(t *testing.T) {
 	})
 
 	code, r := h.call(http.MethodPut, "/api/v1/policy", body)
-	if code != http.StatusBadRequest {
-		t.Fatalf("应当返回 400，实际 %d（%s）", code, r.Error)
-	}
-	if !strings.Contains(r.Error, "不能配置封禁") {
-		t.Errorf("错误信息应当说明内核层不能封禁，实际 %q", r.Error)
+	if code != http.StatusOK {
+		t.Fatalf("端口规则应支持阈值封禁: %d %s", code, r.Error)
 	}
 }
 
@@ -438,7 +434,7 @@ func TestRateRuleProxyNameRoundTrip(t *testing.T) {
 // 代理 + 端口必须被拒：带端口条件的规则下发到内核，那里认不出 frp 的隧道名。
 // 与"地区 + 端口"是同一类冲突，只是方向不同 —— 漏掉这一半，用户配出来的规则
 // 会静默少生效一半。
-func TestRateRuleRejectsProxyWithPorts(t *testing.T) {
+func TestRateRuleRejectsProxyWithPortsWithoutMapping(t *testing.T) {
 	h := newHarness(t)
 
 	code, r := h.call(http.MethodPut, "/api/v1/policy", withRules(h.policyBody(), []map[string]any{{
@@ -448,12 +444,10 @@ func TestRateRuleRejectsProxyWithPorts(t *testing.T) {
 		"ports":      "7000",
 		"per_sec":    10,
 	}}))
-	if code == http.StatusOK {
-		t.Fatal("「代理」+「端口」应当被拒绝，接口却返回了 200")
+	if code != http.StatusBadRequest || !strings.Contains(r.Error, "目的端口留空") {
+		t.Fatalf("没有映射时需明确拒绝组合: %d %s", code, r.Error)
 	}
-	if !strings.Contains(r.Error, "代理") {
-		t.Errorf("报错里应当指出是「代理」与「端口」冲突，实际：%s", r.Error)
-	}
+
 }
 
 // /events/proxy-names 给规则编辑器提供候选。

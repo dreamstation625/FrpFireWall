@@ -78,7 +78,7 @@
 
 ```bash
 # 示例版本；按实际发布计划修改
-FW_VERSION=0.0.2-pre.01
+FW_VERSION=0.0.3-pre.01
 bash scripts/version-bump.sh "$FW_VERSION"
 git diff -- VERSION internal/version/version.go web/package.json web/package-lock.json
 ```
@@ -87,7 +87,7 @@ git diff -- VERSION internal/version/version.go web/package.json web/package-loc
 
 ```bash
 git add VERSION internal/version/version.go web/package.json web/package-lock.json
-git commit -m "[更新] 版本升至 $FW_VERSION"
+git commit -m "chore: 版本升至 $FW_VERSION"
 git push origin main
 ```
 

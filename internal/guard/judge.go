@@ -18,7 +18,7 @@ import (
 // Login 回调不带 proxy_name —— frps 在建立隧道之前调它，那时候还不知道
 // 要连哪个代理。第三个参数因此恒为空，事件里的 proxy_name 也为空。
 func (m *Manager) JudgeLogin(addr netip.Addr, user, _ string) Verdict {
-	return m.judge(addr, user, model.EvtLoginAttempt, "login", "")
+	return m.judge(addr, user, model.EvtLoginAttempt, "login", "", m.cfg.Frps.BindPort)
 }
 
 // JudgeUserConn 处理 frps 的 NewUserConn 插件回调。
@@ -58,7 +58,11 @@ func (m *Manager) banGeoBlackHit(
 // proxy 是 frps 回调带过来的代理名（连的是哪个隧道）。Login 回调没有它，只有
 // NewUserConn 有。它单独占一列而不是塞进 detail —— 塞进 detail 里既搜不准
 // 也没法排序，而"哪个代理在被撞"恰恰是最常问的那个问题。
-func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdict {
+func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string, destination ...int) Verdict {
+	port := 0
+	if len(destination) > 0 {
+		port = destination[0]
+	}
 	if !addr.IsValid() {
 		return Verdict{Allow: true, Reason: "invalid-address"}
 	}
@@ -78,6 +82,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 
 	m.mu.RLock()
 	policy := m.policy
+	globalBucket := m.globalBucket
 	isWhite := m.matchAnyLocked(m.white, addr)
 	isBlack := m.matchAnyBlockLocked(m.black, addr)
 	geoWhiteHit := m.matchGeoLocked(m.geoWhite, geoInfo)
@@ -219,7 +224,7 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 	// 代理名参与匹配：规则可以只针对某个隧道生效（不同代理不同力度）。
 	// Login 回调传进来的是空串，所以带代理条件的规则在登录阶段不命中 ——
 	// 那一刻隧道还没建立，没有这个信息可用。
-	rule := m.matchAppRule(addr, geoInfo, proxy)
+	rule := m.matchAppRule(addr, geoInfo, proxy, port)
 
 	// 6b. 命中即拦截：条件对上就直接拒绝，不计数、不限速。
 	//
@@ -246,6 +251,9 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 	if rule != nil {
 		tag, win, threshold, steps = rule.tag(), rule.window, rule.threshold, rule.steps
 		who = "规则「" + rule.name + "」："
+		if len(rule.ports) > 0 {
+			tag += "@" + fmt.Sprint(port)
+		}
 	} else {
 		win = time.Duration(policy.WindowSeconds) * time.Second
 		threshold = policy.Threshold
@@ -264,15 +272,10 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 		hits = m.countWindow(tag, ip, now, win)
 	}
 
-	// 9. 应用层限速。
-	//
-	//    全局的限速不在这里做：它按端口分流，而插件回调拿不到被访问的端口，
-	//    只能落在内核（见 DESIGN D16）。这里只做细分规则自己那份 ——
-	//    细分规则的条件是属地与网段，内核表达不出来。
-
+	// 先判封禁阈值，再判应用层令牌桶；拒绝的尝试也进入窗口。
 	// 10. 阈值判定
 	if threshold > 0 && hits >= threshold {
-		detail := fmt.Sprintf("%s%d 秒内登录尝试 %d 次，超过阈值 %d 次",
+		detail := fmt.Sprintf("%s%d 秒内连接尝试 %d 次，超过阈值 %d 次",
 			who, int(win.Seconds()), hits, threshold)
 
 		if !policy.AutoBanEnabled {
@@ -282,7 +285,11 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 				Detail: detail + "（自动封禁已关闭，仅记录）",
 			})
 		} else {
-			m.triggerBan(addr, model.SourceAuto, detail, user, proxy, geoInfo, steps, "")
+			ref := ""
+			if rule != nil {
+				ref = rule.ref
+			}
+			m.triggerBan(addr, model.SourceAuto, detail, user, proxy, geoInfo, steps, ref)
 			m.pushEvent(&model.Event{
 				Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
 				Country: geoInfo.Country, Province: geoInfo.Province,
@@ -292,8 +299,15 @@ func (m *Manager) judge(addr netip.Addr, user, category, op, proxy string) Verdi
 		}
 	}
 
-	if rule != nil && rule.perSec > 0 && !rule.bucket.allow(ip, now) {
-		detail := fmt.Sprintf("规则「%s」：单个来源 IP 每秒最多 %d 个连接，已超限", rule.name, rule.perSec)
+	bucket, rate, label, key := globalBucket, policy.RateLimitPerSec, "全局规则", ip
+	if rule != nil {
+		bucket, rate, label = rule.bucket, rule.perSec, "规则「"+rule.name+"」"
+		if len(rule.ports) > 0 {
+			key = fmt.Sprint(port) + "|" + ip
+		}
+	}
+	if bucket != nil && !bucket.allow(key, now) {
+		detail := fmt.Sprintf("%s：单个来源 IP 每秒最多 %d 个连接，已超限", label, rate)
 		m.pushEvent(&model.Event{
 			Category: autoCategory, IP: ip, User: user, ProxyName: proxy, Op: op,
 			Country: geoInfo.Country, Province: geoInfo.Province,

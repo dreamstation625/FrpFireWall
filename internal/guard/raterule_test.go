@@ -11,15 +11,14 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/config"
 	"github.com/dreamstation625/FrpFireWall/internal/geoip"
 	"github.com/dreamstation625/FrpFireWall/internal/model"
-	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 	"github.com/dreamstation625/FrpFireWall/internal/store"
 )
 
 // ---------- 编译 ----------
 
-// 落点由"有没有端口条件"决定，不是由"有没有地区条件"决定。
+// 端口、来源和地区规则都应进入应用层，不提前写入内核。
 // 这条错了的表现是：规则看着配好了，实际落在一层里什么都不做。
-func TestCompileRulesSplitsByLayer(t *testing.T) {
+func TestCompileRulesAllInApplication(t *testing.T) {
 	rows := []model.RateRule{
 		{ID: 1, Name: "香港限速", Enabled: true, Countries: "HK", PerSec: 5},
 		{ID: 2, Name: "某段限速", Enabled: true, CIDRs: "203.0.113.0/24", PerSec: 5},
@@ -27,21 +26,18 @@ func TestCompileRulesSplitsByLayer(t *testing.T) {
 		{ID: 4, Name: "停用的", Enabled: false, Countries: "US", PerSec: 5},
 	}
 
-	app, kernel, skipped := compileRules(rows)
+	app, skipped := compileRules(rows)
 	if len(skipped) != 0 {
 		t.Fatalf("不该有跳过项：%v", skipped)
 	}
-	if len(app) != 2 {
-		t.Fatalf("应用层应有 2 条（地区、网段），实际 %d 条", len(app))
-	}
-	if len(kernel) != 1 {
-		t.Fatalf("内核层应有 1 条（带端口），实际 %d 条", len(kernel))
+	if len(app) != 3 {
+		t.Fatalf("应用层应有 3 条（地区、网段），实际 %d 条", len(app))
 	}
 	if app[0].name != "香港限速" || app[1].name != "某段限速" {
 		t.Errorf("应用层顺序被改动了：%v", []string{app[0].name, app[1].name})
 	}
-	if kernel[0].name != "扫描限速" {
-		t.Errorf("内核层规则不对：%q", kernel[0].name)
+	if app[2].name != "扫描限速" {
+		t.Fatal("端口规则丢失")
 	}
 }
 
@@ -50,22 +46,19 @@ func TestCompileRulesSplitsByLayer(t *testing.T) {
 func TestCompileRulesSkipsBadRowsWithoutFailing(t *testing.T) {
 	rows := []model.RateRule{
 		{ID: 1, Name: "好的", Enabled: true, Countries: "HK", PerSec: 5},
-		{ID: 2, Name: "混搭", Enabled: true, Countries: "HK", Ports: "443", PerSec: 5}, // 地区 + 端口
+		{ID: 2, Name: "混搭", Enabled: true, Countries: "HK", Ports: "443", PerSec: -1}, // 非法负速率
 		{ID: 3, Name: "坏端口", Enabled: true, Ports: "70000", PerSec: 5},
 		{ID: 4, Name: "没有条件", Enabled: true, PerSec: 5},
 	}
 
-	app, kernel, skipped := compileRules(rows)
+	app, skipped := compileRules(rows)
 	if len(app) != 1 || app[0].name != "好的" {
 		t.Fatalf("应当只剩「好的」这一条应用层规则，实际 %v", app)
-	}
-	if len(kernel) != 0 {
-		t.Fatalf("不该有内核层规则，实际 %v", kernel)
 	}
 	if len(skipped) != 3 {
 		t.Fatalf("应当有 3 条被跳过并给出原因，实际 %d 条：%v", len(skipped), skipped)
 	}
-	for i, want := range []string{"无法生效", "无法识别", "没有任何匹配条件"} {
+	for i, want := range []string{"不能为负数", "无法识别", "没有任何匹配条件"} {
 		if !strings.Contains(skipped[i], want) {
 			t.Errorf("第 %d 条原因里没有 %q：%s", i+1, want, skipped[i])
 		}
@@ -82,7 +75,7 @@ func TestCompileRulesCarriesActions(t *testing.T) {
 		},
 		{ID: 8, Name: "只限速", Enabled: true, Countries: "US", PerSec: 3},
 	}
-	app, _, _ := compileRules(rows)
+	app, _ := compileRules(rows)
 	if len(app) != 2 {
 		t.Fatalf("应有 2 条，实际 %d 条", len(app))
 	}
@@ -117,7 +110,7 @@ func TestCompileRulesRejectsGarbageLadder(t *testing.T) {
 		ID: 1, Name: "空阶梯", Enabled: true, Countries: "HK",
 		PerSec: 5, WindowSeconds: 30, Threshold: 3, BanDurations: " , ",
 	}}
-	app, _, skipped := compileRules(rows)
+	app, skipped := compileRules(rows)
 	if len(app) != 0 {
 		t.Fatalf("阶梯填不出数字就不该编译出规则，实际 %+v", app)
 	}
@@ -550,9 +543,8 @@ func TestJudgeRuleScopedToItsCIDR(t *testing.T) {
 	}
 }
 
-// 内核限速规则的顺序：细分规则在前，全局兜底在最后。
-// 反过来的话，全局那条会先把所有连接吃掉，细分规则永远轮不到。
-func TestDesiredRateLimitsOrder(t *testing.T) {
+// 全局与细分限速都在应用层执行，不生成内核限速期望。
+func TestDesiredDoesNotPreinstallRateLimits(t *testing.T) {
 	m := newTestManager(t)
 	setPolicy(t, m, func(p *model.Policy) {
 		p.RateLimitEnabled = true
@@ -570,31 +562,15 @@ func TestDesiredRateLimitsOrder(t *testing.T) {
 	}
 
 	des := m.desired()
-	if len(des.RateLimits) != 3 {
-		t.Fatalf("应有 2 条细分 + 1 条全局 = 3 条，实际 %d 条", len(des.RateLimits))
+	if len(des.RateLimits) != 0 {
+		t.Fatal("细分和全局限速必须在应用层，不能预写内核")
 	}
-	if des.RateLimits[0].Name != "第一条" || des.RateLimits[1].Name != "第二条" {
-		t.Errorf("细分规则的顺序被改动了：%+v", des.RateLimits)
-	}
-	last := des.RateLimits[2]
-	if last.Key != globalRateKey {
-		t.Errorf("最后一条应当是全局兜底，实际 Key=%q", last.Key)
-	}
-	if last.PerSec != 20 || last.Burst != 40 {
-		t.Errorf("全局兜底参数不对：%+v", last)
-	}
-	// 全局兜底作用在受保护端口上（bind_port 7000 + proxy_ports 80,443）。
-	if got := last.Ports.String(); got != "80,443,7000" {
-		t.Errorf("全局兜底的端口应为受保护端口，实际 %q", got)
-	}
-
-	// 细分那条带网段的规则要把网段带上，否则会变成"全网限速"。
-	if len(des.RateLimits[1].Sources) != 1 || des.RateLimits[1].Sources[0] != "203.0.113.0/24" {
-		t.Errorf("来源段没带上：%+v", des.RateLimits[1].Sources)
+	if m.AppRuleCount() != 2 {
+		t.Fatal("两条端口规则均需进入应用层")
 	}
 }
 
-// 关掉全局限速后就不该再产生全局兜底那条 —— 否则"关掉了还在限"比不关更糟。
+// 关掉全局限速后仍保留应用层细分规则。
 func TestDesiredRateLimitsGlobalOff(t *testing.T) {
 	m := newTestManager(t)
 	setPolicy(t, m, func(p *model.Policy) { p.RateLimitEnabled = false })
@@ -609,8 +585,8 @@ func TestDesiredRateLimitsGlobalOff(t *testing.T) {
 	}
 
 	des := m.desired()
-	if len(des.RateLimits) != 1 || des.RateLimits[0].Name != "细分" {
-		t.Fatalf("全局关掉后应当只剩细分那条，实际 %+v", des.RateLimits)
+	if len(des.RateLimits) != 0 || m.AppRuleCount() != 1 {
+		t.Fatal("全局关闭不影响应用层细分规则")
 	}
 }
 
@@ -661,41 +637,20 @@ func TestUnbanClearsAllRuleWindows(t *testing.T) {
 	}
 }
 
-// 端口条件与地区条件不可能同时生效，编译时也不能偷偷只留一边。
-func TestCompileRulesRejectsMixedConditions(t *testing.T) {
+// 端口与地区组合时，编译应完整保留各个条件。
+func TestCompileRulesAcceptsMixedConditions(t *testing.T) {
 	rows := []model.RateRule{{
 		ID: 1, Name: "混搭", Enabled: true,
 		Countries: "HK", Ports: "20000-30000", PerSec: 5,
 	}}
-	app, kernel, skipped := compileRules(rows)
-	if len(app) != 0 || len(kernel) != 0 {
-		t.Fatalf("混搭条件不该落到任何一层：app=%v kernel=%v", app, kernel)
+	app, skipped := compileRules(rows)
+	if len(app) != 1 {
+		t.Fatalf("混搭条件应全部在应用层匹配：app=%v", app)
 	}
-	if len(skipped) != 1 || !strings.Contains(skipped[0], "无法生效") {
+	if len(skipped) != 0 {
 		t.Fatalf("应当给出明确原因，实际 %v", skipped)
 	}
 }
-
-// 内核规则的 Key 由 ID 派生，必须稳定且互不相同。
-func TestRuleKeyStability(t *testing.T) {
-	if ruleKey(1) != ruleKey(1) {
-		t.Error("同一个 ID 应派生出同一个 Key")
-	}
-	seen := map[string]uint{}
-	for id := uint(1); id <= 200; id++ {
-		k := ruleKey(id)
-		if prev, dup := seen[k]; dup {
-			t.Fatalf("ID %d 与 %d 撞成同一个 Key %q", id, prev, k)
-		}
-		seen[k] = id
-	}
-	if ruleKey(1) == globalRateKey {
-		t.Error("细分规则的 Key 不能和全局兜底撞")
-	}
-}
-
-// 确保 portrange 被用到（受保护端口的合并结果），避免测试文件出现无用的 import。
-var _ = portrange.Ports
 
 // 不同代理不同力度：一条只对 web-ssh 生效的规则，端到端走一遍判定。
 //

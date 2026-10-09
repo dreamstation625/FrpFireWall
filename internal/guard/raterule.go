@@ -13,20 +13,14 @@ import (
 	"github.com/dreamstation625/FrpFireWall/internal/portrange"
 )
 
-// globalRateKey 是全局兜底规则在内核对象名里的 Key。
-//
-// 用固定字符串而不是"某条规则的 ID"：全局规则不来自 rate_rules 表，
-// 它的对象名必须在重启、改配置、换规则之后都保持不变，否则每次同步都会
-// 新建一个内核对象、再删掉旧的。
-const globalRateKey = "global"
-
 // appRule 是一条细分规则在运行时的形态（落点在应用层）。
 //
 // 条件在编译期就解析成 map 与前缀切片，判定时只做比较 —— 判定跑在 frps 插件
 // 回调的关键路径上（硬超时 100ms），每个连接现 parse 一遍字符串是不合适的。
 type appRule struct {
-	id   uint
-	name string
+	ports portrange.Set
+	id    uint
+	name  string
 
 	countries map[string]bool
 	provinces map[string]bool
@@ -71,7 +65,14 @@ func (r *appRule) tag() string { return "r" + strconv.FormatUint(uint64(r.id), 1
 // proxy 是调用方报上来的代理名（Login 回调没有，传空串）。规则指定过代理名
 // 就必须相等才算命中，所以**登录阶段的连接永远匹配不上带代理条件的规则** ——
 // 那一刻隧道还没建立，没有这个信息，留空比拿别的维度凑合诚实。
-func (r *appRule) match(addr netip.Addr, geo *geoip.Info, proxy string) bool {
+func (r *appRule) match(addr netip.Addr, geo *geoip.Info, proxy string, destination ...int) bool {
+	port := 0
+	if len(destination) > 0 {
+		port = destination[0]
+	}
+	if len(r.ports) > 0 && (port == 0 || !r.ports.Contains(port)) {
+		return false
+	}
 	if r.proxy != "" && r.proxy != proxy {
 		return false
 	}
@@ -111,32 +112,13 @@ func (r *appRule) match(addr netip.Addr, geo *geoip.Info, proxy string) bool {
 	return true
 }
 
-// kernelRule 是一条细分规则在内核侧的形态（落点在内核）。
-//
-// 内核只有丢包一种动作，所以这里没有窗口/阈值/阶梯。
-type kernelRule struct {
-	key    string
-	name   string
-	srcs   []string
-	ports  portrange.Set
-	perSec int
-	burst  int
-}
-
-// ruleKey 派生一条规则的内核对象 Key。
-//
-// 内含 ID，所以规则被删掉重建之后对象名会变 —— 这是可以接受的：
-// 内核对象每次同步都整体重建，旧的会被清理掉（见 nftables 的 pruneRateSets）。
-func ruleKey(id uint) string { return "r" + strconv.FormatUint(uint64(id), 36) }
-
 // compileRules 把库里的规则编译成运行时结构，顺序保持不变（库按 priority 返回）。
 //
 // 编译不过的规则**逐条跳过**并给出原因，不让一条坏规则把整个引擎带下水：
 // 规则是存在数据库里的，手工改库、降级回老版本、改过 geoip 库之后都可能出现
 // 编译不过的行，而那时候引擎必须还能起来。
-func compileRules(rows []model.RateRule) (app []appRule, kernel []kernelRule, skipped []string) {
+func compileRules(rows []model.RateRule) (app []appRule, skipped []string) {
 	app = make([]appRule, 0, len(rows))
-	kernel = make([]kernelRule, 0, len(rows))
 	skipped = make([]string, 0)
 
 	for i := range rows {
@@ -160,22 +142,6 @@ func compileRules(rows []model.RateRule) (app []appRule, kernel []kernelRule, sk
 			continue
 		}
 
-		if len(ports) > 0 {
-			srcs := make([]string, 0, len(prefixes))
-			for _, p := range prefixes {
-				srcs = append(srcs, p.String())
-			}
-			kernel = append(kernel, kernelRule{
-				key:    ruleKey(row.ID),
-				name:   row.Name,
-				srcs:   srcs,
-				ports:  ports,
-				perSec: row.PerSec,
-				burst:  row.Burst,
-			})
-			continue
-		}
-
 		a := appRule{
 			id:        row.ID,
 			name:      row.Name,
@@ -183,6 +149,7 @@ func compileRules(rows []model.RateRule) (app []appRule, kernel []kernelRule, sk
 			provinces: stringSet(row.ProvinceList()),
 			cities:    stringSet(row.CityList()),
 			prefixes:  prefixes,
+			ports:     ports,
 			proxy:     row.ProxyName,
 			block:     row.Block,
 			ref:       row.BanRef(),
@@ -207,7 +174,7 @@ func compileRules(rows []model.RateRule) (app []appRule, kernel []kernelRule, sk
 		}
 		app = append(app, a)
 	}
-	return app, kernel, skipped
+	return app, skipped
 }
 
 func stringSet(in []string) map[string]bool {
@@ -221,53 +188,28 @@ func stringSet(in []string) map[string]bool {
 	return out
 }
 
-// rateLimitsLocked 编译出本次要下发的内核限速规则。调用方需持有读锁。
-//
-// **顺序**：细分规则在前，全局兜底在最后。内核规则是"先匹配先生效"
-// （iptables 是链上顺序，nft 是插入链首），顺序反了细分规则就永远轮不到。
+// rateLimitsLocked 返回空集合，以全量同步回收旧版受管内核限速对象。
 func (m *Manager) rateLimitsLocked() []firewall.RateLimitRule {
-	if m.policy != nil && m.policy.ObserveOnly {
-		return nil
-	}
-	out := make([]firewall.RateLimitRule, 0, len(m.kernelRules)+1)
-	for _, r := range m.kernelRules {
-		out = append(out, firewall.RateLimitRule{
-			Key:     r.key,
-			Name:    r.name,
-			Sources: r.srcs,
-			Ports:   r.ports,
-			PerSec:  r.perSec,
-			Burst:   r.burst,
-		})
-	}
-	if m.policy != nil && m.policy.RateLimitEnabled && m.policy.RateLimitPerSec > 0 {
-		out = append(out, firewall.RateLimitRule{
-			Key:    globalRateKey,
-			Name:   "全局兜底",
-			Ports:  m.protectPortsLocked(),
-			PerSec: m.policy.RateLimitPerSec,
-			Burst:  m.policy.RateLimitBurst,
-		})
-	}
-	return out
+	// 空集合会在下一次全量同步中清除旧版受管内核限速规则。
+	return nil
 }
 
 // matchAppRule 按优先级找第一条命中的应用层规则，没有则返回 nil。
 //
 // 返回的指针指向上一次 Refresh 装进来的那份切片。Refresh 是整体换切片
 // （不是原地改），所以这里即使在锁外继续用也是安全的：旧切片不会被改写。
-func (m *Manager) matchAppRule(addr netip.Addr, geo *geoip.Info, proxy string) *appRule {
+func (m *Manager) matchAppRule(addr netip.Addr, geo *geoip.Info, proxy string, destination ...int) *appRule {
 	m.mu.RLock()
 	rules := m.appRules
 	m.mu.RUnlock()
-	return pickAppRule(rules, addr, geo, proxy)
+	return pickAppRule(rules, addr, geo, proxy, destination...)
 }
 
 // pickAppRule 从一串规则里取第一条命中的。抽成自由函数是为了让
 // IP 查询工具能复用同一套判定，而不是另写一份"看起来一样"的匹配逻辑。
-func pickAppRule(rules []appRule, addr netip.Addr, geo *geoip.Info, proxy string) *appRule {
+func pickAppRule(rules []appRule, addr netip.Addr, geo *geoip.Info, proxy string, destination ...int) *appRule {
 	for i := range rules {
-		if rules[i].match(addr, geo, proxy) {
+		if rules[i].match(addr, geo, proxy, destination...) {
 			return &rules[i]
 		}
 	}
@@ -283,12 +225,7 @@ func (m *Manager) AppRuleCount() int {
 
 // ---------- 应用层令牌桶 ----------
 
-// tokenBucket 是按来源 IP 计数的令牌桶。
-//
-// 为什么应用层也要一个：内核与应用的匹配维度不同 —— 内核按端口分流，
-// 应用层按属地与网段分流。一条"某地区访客限速"的规则在内核里表达不出来
-// （插件回调拿不到被访问的端口，内核也拿不到属地，见 DESIGN D16），
-// 所以规则落在哪一层，限速就在哪一层做，两边的桶互不影响。
+// tokenBucket 按来源计数；端口规则使用目的端口 + 来源 IP 作为 key。
 type tokenBucket struct {
 	rate  float64
 	burst float64
@@ -303,15 +240,19 @@ type bucketState struct {
 }
 
 func newTokenBucket(perSec, burst int) *tokenBucket {
-	b := burst
-	if b <= 0 {
-		b = perSec * 2
-	}
+	b := effectiveBurst(perSec, burst)
 	return &tokenBucket{
 		rate:  float64(perSec),
 		burst: float64(b),
 		state: make(map[string]*bucketState),
 	}
+}
+
+func effectiveBurst(perSec, burst int) int {
+	if burst > 0 {
+		return burst
+	}
+	return perSec * 2
 }
 
 // allow 判断这次连接是否放行，并扣掉一个令牌。

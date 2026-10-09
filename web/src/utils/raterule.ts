@@ -1,8 +1,4 @@
-// 细分频控规则的展示口径。
-//
-// 表格里的"条件"列和编辑弹窗里的落点提示都从这里取，落点判断尤其不能各写一份：
-// 一处按"有没有端口"算、另一处按"有没有地区"算的话，界面会显示落在内核层、
-// 而实际规则落在应用层 —— 用户按界面上的提示去理解行为，就会得出错误结论。
+// 细分频控规则统一在应用层匹配。
 
 /** 后端返回的一条细分规则 */
 export interface RateRule {
@@ -72,21 +68,10 @@ export const hasGeo = (r: RateRule) =>
 export const hasBan = (r: RateRule) =>
   r.window_seconds > 0 || r.threshold > 0 || splitList(r.ban_durations).length > 0
 
-/**
- * 落点：有端口条件就落内核，否则落应用层。
- *
- * 这不是"用户选的"，是两条硬约束推出来的：需要按被访问的端口分流只能在内核做
- * （frps 插件回调拿不到端口），需要按来源属地分流只能在应用层做
- * （属地库没法反查出某个国家的 CIDR 列表）。落点不同，能配的动作也不同。
- */
-export function layerOf(r: RateRule): Layer {
-  return hasPorts(r) ? 'kernel' : 'app'
-}
+/** 所有细分规则在应用层匹配；触发封禁后才写内核。 */
+export function layerOf(_r: RateRule): Layer { return "app" }
 
-export const LAYER_LABEL: Record<Layer, string> = {
-  kernel: '内核',
-  app: '应用层',
-}
+export const LAYER_LABEL: Record<Layer, string> = {kernel: "内核", app: "应用层"}
 
 export const LAYER_TAG_TYPE: Record<Layer, 'success' | 'warning'> = {
   kernel: 'warning',
@@ -94,9 +79,8 @@ export const LAYER_TAG_TYPE: Record<Layer, 'success' | 'warning'> = {
 }
 
 export const LAYER_TIP: Record<Layer, string> = {
-  kernel:
-    '带端口条件的规则下发到系统防火墙，按目的端口丢包。内核只能丢包，不能封禁 —— 超限的包根本到不了 frps，应用层无从知道它超限。',
-  app: '不带端口条件的规则由 frps 插件在每次登录时判定，可以限速、可以封禁，也可以直接拒绝。限速按来源 IP 独立计数。',
+ kernel: "旧版内核限速已迁移到应用层。",
+ app: "按来源、属地与代理名匹配新连接；目的端口仅用于登录阶段。先计数再限速，触发封禁后才写内核，自动封禁仍为全端口。"
 }
 
 /** 条件的可读摘要 */
@@ -130,52 +114,25 @@ export function actionParts(r: RateRule): string[] {
   return out
 }
 
-/**
- * 这条规则有什么问题（会导致保存被后端拒绝），没问题返回空数组。
- *
- * 三条冲突必须在这里拦下来并讲清楚，而不是让用户去读后端的报错：
- * 地区 + 端口凑在一条里必然有一条不生效，这个约束从界面上完全看不出来。
- *
- * 这里的判据必须与 model.RateRule.Validate 一一对应：前端放行、后端拒绝，
- * 用户看到的是一句弹窗报错；前端拦住、后端本来会放行，则是一个能用却配不出来的
- * 功能。两边都从"有没有端口"这个唯一的落点开关推，就不会走岔。
- */
+/** 校验规则动作，口径与后端一致。端口条件仅用于登录阶段，代理名规则须留空。 */
 export function ruleProblems(r: RateRule): string[] {
   const out: string[] = []
+  if (hasProxy(r) && hasPorts(r)) out.push('本版本未接入代理端口映射：按代理名对新连接做频控时，请将目的端口留空')
   if (!String(r.name ?? '').trim()) out.push('规则名不能为空')
   // 代理名也算匹配条件：只有它、没有地区和网段，是"给这个隧道单独定一套参数"。
   const hasCond = hasPorts(r) || hasGeo(r) || hasProxy(r) || splitList(r.cidrs).length > 0
   if (!hasCond) {
     out.push('还没有任何匹配条件，这条规则会命中所有流量；全量兜底请用下方的全局规则')
   }
-  if (hasPorts(r) && hasGeo(r)) {
-    out.push(
-      '「地区」和「端口」不能出现在同一条规则里：地区只有 frps 插件能判（它拿不到被访问的端口），' +
-        '端口只有系统防火墙能判。请清掉其中一边，或者拆成两条规则'
-    )
-  }
-  // 同一类冲突的另一半：内核认不出 frp 的隧道名。
-  if (hasPorts(r) && hasProxy(r)) {
-    out.push(
-      '「代理」和「端口」不能出现在同一条规则里：代理名只有 frps 插件能判，' +
-        '带端口条件的规则下发到系统防火墙、那里认不出代理。请清掉其中一边，或者拆成两条规则'
-    )
-  }
-  if (hasPorts(r) && r.block) {
-    out.push('带端口条件的规则落在内核层，内核只能丢包、丢不到「拒绝」这一步，请清掉端口或关掉「直接拦截」')
-  }
-  if (hasPorts(r) && hasBan(r)) {
-    out.push('带端口条件的规则落在内核层，内核只能丢包、不能封禁，请清掉封禁配置或改走应用层')
-  }
-  if (!hasPorts(r) && r.block && (r.per_sec > 0 || hasBan(r))) {
+  if (r.block && (r.per_sec > 0 || hasBan(r))) {
     out.push('「直接拦截」命中就直接拒绝了，后面的限速与封禁阈值永远不会被用到，请只保留一个')
   }
   // 拦截也算一种动作，所以开了拦截就不再要求限速/封禁
-  if (!hasPorts(r) && !r.block && r.per_sec <= 0 && !hasBan(r)) {
+  if (!r.block && r.per_sec <= 0 && !hasBan(r)) {
     out.push('既没有限速也没有封禁阈值，命中后什么都不会发生')
   }
   const banParts = [r.window_seconds > 0, r.threshold > 0, splitList(r.ban_durations).length > 0].filter(Boolean).length
-  if (!hasPorts(r) && banParts !== 0 && banParts !== 3) {
+  if (banParts !== 0 && banParts !== 3) {
     out.push('封禁配置不完整：「统计窗口」「触发阈值」「封禁阶梯」要么都填，要么都不填')
   }
   return out

@@ -100,6 +100,7 @@ type Stats struct {
 	// RuleProblems 是编译不过、被跳过的规则原因。界面必须显示出来 ——
 	// 一条规则在列表里显示"已启用"、实际一条都没生效，是最难发现的那类问题。
 	RuleProblems  []string  `json:"rule_problems,omitempty"`
+	RuleWarnings  []string  `json:"rule_warnings,omitempty"`
 	LastSyncAt    time.Time `json:"last_sync_at"`
 	LastSyncErr   string    `json:"last_sync_err"`
 	LastSyncRules int       `json:"last_sync_rules"`
@@ -178,13 +179,9 @@ type Manager struct {
 	bans     map[string]*banState
 	windows  map[string]*hitWindow
 
-	// appRules 是按优先级排好的细分规则（应用层那部分）。
-	// kernelRules 是细分规则里落在内核的那部分，交给驱动编译成限速规则。
-	//
-	// 两者都是从 rate_rules 表编译出来的，一次 Refresh 整体替换 ——
-	// 判定路径上只读，不加锁也不会有半新半旧的状态。
-	appRules    []appRule
-	kernelRules []kernelRule
+	// appRules 在 Refresh 时整体替换，判定路径只读规则快照。
+	appRules     []appRule
+	globalBucket *tokenBucket
 	// ruleProblems 记录编译不过、被跳过的规则，界面要把它显示出来。
 	ruleProblems []string
 
@@ -282,7 +279,7 @@ func (m *Manager) Refresh() error {
 	if err != nil {
 		return fmt.Errorf("读取频控细分规则失败: %w", err)
 	}
-	appRules, kernelRules, skipped := compileRules(ruleRows)
+	appRules, skipped := compileRules(ruleRows)
 	for _, s := range skipped {
 		m.log.Error("频控细分规则无法生效，已跳过", "reason", s)
 	}
@@ -302,6 +299,13 @@ func (m *Manager) Refresh() error {
 
 	m.mu.Lock()
 	m.policy = policy
+	if policy.RateLimitEnabled && policy.RateLimitPerSec > 0 {
+		if m.globalBucket == nil || m.globalBucket.rate != float64(policy.RateLimitPerSec) || m.globalBucket.burst != float64(effectiveBurst(policy.RateLimitPerSec, policy.RateLimitBurst)) {
+			m.globalBucket = newTokenBucket(policy.RateLimitPerSec, policy.RateLimitBurst)
+		}
+	} else {
+		m.globalBucket = nil
+	}
 	m.protect = prot
 	m.white = white
 	m.whiteExpiry = make(map[netip.Prefix]time.Time)
@@ -334,7 +338,6 @@ func (m *Manager) Refresh() error {
 	m.geoWhite = geoWhite
 	m.geoBlack = geoBlack
 	m.appRules = appRules
-	m.kernelRules = kernelRules
 	m.ruleProblems = skipped
 	m.mu.Unlock()
 
@@ -797,13 +800,6 @@ func (m *Manager) Stats() Stats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// 内核规则数把全局兜底也算进去：界面上要回答的是"现在有几条限速规则
-	// 在内核里"，而不是"细分规则有几条"。
-	kernelRules := len(m.kernelRules)
-	if m.policy != nil && m.policy.RateLimitEnabled && m.policy.RateLimitPerSec > 0 {
-		kernelRules++
-	}
-
 	s := Stats{
 		Enabled:         m.guardEnabled(),
 		DryRun:          m.dryRun(),
@@ -812,11 +808,16 @@ func (m *Manager) Stats() Stats {
 		BlackCount:      len(m.black),
 		WindowsTracked:  len(m.windows),
 		AppRuleCount:    len(m.appRules),
-		KernelRuleCount: kernelRules,
+		KernelRuleCount: 0,
 		RuleProblems:    append([]string(nil), m.ruleProblems...),
 		LastSyncAt:      m.lastSyncAt,
 		LastSyncErr:     m.lastSyncErr,
 		LastSyncRules:   m.lastSyncRules,
+	}
+	for _, r := range m.appRules {
+		if len(r.ports) > 0 {
+			s.RuleWarnings = append(s.RuleWarnings, "规则「"+r.name+"」：目的端口仅在 Login 阶段按 bindPort 匹配；对代理新连接做频控，请填写代理名并将目的端口留空，无需 Dashboard")
+		}
 	}
 	if m.protect != nil {
 		s.TrustedCount = m.protect.TrustedCount()
@@ -917,10 +918,13 @@ func (m *Manager) Lookup(target string) map[string]any {
 	// 代理名在这里永远是空：查询请求只给了一个 IP，没有"连的是哪个隧道"这层
 	// 上下文。后果是**带代理条件的规则在查询结果里显示为不命中** —— 这与真实
 	// 判定一致（登录阶段同样没有代理名），不是查询漏了规则。
-	if r := pickAppRule(appRules, addr, geoNow, ""); r != nil {
+	if r := pickAppRule(appRules, addr, geoNow, "", m.cfg.Frps.BindPort); r != nil {
 		who = "规则「" + r.name + "」"
 		if r.threshold > 0 {
 			tag, win = r.tag(), r.window
+			if len(r.ports) > 0 {
+				tag += "@" + fmt.Sprint(m.cfg.Frps.BindPort)
+			}
 		}
 	} else if policy != nil {
 		win = time.Duration(policy.WindowSeconds) * time.Second
@@ -1118,6 +1122,7 @@ func (m *Manager) pruneWindows() {
 			delete(m.windows, k)
 		}
 	}
+	m.globalBucket.prune(cutoff)
 	for i := range m.appRules {
 		m.appRules[i].bucket.prune(cutoff)
 	}
@@ -1256,6 +1261,7 @@ func (m *Manager) resetWindowsForLocked(ip string) {
 			w.reset()
 		}
 	}
+	m.globalBucket.resetPrefix(p)
 	for i := range m.appRules {
 		m.appRules[i].bucket.resetPrefix(p)
 	}
