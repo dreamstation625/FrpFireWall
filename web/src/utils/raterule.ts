@@ -80,7 +80,7 @@ export const LAYER_TAG_TYPE: Record<Layer, 'success' | 'warning'> = {
 
 export const LAYER_TIP: Record<Layer, string> = {
  kernel: "旧版内核限速已迁移到应用层。",
- app: "按来源、属地与代理名匹配新连接；目的端口仅用于登录阶段。先计数再限速，触发封禁后才写内核，自动封禁仍为全端口。"
+ app: "按来源、属地、代理名与目的端口组合匹配；填写的各项条件必须同时命中。先计数再限速，触发封禁后才写内核，自动封禁仍为全端口。"
 }
 
 /** 条件的可读摘要 */
@@ -114,10 +114,9 @@ export function actionParts(r: RateRule): string[] {
   return out
 }
 
-/** 校验规则动作，口径与后端一致。端口条件仅用于登录阶段，代理名规则须留空。 */
+/** 校验规则动作，口径与后端一致。代理名与目的端口可组合匹配。 */
 export function ruleProblems(r: RateRule): string[] {
   const out: string[] = []
-  if (hasProxy(r) && hasPorts(r)) out.push('本版本未接入代理端口映射：按代理名对新连接做频控时，请将目的端口留空')
   if (!String(r.name ?? '').trim()) out.push('规则名不能为空')
   // 代理名也算匹配条件：只有它、没有地区和网段，是"给这个隧道单独定一套参数"。
   const hasCond = hasPorts(r) || hasGeo(r) || hasProxy(r) || splitList(r.cidrs).length > 0

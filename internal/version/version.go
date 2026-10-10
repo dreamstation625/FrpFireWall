@@ -29,7 +29,7 @@ const DefaultRepo = "dreamstation625/FrpFireWall"
 // 构建失败（CI 与 Makefile 走的都是注入路径），只会让裸 go build 出来的
 // 二进制自称一个错误的版本号，因此由 TestDefaultVersionMatchesVersionFile 兜底。
 var (
-	Version   = "0.0.3-pre.02"
+	Version   = "0.0.3-pre.03"
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )

@@ -431,23 +431,28 @@ func TestRateRuleProxyNameRoundTrip(t *testing.T) {
 	}
 }
 
-// 代理 + 端口必须被拒：带端口条件的规则下发到内核，那里认不出 frp 的隧道名。
-// 与"地区 + 端口"是同一类冲突，只是方向不同 —— 漏掉这一半，用户配出来的规则
-// 会静默少生效一半。
-func TestRateRuleRejectsProxyWithPortsWithoutMapping(t *testing.T) {
+// 端口与代理名作为组合条件完整往返，不提前产生内核限速。
+func TestRateRuleAcceptsProxyWithPorts(t *testing.T) {
 	h := newHarness(t)
 
 	code, r := h.call(http.MethodPut, "/api/v1/policy", withRules(h.policyBody(), []map[string]any{{
-		"name":       "冲突规则",
+		"name":       "组合规则",
 		"enabled":    true,
 		"proxy_name": "web-ssh",
 		"ports":      "7000",
 		"per_sec":    10,
 	}}))
-	if code != http.StatusBadRequest || !strings.Contains(r.Error, "目的端口留空") {
-		t.Fatalf("没有映射时需明确拒绝组合: %d %s", code, r.Error)
+	if code != http.StatusOK {
+		t.Fatalf("组合条件应当允许保存: %d %s", code, r.Error)
 	}
-
+	rows := h.rules()
+	if len(rows) != 1 {
+		t.Fatalf("应有一条组合规则: %v", rows)
+	}
+	row := rows[0].(map[string]any)
+	if row["proxy_name"] != "web-ssh" || row["ports"] != "7000" || row["layer"] != "app" {
+		t.Fatalf("组合条件未完整保存: %v", rows)
+	}
 }
 
 // /events/proxy-names 给规则编辑器提供候选。

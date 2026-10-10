@@ -456,7 +456,7 @@ func TestRateRuleValidateRejectsEmptyCity(t *testing.T) {
 // 没有地区和网段的写法；不把它算进条件里，这种规则会被"没有任何匹配条件"
 // 那条检查拒掉，功能直接配不出来。
 //
-// 二、未接入端口映射时拒绝与目的端口共存，避免永远不命中的组合。
+// 二、代理名与目的端口可作为 AND 条件共存。
 //
 // 三、**它进封禁来源引用的签名**。改了代理名等于换了一批适用对象，旧的封禁
 // 依据不再成立，由它封的地址要跟着解封。
@@ -468,10 +468,10 @@ func TestRateRuleProxyNameContract(t *testing.T) {
 		t.Fatalf("只有代理名、没有地区/网段的规则应当合法，实际被拒：%v", err)
 	}
 
-	// 二、本版本未接入端口映射，代理规则的目的端口必须留空。
-	conflict := RateRule{Name: "x", ProxyName: "web-ssh", Ports: "7000", PerSec: 10}
-	if err := conflict.Validate(); err == nil || !strings.Contains(err.Error(), "目的端口留空") {
-		t.Fatalf("应明确说明代理规则需要目的端口留空: %v", err)
+	// 二、允许组合；无法确定实际端口的连接在判定时不命中。
+	combined := RateRule{Name: "x", ProxyName: "web-ssh", Ports: "7000", PerSec: 10}
+	if err := combined.Validate(); err != nil {
+		t.Fatalf("代理名与端口组合应当合法: %v", err)
 	}
 
 	// 三、代理名进签名

@@ -366,9 +366,11 @@ func (s *Server) handleFrpsSnippet(c *gin.Context) {
 		"path":         s.cfg.Frps.PluginPath,
 		// ops 取自 frpsplugin，不在这里另写一份：界面告诉用户订阅了哪几个 op，
 		// 与实际生成到配置里的必须一致。
-		"ops":       frpsplugin.Ops(),
-		"bind_port": s.cfg.Frps.BindPort,
+		"ops":                 frpsplugin.Ops(),
+		"bind_port":           s.cfg.Frps.BindPort,
+		"proxy_port_mappings": s.guard.ProxyPortMappings(),
 		"warnings": []string{
+			"端口规则需订阅 NewProxy / CloseProxy，并让 frpc 重新连接。本程序重启后需重新学习映射；仅支持固定 remotePort 的 TCP 代理（不含负载均衡组）。若有多个修改代理配置的插件，请将本插件排在最后。",
 			"ops 绝对不要加 \"Ping\"：心跳是每客户端 30s 一次，挂上来会让插件 QPS 乘以客户端数，可能拖垮 frps。",
 			"修改配置后需要 systemctl restart frps，重启期间所有隧道会断开，建议避开业务高峰。",
 			"插件服务只监听回环地址，frps 必须与本程序在同一台机器上。",

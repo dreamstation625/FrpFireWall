@@ -45,8 +45,8 @@ type ServerConfig struct {
 	//
 	// 对外可达时，安全只剩两道：一次性初始化令牌（防别人抢先设密码）
 	// 与登录防爆破。密码走的是明文 HTTP，所以务必在面板里开启 TLS。
-	Listen string    `json:"listen"`
-	TLS    TLSConfig `json:"tls"`
+	Listen string     `json:"listen"`
+	TLS    TLSConfig  `json:"tls"`
 	Auth   AuthConfig `json:"auth"`
 }
 
@@ -69,7 +69,7 @@ type FrpsConfig struct {
 	PluginListen string `json:"plugin_listen"`
 	// PluginPath 是 frps httpPlugins 里配置的 path。
 	PluginPath string `json:"plugin_path"`
-	// BindPort 是 frps 的 bindPort，用于下发连接速率限制规则。
+	// BindPort 是 frps 的 bindPort，用于登录阶段的端口匹配与 frp 范围封禁。
 	BindPort int `json:"bind_port"`
 	// ProxyPorts 是代理对外暴露的端口，用于 NewUserConn 阶段判定的覆盖范围。
 	//
@@ -293,4 +293,3 @@ func randomSecret(n int) (string, error) {
 	}
 	return s, nil
 }
-

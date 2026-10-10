@@ -25,14 +25,14 @@ func (m *Manager) JudgeLogin(addr netip.Addr, user, _ string) Verdict {
 //
 // CDN 回源场景下 remoteAddr 往往是 CDN 节点 IP，
 // 对这类来源只记录、不做封禁（封一个节点等于掐死一大片正常用户）。
-func (m *Manager) JudgeUserConn(clientAddr netip.Addr, remoteAddr, user, proxy string) Verdict {
+func (m *Manager) JudgeUserConn(clientAddr netip.Addr, remoteAddr, user, proxy string, destination ...int) Verdict {
 	addr := clientAddr
 	if ra, err := netip.ParseAddrPort(remoteAddr); err == nil {
 		addr = ra.Addr()
 	} else if ra2, err := netip.ParseAddr(remoteAddr); err == nil {
 		addr = ra2
 	}
-	return m.judge(addr, user, model.EvtUserConn, "user-conn", proxy)
+	return m.judge(addr, user, model.EvtUserConn, "user-conn", proxy, destination...)
 }
 
 // banGeoBlackHit 把"命中地区黑名单条目"落成一次封禁，返回事件文案。

@@ -23,7 +23,7 @@ func TestSnippetTOML(t *testing.T) {
 		`name = "frpfirewall"`,
 		`addr = "127.0.0.1:9100"`,
 		`path = "/frps/handler"`,
-		`ops = ["Login", "NewUserConn"]`,
+		`ops = ["Login", "NewProxy", "CloseProxy", "NewUserConn"]`,
 		"tlsVerify = false",
 	} {
 		if !strings.Contains(got, want) {
@@ -78,8 +78,8 @@ func TestSnippetJSON(t *testing.T) {
 	if p.Path != testPath {
 		t.Errorf("path = %q，期望 %q", p.Path, testPath)
 	}
-	if len(p.Ops) != 2 || p.Ops[0] != "Login" || p.Ops[1] != "NewUserConn" {
-		t.Errorf("ops = %v，期望 [Login NewUserConn]", p.Ops)
+	if strings.Join(p.Ops, ",") != "Login,NewProxy,CloseProxy,NewUserConn" {
+		t.Errorf("ops = %v，期望 [Login NewProxy CloseProxy NewUserConn]", p.Ops)
 	}
 	if p.TLSVerify {
 		t.Error("tlsVerify 应为 false（插件只监听回环，无需 TLS）")
@@ -148,7 +148,7 @@ func TestSnippetsAgree(t *testing.T) {
 		`name = "` + p.Name + `"`,
 		`addr = "` + p.Addr + `"`,
 		`path = "` + p.Path + `"`,
-		`ops = ["` + p.Ops[0] + `", "` + p.Ops[1] + `"]`,
+		`ops = ["` + strings.Join(p.Ops, `", "`) + `"]`,
 	} {
 		if !strings.Contains(tomlStr, want) {
 			t.Errorf("TOML 片段与 JSON 不一致，缺少 %q\n--- TOML ---\n%s", want, tomlStr)
@@ -162,8 +162,8 @@ func TestSnippetsAgree(t *testing.T) {
 // 就会污染所有后续请求的 ops，表现出来是「ops 越用越多」。
 func TestOpsReturnsCopy(t *testing.T) {
 	first := Ops()
-	if len(first) != 2 {
-		t.Fatalf("ops 应有 2 项，得到 %v", first)
+	if len(first) != 4 {
+		t.Fatalf("ops 应有 4 项，得到 %v", first)
 	}
 
 	first[0] = "Ping"

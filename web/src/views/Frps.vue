@@ -74,8 +74,32 @@
         插件只监听回环地址，frps 必须与本程序同机。
         「仅 frp 端口」封禁针对上面这个端口集合下发：<span class="mono">bind_port</span> 与
         <span class="mono">proxy_ports</span> 的并集。全端口和自定义端口封禁仍按各自范围执行。
-        频控在应用层统计新连接，目的端口请留空；代理名可选，留空时按地区和来源条件匹配所有代理，无需 Dashboard。目的端口条件仅用于登录阶段。
+        频控在应用层统计新连接，代理名和目的端口均可选；同时填写时，两项必须同时匹配。固定 TCP 端口通过生命周期回调自动学习，无需 Dashboard。
       </div>
+    </div>
+
+    <div class="page-card panel mt">
+      <div class="panel-head">
+        <span class="section-title">代理端口映射</span>
+        <el-button size="small" @click="load">刷新</el-button>
+      </div>
+      <div class="hint" style="margin-bottom: 12px">
+        仅学习固定 remotePort 的 TCP 代理，不支持随机端口或负载均衡组。
+        请订阅 NewProxy / CloseProxy，并让 frpc 重新连接；本程序重启后映射会清空，需要重新连接学习。
+        「已申报」表示收到注册请求，不代表监听成功；「已收到连接」表示该会话已发生新连接。
+        未知端口会跳过带端口条件的规则，继续匹配其他规则或全局频控。
+      </div>
+      <el-table :data="snippet?.proxy_port_mappings || []" size="small" border empty-text="暂无映射，请检查插件配置并让 frpc 重新连接">
+        <el-table-column prop="proxy_name" label="代理名" min-width="140" />
+        <el-table-column prop="user" label="用户" min-width="100" />
+        <el-table-column prop="proxy_type" label="类型" width="80" />
+        <el-table-column label="目的端口" width="100">
+          <template #default="{ row }">{{ row.port || '未知' }}</template>
+        </el-table-column>
+        <el-table-column label="状态" min-width="220">
+          <template #default="{ row }">{{ row.problem || (row.observed ? '已收到连接' : '已申报') }}</template>
+        </el-table-column>
+      </el-table>
     </div>
 
     <div class="page-card panel mt" data-guide="frps-config">

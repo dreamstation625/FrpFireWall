@@ -18,7 +18,7 @@
 //     所以这里给判定加了硬超时，超时或 panic 一律 fail-open 放行。
 //     理由：防火墙插件挂掉不应该导致整个 frp 服务不可用。
 //
-//  2. ops 只挂 Login 和 NewUserConn，**绝不能挂 Ping**。
+//  2. NewProxy / CloseProxy 只维护端口上下文，不参与频次统计；**绝不能挂 Ping**。
 //     心跳是每客户端 30s 一次，挂上来会让插件 QPS 乘以客户端数，
 //     在小内存机器上直接把 frps 拖垮。
 package frpsplugin
@@ -49,6 +49,8 @@ const maxBody = 1 << 20
 const (
 	opLogin       = "Login"
 	opNewUserConn = "NewUserConn"
+	opNewProxy    = "NewProxy"
+	opCloseProxy  = "CloseProxy"
 	opPing        = "Ping"
 )
 
@@ -116,6 +118,19 @@ type newUserConnContent struct {
 	ProxyName  string   `json:"proxy_name"`
 	ProxyType  string   `json:"proxy_type"`
 	RemoteAddr string   `json:"remote_addr"`
+}
+
+type newProxyContent struct {
+	User       userInfo `json:"user"`
+	ProxyName  string   `json:"proxy_name"`
+	ProxyType  string   `json:"proxy_type"`
+	RemotePort int      `json:"remote_port"`
+	Group      string   `json:"group"`
+}
+
+type closeProxyContent struct {
+	User      userInfo `json:"user"`
+	ProxyName string   `json:"proxy_name"`
 }
 
 // ---- 生命周期 ----
@@ -237,8 +252,27 @@ func (s *Server) dispatch(op string, req pluginRequest) pluginResponse {
 		if err := json.Unmarshal(req.Content, &c); err != nil {
 			return s.onInternalError("解析 NewUserConn 内容失败: " + err.Error())
 		}
-		v := s.mgr.JudgeUserConn(netip.Addr{}, c.RemoteAddr, c.User.User, c.ProxyName)
+		port := s.mgr.ResolveProxyPort(c.User.User, c.User.RunID, c.ProxyName, c.ProxyType)
+		v := s.mgr.JudgeUserConn(netip.Addr{}, c.RemoteAddr, c.User.User, c.ProxyName, port)
 		return toResponse(v)
+
+	case opNewProxy:
+		var c newProxyContent
+		if err := json.Unmarshal(req.Content, &c); err != nil {
+			return s.onInternalError("解析 NewProxy 内容失败: " + err.Error())
+		}
+		if err := s.mgr.RegisterProxyPort(c.User.User, c.User.RunID, c.ProxyName, c.ProxyType, c.RemotePort, c.Group); err != nil {
+			s.log.Warn("未能记录代理端口，端口条件保持未知", "proxy", c.ProxyName, "err", err)
+		}
+		return pluginResponse{Reject: false, Unchange: true}
+
+	case opCloseProxy:
+		var c closeProxyContent
+		if err := json.Unmarshal(req.Content, &c); err != nil {
+			return s.onInternalError("解析 CloseProxy 内容失败: " + err.Error())
+		}
+		s.mgr.RemoveProxyPort(c.User.User, c.User.RunID, c.ProxyName)
+		return pluginResponse{Reject: false, Unchange: true}
 
 	case opPing:
 		// 理论上不会走到这里（配置里不挂 Ping）。
@@ -312,7 +346,7 @@ const pluginName = "frpfirewall"
 
 // ops 是订阅的回调。**绝不能加 "Ping"**：心跳是每客户端 30s 一次，
 // 挂上来会让插件 QPS 乘以客户端数，在小内存机器上直接把 frps 拖垮。
-var ops = []string{"Login", "NewUserConn"}
+var ops = []string{"Login", "NewProxy", "CloseProxy", "NewUserConn"}
 
 // Ops 返回订阅的 op 列表副本。
 //
@@ -320,6 +354,14 @@ var ops = []string{"Login", "NewUserConn"}
 // 订阅了某几个 op，实际没订阅，这种错在界面上完全看不出来。
 func Ops() []string {
 	return append([]string(nil), ops...)
+}
+
+func quotedOps() string {
+	out := make([]string, len(ops))
+	for i, op := range ops {
+		out[i] = fmt.Sprintf("%q", op)
+	}
+	return strings.Join(out, ", ")
 }
 
 // Snippet 生成需要追加到 frps.toml 的配置片段。
@@ -331,7 +373,7 @@ func Snippet(pluginAddr, pluginPath string) string {
 	fmt.Fprintf(&b, "name = %q\n", pluginName)
 	fmt.Fprintf(&b, "addr = %q\n", pluginAddr)
 	fmt.Fprintf(&b, "path = %q\n", pluginPath)
-	fmt.Fprintf(&b, "ops = [%q, %q]\n", ops[0], ops[1])
+	fmt.Fprintf(&b, "ops = [%s]\n", quotedOps())
 	b.WriteString("tlsVerify = false\n")
 	b.WriteString("\n# 不要把 \"Ping\" 加进 ops：心跳每客户端 30s 一次，挂上来会让插件调用量\n")
 	b.WriteString("# 乘以客户端数量，小内存机器上足以把 frps 拖垮。\n")
@@ -370,7 +412,7 @@ func SnippetJSON(pluginAddr, pluginPath string) string {
 	fmt.Fprintf(&b, "      \"name\": %s,\n", jq(pluginName))
 	fmt.Fprintf(&b, "      \"addr\": %s,\n", jq(pluginAddr))
 	fmt.Fprintf(&b, "      \"path\": %s,\n", jq(pluginPath))
-	fmt.Fprintf(&b, "      \"ops\": [%s, %s],\n", jq(ops[0]), jq(ops[1]))
+	fmt.Fprintf(&b, "      \"ops\": [%s],\n", quotedOps())
 	b.WriteString("      \"tlsVerify\": false\n")
 	b.WriteString("    }\n")
 	b.WriteString("  ]\n")

@@ -56,7 +56,7 @@ type RateRule struct {
 	// （ID 在 commonInitialisms 里），不加 column 的话列名会是 c_id_rs。
 	CIDRs string `gorm:"column:cidrs;size:4096;not null;default:''" json:"cidrs"`
 	// Ports 实际被访问的目的端口，仅是匹配条件，不决定封禁范围。
-	// 本版本仅在 Login 使用 bindPort；代理名规则必须留空。
+	// Login 使用 bindPort；TCP 新连接通过同会话的固定端口映射匹配。
 	Ports string `gorm:"size:1024;not null;default:''" json:"ports"`
 	// ProxyName frp 的代理（隧道）名，精确匹配，单个值。
 	//
@@ -68,7 +68,7 @@ type RateRule struct {
 	// 绑一串名字的话，"这条命中了是因为哪个"又说不清了。
 	//
 	// 它只能落在应用层：代理名来自 frps 的 NewUserConn 回调，内核层压根没有
-	// 这个概念。**Login 回调不带代理名**（隧道还没建立），所以带这条件件的
+	// 这个概念。**Login 回调不带代理名**（隧道还没建立），所以带这条件的
 	// 规则在登录阶段一律不命中 —— 这不是缺陷，是那一刻还没有这个信息。
 	//
 	// 填了它就已经算一个匹配条件（Validate 认），所以可以出现"只有代理名、
@@ -329,10 +329,6 @@ func (r *RateRule) Validate() error {
 	// 当成"没有任何条件、会命中所有流量"给拒掉，功能直接配不出来。
 	if !hasGeo && !hasCIDR && !hasPorts && !hasProxy {
 		return fmt.Errorf("规则「%s」没有任何匹配条件，会命中所有流量；全量兜底请用上方的全局规则", r.Name)
-	}
-	// NewUserConn 没有目的端口；本版本不接入端口映射，不能保存永远不命中的组合。
-	if hasProxy && hasPorts {
-		return fmt.Errorf("规则「%s」未接入代理端口映射：按代理名对新连接做频控时，请将目的端口留空", r.Name)
 	}
 
 	// 条件解析失败要在这里挡掉，不能留到下发时才炸。

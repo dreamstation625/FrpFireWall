@@ -392,7 +392,7 @@ check "插件监听地址" "$(printf '%s' "$SN" | jqf data.addr)" "127.0.0.1:910
 check "插件路径" "$(printf '%s' "$SN" | jqf data.path)" "/frps/handler"
 check "订阅 2 个 op" "$(printf '%s' "$SN" | jqf data.ops)" "[2]"
 check_err "片段包含 httpPlugins" "$(printf '%s' "$SN" | jqf data.snippet)" "httpPlugins"
-check_err "片段包含 ops" "$(printf '%s' "$SN" | jqf data.snippet)" 'ops = ["Login", "NewUserConn"]'
+check_err "片段包含 ops" "$(printf '%s' "$SN" | jqf data.snippet)" 'ops = ["Login", "NewProxy", "CloseProxy", "NewUserConn"]'
 check_err "片段插件名正确" "$(printf '%s' "$SN" | jqf data.snippet)" 'name = "frpfirewall"'
 
 # JSON 形态（供 frps.json 用）。字段名是驼峰，改大小写会被 frp 的严格校验直接
@@ -400,7 +400,7 @@ check_err "片段插件名正确" "$(printf '%s' "$SN" | jqf data.snippet)" 'nam
 SNJ="$(printf '%s' "$SN" | jqf data.snippet_json)"
 check_err "JSON 片段含 httpPlugins" "$SNJ" '"httpPlugins"'
 check_err "JSON 字段名用驼峰 tlsVerify" "$SNJ" '"tlsVerify": false'
-check_err "JSON 片段含 ops" "$SNJ" '"ops": ["Login", "NewUserConn"]'
+check_err "JSON 片段含 ops" "$SNJ" '"ops": ["Login", "NewProxy", "CloseProxy", "NewUserConn"]'
 # 标准 JSON 不支持注释。TOML 版本里那几行说明若被顺手带过来，frps 会在解析
 # 阶段就报 invalid character '/'，用户很难自己定位。
 if printf '%s' "$SNJ" | grep -qE '//|#'; then

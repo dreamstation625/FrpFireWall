@@ -122,7 +122,7 @@ type Verdict struct {
 // blockTarget 是内存里的黑名单条目：地址 + 封禁范围（+ 自定义端口）。
 //
 // 范围只影响内核规则怎么写（全端口丢 / 只在某些端口上丢），不影响"是否命中"的判定 ——
-// 插件层本来就只作用于 frp 连接，而且拿不到被访问的端口，几种范围对它没有区别。
+// 人工黑名单保留整体拒绝 frp 连接的既有行为，不根据学习的代理端口缩小判定范围。
 // 所以自定义端口与「仅 frp 端口」在判定路径上完全一样，区别只在内核规则的端口集合。
 type blockTarget struct {
 	Prefix    netip.Prefix
@@ -192,6 +192,8 @@ type Manager struct {
 	// 只有这一项走热更路径 —— bind_port、监听地址这类要重启的配置仍以 m.cfg 为准，
 	// 免得出现"一半是新的、一半是旧的"这种没人能解释的状态。
 	frpsProxyPorts portrange.Set
+	// 生命周期回调学习的会话端口，不与人工配置的受保护端口集合混用。
+	proxyPortMappings map[proxyPortKey]ProxyPortView
 
 	// eventRetention 是运行期生效的事件保留天数，0 表示永久保留。
 	//
@@ -816,7 +818,7 @@ func (m *Manager) Stats() Stats {
 	}
 	for _, r := range m.appRules {
 		if len(r.ports) > 0 {
-			s.RuleWarnings = append(s.RuleWarnings, "规则「"+r.name+"」：目的端口仅在 Login 阶段按 bindPort 匹配；对代理新连接做频控，请将目的端口留空，代理名可选，无需 Dashboard")
+			s.RuleWarnings = append(s.RuleWarnings, "规则「"+r.name+"」：代理端口匹配需要订阅 NewProxy / CloseProxy，并让 frpc 重新连接；仅支持固定 remotePort 的 TCP 代理，未知端口会跳过端口规则。可在 frp 接入页查看映射，代理名可选，无需 Dashboard")
 		}
 	}
 	if m.protect != nil {

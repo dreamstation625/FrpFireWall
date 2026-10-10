@@ -90,6 +90,26 @@ func TestFrpsSnippetFormats(t *testing.T) {
 	}
 }
 
+func TestFrpsSnippetExposesProxyPortMappings(t *testing.T) {
+	h := newHarness(t)
+	_, r := h.call(http.MethodGet, "/api/v1/frps/snippet", nil)
+	if rows, ok := h.data(r)["proxy_port_mappings"].([]any); !ok || len(rows) != 0 {
+		t.Fatalf("空映射应返回数组: %v", h.data(r))
+	}
+	if err := h.srv.guard.RegisterProxyPort("u", "session", "web", "tcp", 25666, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, r = h.call(http.MethodGet, "/api/v1/frps/snippet", nil)
+	rows, ok := h.data(r)["proxy_port_mappings"].([]any)
+	if !ok || len(rows) != 1 {
+		t.Fatalf("应展示端口映射: %v", h.data(r))
+	}
+	row := rows[0].(map[string]any)
+	if row["proxy_name"] != "web" || row["port"] != float64(25666) || row["observed"] != false {
+		t.Fatalf("申报不能被展示为监听已成功: %v", row)
+	}
+}
+
 // TestFrpsConfigFormats 加固项同样要给两种格式。
 func TestFrpsConfigFormats(t *testing.T) {
 	h := newHarness(t)
